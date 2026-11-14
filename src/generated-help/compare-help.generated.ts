@@ -75,7 +75,7 @@ export function render(container: HTMLElement, ctx: RenderContext): void {
   td3.appendText(", 400px, 500px");
   const row5 = tbody.createEl('tr');
   row5.createEl('td', { text: "width" });
-  row5.createEl('td', { text: "Width of the mini-map" });
+  row5.createEl('td', { text: "Width of everything the block renders, its legend and info included. A percentage measures the note's width, vw the window's" });
   const td4 = row5.createEl('td');
   td4.createEl('strong', { cls: 'places-help-bold', text: "100%" });
   td4.appendText(", 50%, 800px");
@@ -113,7 +113,13 @@ export function render(container: HTMLElement, ctx: RenderContext): void {
   const row11 = tbody.createEl('tr');
   row11.createEl('td', { text: "queryParameters" });
   const td10 = row11.createEl('td');
-  td10.appendText("UI controls that adjust the block without editing it. See ");
+  td10.appendText("UI controls that adjust the block without editing it; ");
+  td10.createEl('code', { cls: 'places-help-code', text: "queryParametersPosition" });
+  td10.appendText(", ");
+  td10.createEl('code', { cls: 'places-help-code', text: "queryParametersLayout" });
+  td10.appendText(", and ");
+  td10.createEl('code', { cls: 'places-help-code', text: "queryParametersCollapsed" });
+  td10.appendText(" place them. See ");
   td10.createEl('code', { cls: 'places-help-code', text: "places-queryparameters-help" });
   const td11 = row11.createEl('td');
   td11.createEl('code', { cls: 'places-help-code', text: "- name: limit" });

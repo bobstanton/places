@@ -1,5 +1,5 @@
 import { App } from "obsidian";
-import { IPlacePluginExtension } from "places-shared/services";
+import { IPlacePluginExtension } from "places-shared/obsidian/services";
 
 export interface DiscoveredPlugin {
   pluginId: string;
@@ -9,7 +9,6 @@ export interface DiscoveredPlugin {
   apiVersion: number | undefined;
 }
 
-// Isolates Places' use of Obsidian's private loaded-plugin registry.
 export class PluginDiscoveryService {
   constructor(private app: App) {}
 
@@ -17,8 +16,9 @@ export class PluginDiscoveryService {
     const plugins = (this.app as unknown as { plugins: { plugins: Record<string, unknown> } }).plugins.plugins;
 
     const placesPluginIds = Object.keys(plugins).filter(pluginId => {
-      if (!pluginId.startsWith('places-') || pluginId === 'places-shared') return false;
+      if (!pluginId.startsWith('places-') || pluginId === 'places-shared/obsidian') return false;
       const candidate = plugins[pluginId] as Partial<IPlacePluginExtension>;
+
       return typeof candidate.getPlaceExports === 'function';
     });
 

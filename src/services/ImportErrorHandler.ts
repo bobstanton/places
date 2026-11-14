@@ -7,6 +7,7 @@ export class ImportErrorHandler {
   // context completes the message "Failed to <context>": "parsing", "creating note".
   static handleImportError(filename: string, error: unknown, context: string): void {
     const errorMessage = getErrorMessage(error);
+
     logger.error(`Failed to ${context} for "${filename}":`, error);
     new Notice("Import failed for " + filename + ": " + errorMessage);
   }
@@ -37,6 +38,7 @@ export class ImportErrorHandler {
   // No Notice; used during validation.
   static logParseError(filename: string, error: unknown): void {
     const errorMessage = getErrorMessage(error);
+
     logger.warn('Parse error for "' + filename + '": ' + errorMessage);
   }
 }

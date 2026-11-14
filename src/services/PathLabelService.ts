@@ -1,17 +1,12 @@
-import type * as GeoJSON from "geojson";
+import { segmentLabelValues } from 'places/core';
 import { MapPlace } from "places-shared/overlay";
-import {
-  resolveCascadedLabelTemplate,
-  DEFAULT_PATH_START_LABEL_TEMPLATE,
-  DEFAULT_PATH_MIDPOINT_LABEL_TEMPLATE,
-  DEFAULT_PATH_END_LABEL_TEMPLATE,
-  type IPlacesPluginSettings,
-} from "places-shared/settings";
+import { resolveCascadedLabelTemplate, DEFAULT_PATH_START_LABEL_TEMPLATE, DEFAULT_PATH_MIDPOINT_LABEL_TEMPLATE, DEFAULT_PATH_END_LABEL_TEMPLATE, type IPlacesPluginSettings } from "places-shared/settings";
 import { buildPathLabelFeatures, buildSegmentedPathLabelFeatures, getPathLabelSegments } from "places-shared/services";
-import { DistanceCalculator } from "places-shared/geo";
-import { readNormalizedProperty } from "places-shared/utils";
-import { formatKmInSystem, formatMetersInSystem, meters, type UnitsSystem } from "places-shared/units";
-import { resolvePlaceLabelTemplate } from "./PlaceLabelTemplate";
+import { createPlaceLabelResolver, resolvePlaceLabelTemplate } from "./PlaceLabelTemplate";
+import type * as GeoJSON from 'geojson';
+import { overlayGeometrySignature } from "places-shared/track";
+import { labelInputSignature, type LabelResultCache } from './LabelResultCache';
+import { LoopYieldController } from 'places/core/strategies';
 
 type PathLabelRole = "start" | "mid" | "end";
 
@@ -27,7 +22,7 @@ interface PathLabelBlockSettings {
 interface PathLabelSlot {
   role: PathLabelRole;
   blockValue: string | undefined;
-  noteProperty: string;
+  settingKey: string;
   globalDefault: string;
   codedDefault: string;
 }
@@ -36,127 +31,132 @@ interface PathLabelSlot {
 function parseEnabledRoles(visibility: string | undefined): Set<PathLabelRole> {
   const raw = (visibility ?? "").trim().toLowerCase();
   const all = () => new Set<PathLabelRole>(["start", "mid", "end"]);
+
   if (!raw || raw === "all" || raw === "true") return all();
   if (raw === "none" || raw === "false") return new Set<PathLabelRole>();
   const enabled = new Set<PathLabelRole>();
+
   for (const token of raw.split(/[\s,]+/)) {
     if (token === "start" || token === "end") enabled.add(token);
     else if (token === "mid" || token === "middle" || token === "midpoint") enabled.add("mid");
     else if (token === "all" || token === "true") return all();
     else if (token === "none" || token === "false") return new Set<PathLabelRole>();
   }
+
   return enabled.size > 0 ? enabled : all();
 }
 
-function noteOverride(place: MapPlace, key: string): string | undefined {
-  // A VaultQuery place carries SQL column names in metadata (`tracklabelsstart`).
-  const value = readNormalizedProperty(place.metadata, key);
+function placeOverride(place: MapPlace, key: string): string | undefined {
+  const value = place.settings?.[key as keyof NonNullable<MapPlace['settings']>];
+
   return typeof value === "string" ? value : undefined;
 }
 
 function labelsEnabled(block: PathLabelBlockSettings): boolean {
   if (block.showLabels === false) return false;
+
   if (typeof block.showLabels === "string") {
     return block.showLabels.trim().toLowerCase() !== "false";
   }
+
   return true;
 }
 
-// Resolve and inject start/midpoint/end labels into each place's GPX/path overlay GeoJSON.
-// Each slot resolves through the note frontmatter > code block > global > coded cascade, then the
-// template is filled from the place's already-materialized frontmatter (placeholder-resolver +
-// SimpleContextProvider). Both map engines render the resulting route_label_point features.
 export async function injectPathLabels(
   places: MapPlace[],
   block: PathLabelBlockSettings,
   settings: IPlacesPluginSettings,
-): Promise<void> {
-  const roles = parseEnabledRoles(block.trackLabelsVisibility);
+  cache?: LabelResultCache<GeoJSON.Feature[]>,
+): Promise<{ resolvedSegments: number; labels: number; yieldCount: number; yieldMs: number }> {
   const shouldBuildLabels = labelsEnabled(block);
+  const loop = new LoopYieldController({ batchSize: Infinity, maxIntervalMs: 8 });
+  let processed = 0;
+  let resolvedSegments = 0;
+  let labels = 0;
 
-  await Promise.all(places.map(async (place) => {
+  const processPlace = async (place: MapPlace): Promise<void> => {
+    const roles = parseEnabledRoles(place.settings?.trackLabelsVisibility ?? block.trackLabelsVisibility);
     const overlay = place.overlay;
     const geojson = overlay?.geojson;
+
     if (!overlay || !geojson?.features) return;
 
-    // Recompute from scratch each render. Labels live on overlay.pathLabels, never mutated
-    // into geojson: bounds/visibility read the track geometry without label points.
     overlay.pathLabels = [];
     if (!shouldBuildLabels || roles.size === 0 || !place.filePath) return;
 
     const slots: PathLabelSlot[] = [
-      { role: "start", blockValue: block.trackLabelsStart, noteProperty: "trackLabelsStart", globalDefault: settings.pathStartLabelTemplate, codedDefault: DEFAULT_PATH_START_LABEL_TEMPLATE },
-      { role: "mid", blockValue: block.trackLabelsMidpoint, noteProperty: "trackLabelsMidpoint", globalDefault: settings.pathMidpointLabelTemplate, codedDefault: DEFAULT_PATH_MIDPOINT_LABEL_TEMPLATE },
-      { role: "end", blockValue: block.trackLabelsEnd, noteProperty: "trackLabelsEnd", globalDefault: settings.pathEndLabelTemplate, codedDefault: DEFAULT_PATH_END_LABEL_TEMPLATE },
+      { role: "start", blockValue: block.trackLabelsStart, settingKey: "trackLabelsStart", globalDefault: settings.pathStartLabelTemplate, codedDefault: DEFAULT_PATH_START_LABEL_TEMPLATE },
+      { role: "mid", blockValue: block.trackLabelsMidpoint, settingKey: "trackLabelsMidpoint", globalDefault: settings.pathMidpointLabelTemplate, codedDefault: DEFAULT_PATH_MIDPOINT_LABEL_TEMPLATE },
+      { role: "end", blockValue: block.trackLabelsEnd, settingKey: "trackLabelsEnd", globalDefault: settings.pathEndLabelTemplate, codedDefault: DEFAULT_PATH_END_LABEL_TEMPLATE },
     ];
 
     const templates: Record<PathLabelRole, string> = { start: "", mid: "", end: "" };
+
     for (const slot of slots) {
       if (!roles.has(slot.role)) continue;
-      templates[slot.role] = resolveCascadedLabelTemplate(noteOverride(place, slot.noteProperty), slot.blockValue, slot.globalDefault, slot.codedDefault);
+      templates[slot.role] = resolveCascadedLabelTemplate(placeOverride(place, slot.settingKey), slot.blockValue, slot.globalDefault, slot.codedDefault);
     }
 
-    const resolveSet = async (overrides?: Record<string, unknown>): Promise<Record<PathLabelRole, string>> => {
-      const resolved: Record<PathLabelRole, string> = { start: "", mid: "", end: "" };
-      await Promise.all(slots.map(async (slot) => {
-        if (!templates[slot.role]) return;
-        resolved[slot.role] = await resolvePlaceLabelTemplate(place, templates[slot.role], overrides);
-      }));
-      return resolved;
-    };
+    if (!Object.values(templates).some(Boolean)) return;
+    const inputKey = cache ? labelInputSignature(place, Object.values(templates)) : undefined;
+    const cacheKey = inputKey ? `${inputKey}:${overlayGeometrySignature(geojson)}:${settings.units}` : undefined;
+    const cached = cache?.get(cacheKey);
 
-    // One stretch: the note's own frontmatter already describes it.
-    const segments = getPathLabelSegments(geojson);
-    if (segments.length <= 1) {
-      overlay.pathLabels = buildPathLabelFeatures(geojson, await resolveSet());
+    if (cached) {
+      overlay.pathLabels = cloneLabels(cached);
+
       return;
     }
 
-    // Several stretches: label each one with its own figures.
-    const perSegment = await Promise.all(segments.map((line, index) =>
-      resolveSet(segmentLabelValues(line, index, segments.length, settings.units))));
-    overlay.pathLabels = buildSegmentedPathLabelFeatures(segments, perSegment);
-  }));
+    let emptyResolution = false;
+
+    const resolveSet = async (overrides?: Record<string, unknown>): Promise<Record<PathLabelRole, string>> => {
+      let resolver: ReturnType<typeof createPlaceLabelResolver> | undefined;
+      const resolved: Record<PathLabelRole, string> = { start: "", mid: "", end: "" };
+
+      await Promise.all(slots.map(async (slot) => {
+        if (!templates[slot.role]) return;
+        resolver ??= createPlaceLabelResolver(place, overrides);
+        resolved[slot.role] = await resolvePlaceLabelTemplate(place, templates[slot.role], resolver);
+        if (!resolved[slot.role]) emptyResolution = true;
+      }));
+
+      return resolved;
+    };
+
+    const segments = getPathLabelSegments(geojson);
+
+    resolvedSegments += segments.length;
+
+    if (segments.length <= 1) {
+      overlay.pathLabels = buildPathLabelFeatures(geojson, await resolveSet());
+    } else {
+      const perSegment: Record<PathLabelRole, string>[] = [];
+
+      for (let index = 0; index < segments.length; index++) {
+        perSegment.push(await resolveSet(segmentLabelValues(segments[index], index, segments.length, settings.units)));
+
+        await loop.yieldIfNeeded(++processed);
+      }
+
+      overlay.pathLabels = buildSegmentedPathLabelFeatures(segments, perSegment);
+    }
+
+    if (cacheKey && !emptyResolution) cache?.set(cacheKey, cloneLabels(overlay.pathLabels));
+  };
+
+  for (const place of places) {
+    await processPlace(place);
+    labels += place.overlay?.pathLabels?.length ?? 0;
+
+    await loop.yieldIfNeeded(++processed);
+  }
+
+  return { resolvedSegments, labels, ...loop.getStats() };
 }
 
-// The label context for one segment: what can be measured from its own geometry,
-// plus blanks for the note-wide metrics that cannot be split. Templates guard
-// with `this.X ? ... : ''`; a blank drops out of the label.
-function segmentLabelValues(
-  line: GeoJSON.Position[],
-  index: number,
-  total: number,
-  units: UnitsSystem,
-): Record<string, unknown> {
-  const distanceKm = DistanceCalculator.calculatePolylineDistanceKm(
-    line.map(position => ({ latitude: position[1] ?? 0, longitude: position[0] ?? 0 })),
-  );
-  const elevations = line.map(position => position[2]).filter((value): value is number => typeof value === "number");
-  let gain = 0;
-  let loss = 0;
-  for (let point = 1; point < elevations.length; point++) {
-    const delta = elevations[point] - elevations[point - 1];
-    if (delta > 0) gain += delta;
-    else loss -= delta;
-  }
-  const hasElevation = elevations.length > 0;
-
-  return {
-    "Distance": formatKmInSystem(distanceKm, units),
-    "Total Points": line.length,
-    "Segment": index + 1,
-    "Segment Count": total,
-    "Elevation Gain": hasElevation && gain > 0 ? formatMetersInSystem(meters(gain), units) : "",
-    "Elevation Loss": hasElevation && loss > 0 ? formatMetersInSystem(meters(loss), units) : "",
-    "Min Elevation": hasElevation ? formatMetersInSystem(meters(Math.min(...elevations)), units) : "",
-    "Max Elevation": hasElevation ? formatMetersInSystem(meters(Math.max(...elevations)), units) : "",
-    "Duration": "",
-    "Moving Time": "",
-    "Average Speed": "",
-    "Average Pace": "",
-    "Max Speed": "",
-    "Best Pace": "",
-    "Start Time": "",
-    "End Time": "",
-  };
+function cloneLabels(features: GeoJSON.Feature[]): GeoJSON.Feature[] {
+  return features.map(feature => ({ ...feature, properties: { ...feature.properties }, geometry: {
+    ...feature.geometry, coordinates: [...(feature.geometry as GeoJSON.Point).coordinates],
+  } as GeoJSON.Point }));
 }

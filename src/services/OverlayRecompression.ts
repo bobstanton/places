@@ -7,17 +7,16 @@ const OVERLAY_FIELDS = ["Overlay Source", "Overlay Cache"] as const;
 export function recompressOverlayValue(value: string, level?: number): string {
   const decoded = StringCompressor.decodeAndDecompress(value);
   const recompressed = StringCompressor.compressAndEncode(decoded, level);
+
   if (StringCompressor.decodeAndDecompress(recompressed) !== decoded) {
     throw new Error("Recompressed value failed verification");
   }
+
   return recompressed;
 }
 
 export class OverlayRecompressor {
-  constructor(
-    private readonly app: App,
-    private readonly level: number,
-  ) {}
+  constructor(private readonly app: App, private readonly level: number) {}
 
   async recompressVault(): Promise<void> {
     const files = this.app.vault.getMarkdownFiles();
@@ -28,6 +27,7 @@ export class OverlayRecompressor {
     let bytesBefore = 0;
     let bytesAfter = 0;
     const encoder = new TextEncoder();
+
     // Pass the level with each call rather than through the shared global:
     // that state is visible to every plugin bundle, and this loop awaits for
     // minutes, and setting it would silently recompress anything the user
@@ -36,6 +36,7 @@ export class OverlayRecompressor {
       for (let index = 0; index < files.length; index++) {
         const file = files[index];
         const frontmatter = this.app.metadataCache.getFileCache(file)?.frontmatter;
+
         if (!frontmatter) continue;
 
         const replacements: Record<string, string> = {};
@@ -43,13 +44,17 @@ export class OverlayRecompressor {
         let fileFailed = false;
         let fileBytesBefore = 0;
         let fileBytesAfter = 0;
+
         for (const field of OVERLAY_FIELDS) {
           const value = scalarToString(frontmatter[field]);
+
           if (!value) continue;
           hasOverlay = true;
           fileBytesBefore += encoder.encode(value).length;
+
           try {
             const replacement = recompressOverlayValue(value, this.level);
+
             fileBytesAfter += encoder.encode(replacement).length;
             if (replacement !== value) replacements[field] = replacement;
           } catch (error) {
@@ -87,6 +92,7 @@ export class OverlayRecompressor {
       ? `${formatBytes(saved)} saved (${percent.toFixed(1)}%)`
       : `${formatBytes(-saved)} larger (${percent.toFixed(1)}%)`;
     const summary = `Overlay recompression complete at level ${this.level}: ${updated} notes updated, ${unchanged} unchanged, ${spaceResult}${failed ? `, ${failed} failed (see console)` : ""}`;
+
     new Notice(summary, 8000);
     logger.info(summary);
   }
@@ -104,5 +110,6 @@ export class OverlayRecompressor {
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+
   return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
 }

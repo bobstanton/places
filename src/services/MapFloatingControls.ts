@@ -1,6 +1,6 @@
 import { setIcon } from "obsidian";
 import { type MapPlace } from "places-shared/overlay";
-import { type MapSearchToggle, setMapContainerState } from "places-shared/map";
+import { type MapSearchToggle, getMapContainerState, setMapContainerState } from "places-shared/map";
 import { type Place } from "places-shared/place";
 import { type PlacesBoundingBox } from "places-shared/geo";
 import { MapGeocodingSearch } from "./MapGeocodingSearch";
@@ -16,12 +16,15 @@ export interface FloatingButtonContainerOptions {
 
 export function createFloatingButtonContainer(options: FloatingButtonContainerOptions): HTMLElement {
   const className = options.className ?? 'places-floating-buttons';
+
   if (options.removeExisting !== false) {
     options.host.querySelector(`.${className}`)?.remove();
   }
+
   if (options.removeGeocodingSearch !== false) {
     options.host.querySelectorAll('.places-geocoding-search').forEach((el) => el.remove());
   }
+
   return options.host.createDiv(className);
 }
 
@@ -32,27 +35,39 @@ export interface MarkerSearchButtonOptions {
   onBeforeToggle?: () => void;
 }
 
-export function createMarkerSearchToggle(container: HTMLElement, controlHandle: MapControlHandle, places: MapPlace[]): MapSearchToggle | undefined {
-  if (!controlHandle.centerOnPlace && !controlHandle.highlightPlace) return undefined;
+export interface MarkerSearchHandle extends MapSearchToggle {
+  setPlaces(places: MapPlace[]): void;
+  destroy(): void;
+}
 
-  const searchToggle: MapSearchToggle = {} as MapSearchToggle;
+export function createMarkerSearchToggle(container: HTMLElement, getControlHandle: () => MapControlHandle | null, places: MapPlace[]): MarkerSearchHandle | undefined {
+  const controlHandle = getControlHandle();
+
+  if (!controlHandle?.centerOnPlace && !controlHandle?.highlightPlace) return undefined;
+
+  const searchToggle = {} as MarkerSearchHandle;
   const searchComponent = new MapSearchComponent(container, {
-    centerOnPlace: (place: MapPlace) => controlHandle.centerOnPlace?.(place),
-    highlightPlace: (place: MapPlace) => controlHandle.highlightPlace?.(place),
+    centerOnPlace: (place: MapPlace) => getControlHandle()?.centerOnPlace?.(place),
+    highlightPlace: (place: MapPlace) => getControlHandle()?.highlightPlace?.(place),
+    clearHighlight: () => getControlHandle()?.clearHighlight?.(),
     onClose: () => {
-      controlHandle.clearHighlight?.();
       searchToggle.onCloseCallback?.();
     },
     renderIcon: (iconContainer, iconSource) => setIcon(iconContainer, iconSource),
   });
+
   searchComponent.setPlaces(places);
   searchToggle.toggle = () => searchComponent.toggle();
   searchToggle.isVisible = () => searchComponent.visible;
+  searchToggle.setPlaces = places => searchComponent.setPlaces(places);
+  searchToggle.destroy = () => searchComponent.destroy();
+
   return searchToggle;
 }
 
 export function createMarkerSearchButton(options: MarkerSearchButtonOptions): HTMLElement {
   const searchButton = options.buttonContainer.createDiv('places-floating-button');
+
   searchButton.setAttribute('aria-label', options.ariaLabel ?? 'Find marker on map');
   setIcon(searchButton, 'target');
 
@@ -63,6 +78,7 @@ export function createMarkerSearchButton(options: MarkerSearchButtonOptions): HT
   searchButton.addEventListener('click', () => {
     options.onBeforeToggle?.();
     options.searchToggle.toggle();
+
     if (options.searchToggle.isVisible()) {
       searchButton.addClass('is-active');
     } else {
@@ -71,6 +87,19 @@ export function createMarkerSearchButton(options: MarkerSearchButtonOptions): HT
   });
 
   return searchButton;
+}
+
+export interface DevicePositionButtonOptions {
+  buttonContainer: HTMLElement;
+  setControl: NonNullable<MapControlHandle['setDevicePositionControl']>;
+}
+
+export function createDevicePositionButton(options: DevicePositionButtonOptions): HTMLButtonElement {
+  const button = options.buttonContainer.createEl('button', { cls: 'places-floating-button' });
+
+  options.setControl(button);
+
+  return button;
 }
 
 // Per-place action id for turning a geocoding search result into a note.
@@ -100,12 +129,13 @@ export interface GeocodingSearchButtonHandle {
   readonly button: HTMLElement;
   isVisible(): boolean;
   hide(): void;
+  destroy(): void;
 }
 
-// The "Search for Places" button and its panel, shared by the places block and the Bases map view.
 export function createGeocodingSearchButton(options: GeocodingSearchButtonOptions): GeocodingSearchButtonHandle {
   const button = options.buttonContainer.createDiv('places-floating-button');
-  button.setAttribute('aria-label', 'Search for Places');
+
+  button.setAttribute('aria-label', 'Search for places');
   setIcon(button, 'search');
 
   const search = new MapGeocodingSearch(options.container, {
@@ -117,16 +147,11 @@ export function createGeocodingSearchButton(options: GeocodingSearchButtonOption
     resolveResultIcon: options.resolveResultIcon,
     getMapBounds: options.getMapBounds,
     onResultsChanged: (places: Place[]) => {
-      // A result whose coordinates are still pending (Mapbox suggest) has no
-      // real location yet - mapping its placeholder would drop a marker at 0,0.
-      // It stays in the list; clicking it resolves and then places the marker.
       options.setGeocodingSearchMarkers(places.filter(place => !place.coordinatesPending).map((place, index) => ({
         id: `geocoding-search:${index}`,
         latitude: place.latitude,
         longitude: place.longitude,
         name: place.name,
-        // Preview markers show the icon the note would get, resolved by the
-        // place-note host's marker icon rules, and saving changes nothing visually.
         icon: options.resolveResultIcon(place),
         metadata: { geocodingSearchResult: place },
         actions: [{ id: CREATE_NOTE_ACTION_ID, label: '📝 Create note' }],
@@ -136,13 +161,13 @@ export function createGeocodingSearchButton(options: GeocodingSearchButtonOption
     renderIcon: (iconContainer, iconSource) => setIcon(iconContainer, iconSource),
   });
 
-  setMapContainerState(options.mapContainer, {
-    geocodingToggle: {
-      toggle: () => search.toggle(),
-      isVisible: () => search.visible,
-      onCloseCallback: () => button.removeClass('is-active'),
-    },
-  });
+  const geocodingToggle = {
+    toggle: () => search.toggle(),
+    isVisible: () => search.visible,
+    onCloseCallback: () => button.removeClass('is-active'),
+  };
+
+  setMapContainerState(options.mapContainer, { geocodingToggle });
 
   button.addEventListener('click', () => {
     options.onBeforeOpen?.();
@@ -156,6 +181,15 @@ export function createGeocodingSearchButton(options: GeocodingSearchButtonOption
     hide: () => {
       search.hide();
       button.removeClass('is-active');
+    },
+    destroy: () => {
+      search.destroy();
+
+      if (getMapContainerState(options.mapContainer)?.geocodingToggle === geocodingToggle) {
+        setMapContainerState(options.mapContainer, { geocodingToggle: undefined });
+      }
+
+      button.remove();
     },
   };
 }

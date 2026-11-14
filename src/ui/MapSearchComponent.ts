@@ -1,5 +1,7 @@
+import { positionFloatingPanel } from "./FloatingPanelPosition";
 import { MapPlace } from "places-shared/place";
 import { renderSearchResult } from "places-shared/map";
+import { getPlaceId } from "places-shared/track";
 
 export interface SearchResult {
   place: MapPlace;
@@ -9,6 +11,7 @@ export interface SearchResult {
 export interface MapSearchCallbacks {
   centerOnPlace: (place: MapPlace) => void;
   highlightPlace: (place: MapPlace) => void;
+  clearHighlight?: () => void;
   onClose?: () => void;
   renderIcon?: (iconContainer: HTMLElement, iconName: string) => void;
 }
@@ -33,32 +36,44 @@ export class MapSearchComponent {
   private currentIndex = 0;
   private callbacks: MapSearchCallbacks;
   private isVisible = false;
+  private destroyed = false;
+  private disposePosition: (() => void) | null = null;
+  private disposeDocumentKeys: (() => void) | null = null;
 
-  constructor(parentContainer: HTMLElement, callbacks: MapSearchCallbacks) {
+  constructor(private readonly parentContainer: HTMLElement, callbacks: MapSearchCallbacks) {
     this.callbacks = callbacks;
     this.container = this.createSearchBar(parentContainer);
   }
 
   setPlaces(places: MapPlace[]): void {
+    if (this.destroyed) return;
     this.places = places;
+
     if (this.input.value) {
-      this.performSearch(this.input.value);
+      this.performSearch(this.input.value, true);
     }
   }
 
   show(): void {
+    if (this.destroyed) return;
     this.container.removeClass(SearchClasses.hidden);
     this.isVisible = true;
+    this.disposePosition?.();
+    this.disposePosition = positionFloatingPanel(this.parentContainer, this.container);
     this.input.focus();
   }
 
   hide(): void {
+    if (this.destroyed) return;
     this.container.addClass(SearchClasses.hidden);
     this.isVisible = false;
+    this.disposePosition?.();
+    this.disposePosition = null;
     this.input.value = '';
     this.results = [];
     this.currentIndex = 0;
     this.resultsEl.empty();
+    this.callbacks.clearHighlight?.();
     this.callbacks.onClose?.();
   }
 
@@ -76,6 +91,7 @@ export class MapSearchComponent {
 
   private createSearchBar(parent: HTMLElement): HTMLElement {
     const container = parent.createDiv();
+
     container.className = `${SearchClasses.container} ${SearchClasses.hidden}`;
     parent.insertBefore(container, parent.firstChild);
 
@@ -89,6 +105,7 @@ export class MapSearchComponent {
     });
 
     const closeBtn = container.createDiv({ cls: SearchClasses.closeButton, text: '×' });
+
     closeBtn.setAttribute('aria-label', 'Close search');
 
     this.resultsEl = container.createDiv({ cls: SearchClasses.results });
@@ -96,6 +113,7 @@ export class MapSearchComponent {
     this.resultsEl.addEventListener('wheel', (e) => {
       const canScrollUp = this.resultsEl.scrollTop > 0;
       const canScrollDown = this.resultsEl.scrollTop < this.resultsEl.scrollHeight - this.resultsEl.clientHeight;
+
       if ((e.deltaY < 0 && canScrollUp) || (e.deltaY > 0 && canScrollDown)) {
         e.stopPropagation();
       } else if (this.resultsEl.scrollHeight > this.resultsEl.clientHeight) {
@@ -119,13 +137,14 @@ export class MapSearchComponent {
       this.performSearch(this.input.value);
     });
 
-    this.input.addEventListener('keydown', (e) => {
+    const handleKeydown = (e: KeyboardEvent) => {
       stopEvent(e);
 
       if (e.key === 'Enter') {
         if (this.results.length > 0) {
           this.navigateToResult(this.currentIndex);
         }
+
         e.preventDefault();
       } else if (e.key === 'Escape') {
         this.hide();
@@ -137,7 +156,9 @@ export class MapSearchComponent {
         this.selectNext();
         e.preventDefault();
       }
-    });
+    };
+
+    this.input.addEventListener('keydown', handleKeydown);
 
     this.input.addEventListener('keyup', stopEvent);
     this.input.addEventListener('keypress', stopEvent);
@@ -154,26 +175,38 @@ export class MapSearchComponent {
 
     const documentKeyHandler = (e: KeyboardEvent) => {
       if (e.target === this.input) {
+        if (e.type === 'keydown') handleKeydown(e);
         e.stopPropagation();
         e.stopImmediatePropagation();
       }
     };
-    activeDocument.addEventListener('keydown', documentKeyHandler, true);
-    activeDocument.addEventListener('keyup', documentKeyHandler, true);
-    activeDocument.addEventListener('keypress', documentKeyHandler, true);
+    const ownerDocument = this.input.ownerDocument;
 
-    (this.input as unknown as Record<string, unknown>)._documentKeyHandler = documentKeyHandler;
+    ownerDocument.addEventListener('keydown', documentKeyHandler, true);
+    ownerDocument.addEventListener('keyup', documentKeyHandler, true);
+    ownerDocument.addEventListener('keypress', documentKeyHandler, true);
+
+    this.disposeDocumentKeys = () => {
+      ownerDocument.removeEventListener('keydown', documentKeyHandler, true);
+      ownerDocument.removeEventListener('keyup', documentKeyHandler, true);
+      ownerDocument.removeEventListener('keypress', documentKeyHandler, true);
+    };
 
     return container;
   }
 
-  private performSearch(query: string): void {
+  private performSearch(query: string, preserveSelection = false): void {
+    const selected = preserveSelection ? this.results[this.currentIndex]?.place : undefined;
+    const selectedId = selected ? getPlaceId(selected) : undefined;
+    const scrollTop = this.resultsEl.scrollTop;
     const normalizedQuery = query.toLowerCase().trim();
 
     if (!normalizedQuery) {
       this.results = [];
       this.currentIndex = 0;
       this.resultsEl.empty();
+      this.callbacks.clearHighlight?.();
+
       return;
     }
 
@@ -185,15 +218,28 @@ export class MapSearchComponent {
       .sort((a, b) => {
         const aStarts = a.place.name.toLowerCase().startsWith(normalizedQuery);
         const bStarts = b.place.name.toLowerCase().startsWith(normalizedQuery);
+
         if (aStarts !== bStarts) return aStarts ? -1 : 1;
+
         return 0;
       });
 
-    this.currentIndex = 0;
+    const selectedIndex = selectedId === undefined ? -1 : this.results.findIndex(result => getPlaceId(result.place) === selectedId);
+
+    this.currentIndex = Math.max(0, selectedIndex);
     this.renderResults();
+
+    if (preserveSelection) {
+      this.resultsEl.scrollTop = scrollTop;
+      if (selectedId !== undefined && selectedIndex < 0) this.callbacks.clearHighlight?.();
+
+      return;
+    }
 
     if (this.results.length > 0) {
       this.navigateToResult(0);
+    } else {
+      this.callbacks.clearHighlight?.();
     }
   }
 
@@ -204,11 +250,13 @@ export class MapSearchComponent {
       if (this.input.value.trim()) {
         this.resultsEl.createDiv({ cls: 'places-geocoding-no-results', text: 'No markers found' });
       }
+
       return;
     }
 
     this.results.forEach((result, displayIndex) => {
       const item = this.resultsEl.createDiv({ cls: SearchClasses.resultItem });
+
       item.setAttribute('data-index', String(displayIndex));
 
       if (displayIndex === this.currentIndex) {
@@ -258,6 +306,7 @@ export class MapSearchComponent {
     });
 
     const currentItem = this.resultsEl.querySelector(`[data-index="${this.currentIndex}"]`);
+
     if (currentItem) {
       currentItem.addClass(SearchClasses.selectedResult);
       currentItem.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
@@ -282,6 +331,7 @@ export class MapSearchComponent {
     if (this.results.length === 0 || index < 0 || index >= this.results.length) return;
 
     const result = this.results[index];
+
     this.callbacks.centerOnPlace(result.place);
     this.callbacks.highlightPlace(result.place);
 
@@ -289,12 +339,13 @@ export class MapSearchComponent {
   }
 
   destroy(): void {
-    const handler = (this.input as unknown as Record<string, unknown>)._documentKeyHandler;
-    if (handler) {
-      activeDocument.removeEventListener('keydown', handler as EventListener, true);
-      activeDocument.removeEventListener('keyup', handler as EventListener, true);
-      activeDocument.removeEventListener('keypress', handler as EventListener, true);
-    }
+    if (this.destroyed) return;
+    this.hide();
+    this.destroyed = true;
+    this.disposePosition?.();
+    this.disposePosition = null;
+    this.disposeDocumentKeys?.();
+    this.disposeDocumentKeys = null;
     this.container.remove();
   }
 }

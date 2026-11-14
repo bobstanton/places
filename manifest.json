@@ -1,7 +1,7 @@
 {
 	"id": "places",
 	"name": "Places",
-	"version": "0.0.1",
+	"version": "0.0.2",
 	"minAppVersion": "1.13.0",
 	"description": "Create interactive maps with markers, tracks, overlays, image alignment, heatmaps, VaultQuery data, CSV and GPX imports, custom styling, charts, search, directions, and provider extensions.",
 	"author": "Bob Stanton",

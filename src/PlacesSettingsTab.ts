@@ -1,52 +1,29 @@
 import { getErrorMessage, scalarToString } from "places-shared/utils";
 import { DEFAULT_SPEED_WINDOW, parseMetricWindow } from "places-shared/settings";
-import { App, Notice, PluginSettingTab, Setting } from "obsidian";
-import type { SettingDefinitionItem, SettingGroupItem } from "obsidian";
-import { TileCache } from "places-shared/map";
-import { parseTagFilterPatterns } from "./services/PlaceTagFilter";
-import { DEFAULT_SETTINGS, DateParser } from "places-shared/settings";
-import { type PlaceProviderExport, type ExtensionSettingsGroup } from "places-shared/services";
-import { IPlacesUsageStats } from "./places-services/PlacesUsageStats";
-import { PlacesStatsCalculator } from "./places-services/PlacesStatsCalculator";
+import { App, Notice, PluginSettingTab, Setting, TextAreaComponent } from "obsidian";
+import type { SettingDefinitionItem, SettingDefinitionPage, SettingGroupItem } from "obsidian";
+import { TileCache } from "places-shared/obsidian/map";
+import { clearStoredPictures, getStoredPictureStats, defaultMarkerIconRules, defaultWaypointIconMappings } from "places-shared/map";
+import { openLocalFile } from "places-shared/obsidian/utils";
+import { parseTagFilterPatterns } from "./core/map/PlaceTagFilter";
+import { DEFAULT_SETTINGS, DEFAULT_TILE_CACHE_DURATION_HOURS } from "places-shared/settings";
+import { API_USAGE_SERVICES } from "places-shared/services";
+import { type PlaceProviderExport, type ExtensionSettingsGroup } from "places-shared/obsidian/services";
+import { PlacesStatsCalculator, type OriginSummary, type ServiceSummary } from "./places-services/PlacesStatsCalculator";
 import PlacesPlugin from "./main";
+import { EXTENSION_KEY_PREFIX, buildExtensionSettingsPages, parseExtensionKey } from "./settings/ExtensionSettingsPages";
+import { TemplateReferenceSuggest } from "./settings/TemplateReferenceSuggest";
 
 // Control keys of the form `tileCacheProvider:<name>` toggle one provider's tile-cache opt-out.
 const TILE_PROVIDER_KEY_PREFIX = "tileCacheProvider:";
 
-// Control keys of the form `extension:<plugin>:<key>` route to that extension's settings object.
-const EXTENSION_KEY_PREFIX = "extension:";
-
-function parseExtensionKey(key: string): { plugin: string; localKey: string } {
-  const rest = key.slice(EXTENSION_KEY_PREFIX.length);
-  const separator = rest.indexOf(":");
-  return { plugin: rest.slice(0, separator), localKey: rest.slice(separator + 1) };
-}
-
-// Rewrites extension-local control keys to `extension:<plugin>:<key>` for the host tab to route reads and writes.
-function namespaceExtensionItem(plugin: string, item: SettingDefinitionItem): SettingDefinitionItem {
-  if ("control" in item && item.control) {
-    return { ...item, control: { ...item.control, key: `${EXTENSION_KEY_PREFIX}${plugin}:${item.control.key}` } };
-  }
-  if ("type" in item && (item.type === "group" || item.type === "list")) {
-    return { ...item, items: item.items?.map(child => namespaceExtensionItem(plugin, child) as SettingGroupItem) };
-  }
-  if ("type" in item && item.type === "page" && item.items) {
-    return { ...item, items: item.items.map(child => namespaceExtensionItem(plugin, child)) };
-  }
-  return item;
-}
-
 const SPEED_WINDOW_PLACEHOLDER = "200m";
 const GRADE_WINDOW_PLACEHOLDER = "100ft";
 
-// Line-oriented textarea values stored as string arrays.
-const LINE_LIST_KEYS = new Set(["poiFilterPatterns", "newPlaceTagFilterPatterns", "markerIconRules"]);
+const LINE_LIST_KEYS = new Set(["poiFilterPatterns", "newPlaceTagFilterPatterns", "markerIconRules", "waypointIconMappings"]);
 
-// The main settings tab, built on the declarative settings API (Obsidian
-// 1.13+): every plain control is a definition: reading, persisting, and
-// the global settings search all come from the framework. Imperative
-// `render` rows remain only where the UI is custom (extension tabs, the
-// cached-tiles panel, API usage statistics).
+const ORIGIN_ROW_LIMIT = 50;
+
 export class PlacesSettingsTab extends PluginSettingTab {
   constructor(app: App, private plugin: PlacesPlugin, private extensionSettingsGroups: Record<string, ExtensionSettingsGroup>) {
     super(app, plugin);
@@ -56,19 +33,32 @@ export class PlacesSettingsTab extends PluginSettingTab {
     if (key.startsWith(EXTENSION_KEY_PREFIX)) {
       const { plugin, localKey } = parseExtensionKey(key);
       const group = this.extensionSettingsGroups[plugin];
+
       if (group?.getValue) return group.getValue(localKey);
+
       return PlacesPlugin.settings.extensionSettings[plugin]?.[localKey];
     }
+
     if (key.startsWith(TILE_PROVIDER_KEY_PREFIX)) {
-      return PlacesPlugin.settings.tileCacheEnabledProviders[key.slice(TILE_PROVIDER_KEY_PREFIX.length)] !== false;
+      const providerName = key.slice(TILE_PROVIDER_KEY_PREFIX.length);
+      const provider = this.plugin.getRegisteredProviders()
+        .find(candidate => candidate.name.toLowerCase() === providerName);
+
+      if (provider?.features?.tileCache !== true) return false;
+
+      return PlacesPlugin.settings.tileCacheEnabledProviders[providerName] !== false;
     }
+
     const settings = PlacesPlugin.settings as unknown as Record<string, unknown>;
+
     if (LINE_LIST_KEYS.has(key)) {
       return (settings[key] as string[]).join("\n");
     }
+
     if (key === "overlayCompressionLevel") {
       return String(settings[key]);
     }
+
     return settings[key];
   }
 
@@ -76,26 +66,34 @@ export class PlacesSettingsTab extends PluginSettingTab {
     if (key.startsWith(EXTENSION_KEY_PREFIX)) {
       const { plugin, localKey } = parseExtensionKey(key);
       const group = this.extensionSettingsGroups[plugin];
+
       if (group?.setValue) {
         await group.setValue(localKey, value);
       } else {
         (PlacesPlugin.settings.extensionSettings[plugin] ??= {})[localKey] = scalarToString(value);
       }
+
       await PlacesPlugin.saveSettings();
+      if (group?.reloadOn?.includes(localKey)) this.plugin.scheduleExtensionReload(plugin);
       if (group?.updateOn?.includes(localKey)) this.update();
+
       return;
     }
+
     if (key.startsWith(TILE_PROVIDER_KEY_PREFIX)) {
       PlacesPlugin.settings.tileCacheEnabledProviders[key.slice(TILE_PROVIDER_KEY_PREFIX.length)] = value as boolean;
       PlacesPlugin.configureTileCache();
       await PlacesPlugin.saveSettings();
+
       return;
     }
 
     const settings = PlacesPlugin.settings as unknown as Record<string, unknown>;
+
     switch (key) {
       case "poiFilterPatterns":
       case "markerIconRules":
+      case "waypointIconMappings":
         settings[key] = String(value).split("\n").map(line => line.trimEnd()).filter(line => line.trim().length > 0);
         break;
       case "newPlaceTagFilterPatterns":
@@ -115,6 +113,10 @@ export class PlacesSettingsTab extends PluginSettingTab {
       case "tileCacheDurationHoursMobile":
         settings[key] = Math.min(999, Math.max(0, Math.trunc(Number(value) || 0)));
         break;
+      case "overlayCacheMaxSizeMBDesktop":
+      case "overlayCacheMaxSizeMBMobile":
+        settings[key] = Math.max(1, Math.trunc(Number(value)) || DEFAULT_SETTINGS[key]);
+        break;
       case "tileCacheMaxSizeMBDesktop":
         settings[key] = Math.max(1, Math.trunc(Number(value)) || DEFAULT_SETTINGS.tileCacheMaxSizeMBDesktop);
         break;
@@ -133,54 +135,248 @@ export class PlacesSettingsTab extends PluginSettingTab {
     if (key === "speedWindow" || key === "gradeWindow") {
       PlacesPlugin.applyMetricWindowSettings();
     }
+
+    if (key === "units") {
+      this.plugin.scheduleAllExtensionReloads();
+    }
+
+    if (key.startsWith("overlayCache")) {
+      PlacesPlugin.configureOverlayDecodeCache();
+    }
+
     if (key.startsWith("tileCache")) {
       PlacesPlugin.configureTileCache();
-      // Cache-size rows show only while their duration is non-zero.
       this.update();
     }
   }
 
   public getSettingDefinitions(): SettingDefinitionItem[] {
     return [
-      { type: "group", heading: "Note naming", items: this.noteNamingItems() },
-      { type: "group", heading: "Map defaults", items: this.mapDefaultItems() },
-      { type: "group", heading: "Marker clustering", items: this.clusteringItems() },
-      { type: "group", heading: "File import", items: this.fileImportItems() },
-      ...this.extensionItems(),
-      { type: "group", heading: "Tile cache", items: this.tileCacheItems() },
-      { type: "group", heading: "Debug", items: this.debugItems() },
+      this.placesAndNotesPage(),
+      this.mapsAndMarkersPage(),
+      this.tracksAndImportsPage(),
+      this.extensionsPage(),
+      this.cacheAndStoragePage(),
+      this.diagnosticsPage(),
+    ];
+  }
+
+  private placesAndNotesPage(): SettingDefinitionPage {
+    return {
+      type: "page",
+      name: "Places and notes",
+      desc: "Configure notes created or updated by Places.",
+      items: this.groupWhenUseful("Note creation", this.placeNoteItems()),
+    };
+  }
+
+  private mapsAndMarkersPage(): SettingDefinitionPage {
+    return {
+      type: "page",
+      name: "Maps and markers",
+      desc: "Set map, marker, label, and discovery defaults.",
+      displayValue: () => {
+        const provider = PlacesPlugin.settings.defaultMapProvider;
+
+        return provider ? provider.charAt(0).toUpperCase() + provider.slice(1) : "First available";
+      },
+      items: [
+        ...this.groupWhenUseful("Map defaults", this.mapDefaultItems()),
+        ...this.groupWhenUseful("Labels", this.labelItems()),
+        ...this.groupWhenUseful("Styles", this.styleItems()),
+        ...this.groupWhenUseful("POI discovery", this.poiDiscoveryItems()),
+        ...this.groupWhenUseful("Marker clustering", this.clusteringItems()),
+      ],
+    };
+  }
+
+  private tracksAndImportsPage(): SettingDefinitionPage {
+    return {
+      type: "page",
+      name: "Tracks and imports",
+      desc: "Configure measurements and imported track or overlay files.",
+      displayValue: () => PlacesPlugin.settings.units === "metric" ? "Metric" : "Imperial",
+      items: [
+        ...this.groupWhenUseful("Measurements", this.measurementItems()),
+        ...this.groupWhenUseful("Import behavior", this.fileImportItems()),
+        ...this.groupWhenUseful("Track notes", this.trackNoteItems()),
+        ...this.groupWhenUseful("Overlay storage", this.overlayStorageItems()),
+      ],
+    };
+  }
+
+  private extensionsPage(): SettingDefinitionPage {
+    const extensionCount = Object.keys(this.extensionSettingsGroups).length;
+    const pages = this.extensionItems();
+    const providerPages = pages.filter(({ category }) => category === "provider").map(({ page }) => page);
+    const featurePages = pages.filter(({ category }) => category === "feature").map(({ page }) => page);
+    const items: SettingDefinitionItem[] = [];
+
+    items.push(...this.groupWhenUseful("Providers", providerPages));
+    items.push(...this.groupWhenUseful("Feature extensions", featurePages));
+    if (items.length === 0) items.push({ name: "", desc: "No configurable Places extensions are installed." });
+
+    return {
+      type: "page",
+      name: "Extensions",
+      desc: "Configure installed Places providers and feature extensions.",
+      displayValue: extensionCount === 1 ? "1 configurable extension" : `${extensionCount} configurable extensions`,
+      items,
+    };
+  }
+
+  private cacheAndStoragePage(): SettingDefinitionPage {
+    return {
+      type: "page",
+      name: "Cache and storage",
+      desc: "Manage map tile caching on desktop and mobile.",
+      displayValue: () => this.tileCacheSummary(),
+      items: [
+        ...this.groupWhenUseful("Desktop tile cache", this.desktopTileCacheItems()),
+        ...this.groupWhenUseful("Mobile tile cache", this.mobileTileCacheItems()),
+        ...this.groupWhenUseful("Provider caching", this.tileCacheProviderItems()),
+        this.cachedTilesItem(),
+        this.markerThumbnailsItem(),
+      ],
+    };
+  }
+
+  private diagnosticsPage(): SettingDefinitionPage {
+    const logLabels: Record<string, string> = {
+      none: "Logging off",
+      error: "Errors",
+      warn: "Warnings and errors",
+      info: "Info and above",
+      debug: "Debug and above",
+    };
+
+    return {
+      type: "page",
+      name: "Diagnostics",
+      desc: "Control logging and review provider API usage.",
+      displayValue: () => logLabels[PlacesPlugin.settings.consoleLogLevel] ?? "Logging configured",
+      items: [
+        ...this.groupWhenUseful("Logging", this.debugItems()),
+        this.apiUsagePage(),
+      ],
+    };
+  }
+
+  private groupWhenUseful(heading: string, items: SettingGroupItem[]): SettingDefinitionItem[] {
+    if (items.length <= 1) return items;
+
+    return [{ type: "group", heading, cls: "places-settings-group", items }];
+  }
+
+  private placeNoteItems(): SettingGroupItem[] {
+    return [
       {
-        type: "group",
-        heading: "API usage statistics",
-        items: [{
-          name: "API usage statistics",
-          searchable: false,
-          render: (setting: Setting) => {
-            setting.settingEl.empty();
-            this.renderUsageStatistics(setting.settingEl);
-          },
-        }],
+        name: "Place note name format",
+        desc: "Name format for notes created or updated from a place. Supports ${name}, ${city}, and ${state}.",
+        control: { type: "text", key: "noteNameFormat", placeholder: "${name} (${city})" },
+      },
+      {
+        name: "New place content template",
+        desc: "Vault file containing a Knap template for new places from search or the map menu. Adds content and properties; generated place properties take precedence. Leave empty for none.",
+        control: { type: "text", key: "newPlaceTemplate", placeholder: "Templates/New place.knap.md" },
+      },
+      {
+        name: "New place tag filters",
+        desc: "Tags excluded when a place is added or updated. Enter one tag per line.",
+        render: setting => this.renderTextAreaSetting(setting, "newPlaceTagFilterPatterns", DEFAULT_SETTINGS.newPlaceTagFilterPatterns.join("\n"), 6),
+      },
+      {
+        name: "Default marker icon rules",
+        desc: "Icon rules for new, imported, or refreshed notes. Use tag:, name:, or path:; first match wins.",
+        render: (setting: Setting) => this.renderMarkerIconRules(setting),
       },
     ];
   }
 
-  private noteNamingItems(): SettingGroupItem[] {
-    return [{
-      name: "Place note name format",
-      desc: "Format when updating a note with Place data (e.g., from search). Placeholders: ${name} ${city} ${state}",
-      control: { type: "text", key: "noteNameFormat", placeholder: "${name} (${city})" },
-    }];
+  private renderMarkerIconRules(setting: Setting): void {
+    let rulesText: TextAreaComponent | undefined;
+
+    setting.setClass("places-setting-textarea");
+    setting.nameEl.addClass("places-setting-name-reset");
+
+    setting.addExtraButton((button) => {
+      button.setIcon("rotate-ccw").setTooltip("Restore the default rules");
+      button.extraSettingsEl.addClass("places-settings-reset");
+      setting.nameEl.appendChild(button.extraSettingsEl);
+      button.onClick(async () => {
+        const defaults = defaultMarkerIconRules().join("\n");
+
+        await this.setControlValue("markerIconRules", defaults);
+        rulesText?.setValue(defaults);
+        new Notice("Marker icon rules restored to defaults");
+      });
+    });
+    setting.addTextArea((text) => {
+      rulesText = text;
+      text.inputEl.rows = 8;
+      text.setPlaceholder("name:ski|snowboard => 🎿\npath:(^|/)Biking Trails(/|$) => 🚲\ntag:^pizza$ => 🍕");
+      text.setValue(PlacesPlugin.settings.markerIconRules.join("\n"));
+      text.onChange((value) => void this.setControlValue("markerIconRules", value));
+    });
   }
 
   private mapDefaultItems(): SettingGroupItem[] {
     const installedProviders = PlacesPlugin.getAllMapProviders().sort((a, b) => a.localeCompare(b));
     const providerOptions: Record<string, string> = { "": "First available" };
+
     for (const provider of installedProviders) {
       providerOptions[provider] = provider.charAt(0).toUpperCase() + provider.slice(1);
     }
 
+    return [
+      {
+        name: "Default map provider",
+        desc: "Provider used when a places block does not specify mapProvider.",
+        control: { type: "dropdown", key: "defaultMapProvider", options: providerOptions, defaultValue: "" },
+      },
+      {
+        name: "Default template",
+        desc: "Template inherited by every places block. Type # after the note name to choose a heading. Leave empty for none.",
+        render: (setting: Setting) => this.renderDefaultTemplate(setting),
+      },
+      {
+        name: "Show help with empty map",
+        desc: "Show place-creation help below maps with no results.",
+        control: { type: "toggle", key: "showHelpWithEmptyMap" },
+      },
+      {
+        name: "Show current device position",
+        desc: "",
+        control: { type: "toggle", key: "showCurrentDevicePosition" },
+      },
+    ];
+  }
+
+  private renderDefaultTemplate(setting: Setting): () => void {
+    let suggest: TemplateReferenceSuggest | undefined;
+
+    setting.addText(text => {
+      const save = (value: string): void => { void this.setControlValue("defaultTemplate", value); };
+
+      text.setPlaceholder("[[Shared/Templates#Base Map]]")
+        .setValue(PlacesPlugin.settings.defaultTemplate)
+        .onChange(save);
+      suggest = new TemplateReferenceSuggest(this.app, text.inputEl);
+      suggest.onSelect(value => {
+        text.setValue(value);
+        text.inputEl.setSelectionRange(value.length - 2, value.length - 2);
+        save(value);
+        suggest?.close();
+      });
+    });
+
+    return () => suggest?.close();
+  }
+
+  private measurementItems(): SettingGroupItem[] {
     const metricWindowValidator = (placeholder: string) => (value: string): string | void => {
       const effective = value.trim() || placeholder;
+
       try {
         parseMetricWindow(effective, DEFAULT_SPEED_WINDOW);
       } catch (error) {
@@ -190,13 +386,7 @@ export class PlacesSettingsTab extends PluginSettingTab {
 
     return [
       {
-        name: "Default map provider",
-        desc: "The map provider to use when mapProvider is not specified in a code block. Only shows installed providers.",
-        control: { type: "dropdown", key: "defaultMapProvider", options: providerOptions, defaultValue: "" },
-      },
-      {
         name: "Unit system",
-        desc: "Choose between imperial (miles, mph, feet) and metric (kilometers, kph, meters) units for distance, speed, and elevation measurements",
         control: {
           type: "dropdown",
           key: "units",
@@ -205,91 +395,149 @@ export class PlacesSettingsTab extends PluginSettingTab {
       },
       {
         name: "Speed window",
-        desc: "Span speed and pace are averaged over. A distance (200m, 500ft, 0.25mi) keeps the same spatial context at every speed; a time (30s, 5min) reads better across stops, where a distance window spans the whole pause. Override per block with speedWindow:.",
+        desc: "Distance or time span used to average speed and pace.",
         control: { type: "text", key: "speedWindow", placeholder: SPEED_WINDOW_PLACEHOLDER, validate: metricWindowValidator(SPEED_WINDOW_PLACEHOLDER) },
       },
       {
         name: "Grade window",
-        desc: "Span the rolling grade is measured over, used for grade colouring and grade charts. A distance (100ft, 50m) or a time (10min). Track colouring on a map is distance-only. Override per block with gradeWindow:.",
+        desc: "Rolling-grade window. Map blocks require a distance; charts also accept time.",
         control: { type: "text", key: "gradeWindow", placeholder: GRADE_WINDOW_PLACEHOLDER, validate: metricWindowValidator(GRADE_WINDOW_PLACEHOLDER) },
       },
+    ];
+  }
+
+  private labelItems(): SettingGroupItem[] {
+    return [
       {
         name: "Default label template",
-        desc: "Template for map marker labels. Use {this.name}, {this.filename}, or helpers like {h.before(this.name, '(')} to remove city name. Leave empty to use the default name. Can be overridden per code block with labelTemplate. See ```places-help``` for all placeholders.",
+        desc: "Template for marker labels. Leave empty to use the place name.",
         control: { type: "text", key: "defaultLabelTemplate", placeholder: "{h.before(this.name, '(')}" },
       },
       {
         name: "Default route label template",
-        desc: "Template for generated directions labels. Use {this.distance_text}, {this.duration_text}, {this.distance_meters}, or {this.duration_seconds}. Can be overridden per code block with routeLabelTemplate or inside directions with labelTemplate.",
+        desc: "Template for generated directions labels.",
         control: { type: "text", key: "defaultRouteLabelTemplate", placeholder: "{this.distance_text} · {this.duration_text}" },
       },
       {
         name: "Waypoint label template",
-        desc: "Template for waypoint marker labels: directions route endpoints (start / stop / end) and GPX <wpt> markers. Use {this.name}, {this.role_label}, {this.index}, {this.icon}, or {this.path}. Leave empty for the defaults (Start:/Stop N:/End: for directions, the name for GPX waypoints). Override per code block or per overlay with waypointLabelTemplate.",
+        desc: "Template for route and GPX waypoint labels.",
         control: { type: "text", key: "waypointLabelTemplate", placeholder: "{this.role_label}: {this.name}" },
       },
       {
-        name: "Path start label",
-        desc: "Default start label for GPX/path overlays. Resolved against the track note's frontmatter, like VaultQuery templates: {this.Distance}, {this['Elevation Gain']}, {this.title}, {h.wikilink(this.path)}. Override per block with track.labels.start, or per note with the matching frontmatter property.",
+        name: "Track start label",
+        desc: "Default start label for track overlays.",
         control: { type: "text", key: "pathStartLabelTemplate", placeholder: "(none)" },
       },
       {
-        name: "Path midpoint label",
-        desc: "Default midpoint label for GPX/path overlays; resolves like the start label. Use {h.round(this.Distance)} to round a number to 2 decimals. Leave empty to use the built-in default. Override per block with track.labels.midpoint.",
+        name: "Track midpoint label",
+        desc: "Default midpoint label for track overlays.",
         control: { type: "text", key: "pathMidpointLabelTemplate", placeholder: "{this.Distance} · {this['Elevation Gain']}" },
       },
       {
-        name: "Path end label",
-        desc: "Default end label for GPX/path overlays; resolves like the start label. Override per block with track.labels.end.",
+        name: "Track end label",
+        desc: "Default end label for track overlays.",
         control: { type: "text", key: "pathEndLabelTemplate", placeholder: "(none)" },
       },
+    ];
+  }
+
+  private styleItems(): SettingGroupItem[] {
+    return [
       {
         name: "Default icon styles",
-        desc: "Conditional icon style rules to apply to all Places maps before per-map iconStyles. Leave empty for no global icon styles.",
-        control: { type: "textarea", key: "defaultIconStyles", placeholder: "!isLinked => opacity: 0.1", rows: 6 },
+        desc: "Conditional icon style rules applied before per-map iconStyles.",
+        render: setting => this.renderTextAreaSetting(setting, "defaultIconStyles", "!isLinked => opacity: 0.1", 6),
       },
       {
         name: "Default label styles",
-        desc: "Conditional label style rules to apply to all Places maps before per-map labelStyles. Use this for MapLibre/WebGL marker labels that raw CSS cannot target. Leave empty for no global label styles.",
-        control: { type: "textarea", key: "defaultLabelStyles", placeholder: "!isLinked => opacity: 0.1", rows: 6 },
+        desc: "Conditional label style rules applied before per-map labelStyles.",
+        render: setting => this.renderTextAreaSetting(setting, "defaultLabelStyles", "!isLinked => opacity: 0.1", 6),
       },
       {
-        name: "Show help with empty map",
-        desc: "When a code block has no Places to display, an empty map is always shown. Enable this to also render instructions for adding places below it. A code block can override this with showHelpWithEmptyMap: false.",
-        control: { type: "toggle", key: "showHelpWithEmptyMap" },
+        name: "Waypoint icons",
+        desc: "Case-insensitive exact GPX/FIT name, symbol, or type mappings. Use value => emoji; name:, sym:, and type: scope a mapping.",
+        render: (setting: Setting) => this.renderWaypointIconMappings(setting),
       },
+    ];
+  }
+
+  private renderWaypointIconMappings(setting: Setting): void {
+    let mappingsText: TextAreaComponent | undefined;
+
+    setting.setClass("places-setting-textarea");
+    setting.nameEl.addClass("places-setting-name-reset");
+
+    setting.addExtraButton(button => {
+      button.setIcon("rotate-ccw").setTooltip("Restore the default mappings");
+      button.extraSettingsEl.addClass("places-settings-reset");
+      setting.nameEl.appendChild(button.extraSettingsEl);
+      button.onClick(async () => {
+        const defaults = defaultWaypointIconMappings().join("\n");
+
+        await this.setControlValue("waypointIconMappings", defaults);
+        mappingsText?.setValue(defaults);
+        new Notice("Waypoint icons restored to defaults");
+      });
+    });
+    setting.addTextArea(text => {
+      mappingsText = text;
+      text.inputEl.rows = 8;
+      text.setPlaceholder("Parking => 🅿️\nrestroom => 🚻\nname:trailhead => 🥾\ntype:endpoint => 🏁");
+      text.setValue(PlacesPlugin.settings.waypointIconMappings.join("\n"));
+      text.onChange(value => void this.setControlValue("waypointIconMappings", value));
+    });
+  }
+
+  private poiDiscoveryItems(): SettingGroupItem[] {
+    return [
       {
         name: "POI discovery",
-        desc: "Enable clicking on base map features (trails, parks, restaurants) to discover and create notes for points of interest. Only works with vector tile providers. Can be overridden per code block.",
+        desc: "Allow clicks on vector map features to discover points of interest.",
         control: { type: "toggle", key: "poiDiscovery" },
       },
       {
         name: "POI filter patterns",
-        desc: "Regex patterns to hide unwanted POIs from maps and search results. One pattern per line. Matches against class, subclass, name, and tags. Examples: place_of_worship, church|chapel, fast_food",
-        control: {
-          type: "textarea",
-          key: "poiFilterPatterns",
-          placeholder: "place_of_worship\nchurch|chapel\nfast_food",
-          rows: 4,
-          validate: (value: string): string | void => {
-            const invalid = value.split("\n").map(line => line.trim()).filter(Boolean).filter(line => {
-              try { new RegExp(line); return false; } catch { return true; }
-            });
-            if (invalid.length > 0) return `Invalid regex: ${invalid.join(", ")}`;
-          },
-        },
-      },
-      {
-        name: "New place tag filters",
-        desc: "Tags to exclude when adding or updating a place from search. One tag per line. Matches exact tag names after normalizing periods, underscores, and spaces to dashes.",
-        control: { type: "textarea", key: "newPlaceTagFilterPatterns", placeholder: DEFAULT_SETTINGS.newPlaceTagFilterPatterns.join("\n"), rows: 6 },
-      },
-      {
-        name: "Default marker icon rules",
-        desc: "Pick the default `icon` written into a note's frontmatter when a place is added or refreshed with the \"Search for place by name\" command (or saved from a map search) and it has no explicit `icon`. These rules never change how existing markers render - a place with no `icon` shows the default 📍. One rule per line, evaluated top-to-bottom - the first match wins. Each line is `tag:<regex> => 🍕` or `name:<regex> => 🎿` (a bare `<regex>` matches tags). The regex is case-insensitive; an empty emoji forces the default 📍. Defaults to the built-in tag emojis, which can be reordered, edited, or removed.",
-        control: { type: "textarea", key: "markerIconRules", placeholder: "name:ski|snowboard => 🎿\ntag:^pizza$ => 🍕\nbrewery => 🍻", rows: 8 },
+        desc: "Regular expressions that hide matching POIs. Enter one pattern per line.",
+        render: setting => this.renderTextAreaSetting(setting, "poiFilterPatterns", "place_of_worship\nchurch|chapel\nfast_food", 4, value => {
+          const invalid = value.split("\n").map(line => line.trim()).filter(Boolean).filter(line => {
+            try {
+              new RegExp(line);
+
+              return false;
+            } catch {
+              return true;
+            }
+          });
+
+          if (invalid.length > 0) return `Invalid regex: ${invalid.join(", ")}`;
+        }),
       },
     ];
+  }
+
+  private renderTextAreaSetting(setting: Setting, key: string, placeholder: string, rows: number, validate?: (value: string) => string | void): void {
+    setting.setClass("places-setting-textarea");
+    const validation = validate ? setting.controlEl.createDiv({ cls: "places-settings-validation places-settings-validation-error" }) : undefined;
+
+    setting.addTextArea(text => {
+      const check = (value: string): boolean => {
+        const error = validate?.(value) ?? "";
+
+        text.inputEl.setCustomValidity(error);
+        text.inputEl.setAttribute("aria-invalid", String(Boolean(error)));
+        validation?.setText(error);
+
+        return !error;
+      };
+      const value = scalarToString(this.getControlValue(key));
+
+      text.inputEl.rows = rows;
+      text.setPlaceholder(placeholder).setValue(value);
+      check(value);
+      text.onChange(next => {
+        if (check(next)) void this.setControlValue(key, next);
+      });
+    });
   }
 
   private clusteringItems(): SettingGroupItem[] {
@@ -304,18 +552,28 @@ export class PlacesSettingsTab extends PluginSettingTab {
         desc: "Group nearby markers into clusters when marker count exceeds this value on mobile devices. Lower values recommended for better performance. Set to 0 to disable.",
         control: { type: "number", key: "clusterThresholdMobile", placeholder: "200", min: 0 },
       },
+      {
+        name: "Cluster overlay points",
+        desc: "Include GeoJSON overlay points when clustering markers.",
+        control: { type: "toggle", key: "clusterGeoJsonOverlays" },
+      },
+      {
+        name: "Cluster appearance",
+        desc: "",
+        control: {
+          type: "dropdown",
+          key: "clusterStyle",
+          options: { circles: "Counted circles", heatmap: "Density heatmap" },
+        },
+      },
     ];
   }
 
   private fileImportItems(): SettingGroupItem[] {
-    const compressionOptions: Record<string, string> = {};
-    for (let level = 1; level <= 19; level++) {
-      compressionOptions[String(level)] = String(level);
-    }
     return [
       {
         name: "GPX import mode",
-        desc: "How to handle GPX files dropped into notes",
+        desc: "How Places handles GPX files dropped into notes.",
         control: {
           type: "dropdown",
           key: "gpxImportMode",
@@ -323,13 +581,17 @@ export class PlacesSettingsTab extends PluginSettingTab {
         },
       },
       {
-        name: "GPX note name format",
-        desc: "Format for new notes created from GPX files. Placeholders: {yyyymmdd} {TrackName} {filename}",
-        control: { type: "text", key: "gpxNoteNameFormat", placeholder: "{yyyymmdd} - {TrackName}" },
+        name: "FIT import mode",
+        desc: "How Places handles Garmin FIT files dropped into notes.",
+        control: {
+          type: "dropdown",
+          key: "fitImportMode",
+          options: { disabled: "Do nothing", "single-note": "Import as a single note" },
+        },
       },
       {
         name: "GeoJSON import mode",
-        desc: "How to handle GeoJSON files dropped into notes",
+        desc: "How Places handles GeoJSON files dropped into notes.",
         control: {
           type: "dropdown",
           key: "geoJsonImportMode",
@@ -338,7 +600,7 @@ export class PlacesSettingsTab extends PluginSettingTab {
       },
       {
         name: "CSV import mode",
-        desc: "How to handle CSV files dropped into notes",
+        desc: "How Places handles CSV files dropped into notes.",
         control: {
           type: "dropdown",
           key: "csvImportMode",
@@ -347,71 +609,87 @@ export class PlacesSettingsTab extends PluginSettingTab {
       },
       {
         name: "Drop on existing note",
-        desc: "When a track file is dropped on an existing note, update that note's track data instead of creating a new note",
+        desc: "Whether a dropped track updates the target note or creates a note.",
         control: {
           type: "dropdown",
           key: "importDropOnNote",
           options: { "create-new": "Create new note", update: "Update existing note" },
         },
       },
+    ];
+  }
+
+  private trackNoteItems(): SettingGroupItem[] {
+    return [{
+      name: "Track note name format",
+      desc: "Name format for notes created from GPX, FIT, or recorded tracks.",
+      control: { type: "text", key: "gpxNoteNameFormat", placeholder: "{yyyymmdd} - {TrackName}" },
+    }];
+  }
+
+  private overlayStorageItems(): SettingGroupItem[] {
+    const compressionOptions: Record<string, string> = {};
+
+    for (let level = 1; level <= 19; level++) compressionOptions[String(level)] = String(level);
+
+    return [
       {
         name: "Precompute overlay cache",
-        desc: "Store a precomputed GeoJSON cache for GPX/CSV imports. Improves map rendering speed but increases file size. GeoJSON imports are never cached (source is already the render format).",
+        desc: "Store render-ready GeoJSON with imported GPX, FIT, and CSV data.",
         control: { type: "toggle", key: "precomputeOverlayCache" },
       },
       {
         name: "Overlay compression level",
-        desc: "Zstandard level applied when writing Overlay Source and Overlay Cache values. Higher levels store smaller values and take longer during import. Decoding speed does not depend on the level.",
+        desc: "Zstandard level used when writing overlay data. Higher levels take longer and use less space.",
         control: { type: "dropdown", key: "overlayCompressionLevel", options: compressionOptions },
       },
     ];
   }
 
-  // One declarative group per extension, with the extension-local control keys
-  // namespaced, routing reads and writes to that extension's settings object.
-  private extensionItems(): SettingDefinitionItem[] {
-    return Object.entries(this.extensionSettingsGroups).map(([plugin, group]) => ({
-      type: "group",
-      heading: group.heading,
-      items: group.items.map(item => namespaceExtensionItem(plugin, item) as SettingGroupItem),
-    }));
+  private extensionItems(): Array<{ category: "provider" | "feature"; page: SettingDefinitionPage }> {
+    return buildExtensionSettingsPages(this.extensionSettingsGroups);
   }
 
-  private tileCacheItems(): SettingGroupItem[] {
-    const items: SettingGroupItem[] = [
+  private desktopTileCacheItems(): SettingGroupItem[] {
+    return [
       {
-        name: "Desktop cache duration",
-        desc: "Hours to keep supported map tiles on desktop. Use 0 to disable caching.",
-        control: { type: "number", key: "tileCacheDurationHoursDesktop", placeholder: "0", min: 0, max: 999 },
+        name: "Cache duration",
+        desc: `In hours, 0 to disable.`,
+        control: { type: "number", key: "tileCacheDurationHoursDesktop", placeholder: String(DEFAULT_TILE_CACHE_DURATION_HOURS), min: 0, max: 999 },
       },
       {
-        name: "Desktop cache size",
-        desc: "Approximate rolling desktop cache size in mb. Oldest tiles are removed after new tiles push the cache over this limit.",
+        name: "Cache size",
+        desc: "Approximate rolling cache size in MB.",
         visible: () => PlacesPlugin.settings.tileCacheDurationHoursDesktop > 0,
         control: { type: "number", key: "tileCacheMaxSizeMBDesktop", placeholder: "250", min: 1 },
       },
       {
-        name: "Mobile cache duration",
-        desc: "Hours to keep supported map tiles on mobile. Use 0 to disable caching.",
-        control: { type: "number", key: "tileCacheDurationHoursMobile", placeholder: "0", min: 0, max: 999 },
+        name: "Decoded track cache",
+        desc: "Memory in MB for decoded track geometry. A map whose tracks exceed it decodes some of them again on every render.",
+        control: { type: "number", key: "overlayCacheMaxSizeMBDesktop", placeholder: "192", min: 1 },
+      },
+    ];
+  }
+
+  private mobileTileCacheItems(): SettingGroupItem[] {
+    return [
+      {
+        name: "Cache duration",
+        desc: `In hours, 0 to disable.`,
+        control: { type: "number", key: "tileCacheDurationHoursMobile", placeholder: String(DEFAULT_TILE_CACHE_DURATION_HOURS), min: 0, max: 999 },
       },
       {
-        name: "Mobile cache size",
-        desc: "Approximate rolling mobile cache size in mb. Oldest tiles are removed after new tiles push the cache over this limit.",
+        name: "Cache size",
+        desc: "Approximate rolling cache size in MB.",
         visible: () => PlacesPlugin.settings.tileCacheDurationHoursMobile > 0,
         control: { type: "number", key: "tileCacheMaxSizeMBMobile", placeholder: "250", min: 1 },
       },
+      {
+        name: "Decoded track cache",
+        desc: "Memory in MB for decoded track geometry on mobile.",
+        control: { type: "number", key: "overlayCacheMaxSizeMBMobile", placeholder: "64", min: 1 },
+      },
     ];
-
-    items.push(...this.tileCacheProviderItems());
-
-    items.push({
-      name: "Cached tiles",
-      aliases: ["Clear cache"],
-      render: (setting: Setting) => this.renderCachedTiles(setting),
-    });
-
-    return items;
   }
 
   private tileCacheProviderItems(): SettingGroupItem[] {
@@ -426,34 +704,71 @@ export class PlacesSettingsTab extends PluginSettingTab {
       }];
     }
 
-    const items: SettingGroupItem[] = [{
-      name: "Provider caching",
-      desc: "Choose which supported map providers can use the Places tile cache. Providers not listed as supported load tiles through their own SDK or request path.",
-    }];
+    return providers.map(provider => this.tileCacheProviderItem(provider));
+  }
 
-    for (const provider of providers) {
-      items.push(this.tileCacheProviderItem(provider));
-    }
-    return items;
+  private cachedTilesItem(): SettingGroupItem {
+    return {
+      name: "Cached tiles",
+      aliases: ["Clear cache"],
+      render: (setting: Setting) => this.renderCachedTiles(setting),
+    };
+  }
+
+  private markerThumbnailsItem(): SettingGroupItem {
+    return {
+      name: "Marker thumbnails",
+      aliases: ["Clear thumbnails", "Picture cache"],
+      render: (setting: Setting) => this.renderMarkerThumbnails(setting),
+    };
+  }
+
+  private renderMarkerThumbnails(setting: Setting): void {
+    const updateStats = async (): Promise<void> => {
+      const stats = await getStoredPictureStats();
+
+      setting.setDesc(`${stats.count.toLocaleString()} thumbnails, ${(stats.sizeBytes / 1024 / 1024).toFixed(1)} MB. Clear after replacing an image file in place.`);
+    };
+
+    setting.setName("Marker thumbnail cache").setDesc("Loading thumbnail statistics...");
+    void updateStats();
+    setting.addButton((button) => {
+      button.setButtonText("Clear thumbnails");
+      button.buttonEl.addClass("mod-warning");
+      button.onClick(async () => {
+        const cleared = await clearStoredPictures();
+
+        await updateStats();
+        button.setButtonText("Thumbnails cleared!");
+        new Notice(`Cleared ${cleared.toLocaleString()} marker thumbnails`);
+        window.setTimeout(() => {
+          button.setButtonText("Clear thumbnails");
+        }, 2000);
+      });
+    });
+  }
+
+  private tileCacheSummary(): string {
+    const desktop = PlacesPlugin.settings.tileCacheDurationHoursDesktop > 0;
+    const mobile = PlacesPlugin.settings.tileCacheDurationHoursMobile > 0;
+
+    if (desktop && mobile) return "Desktop and mobile";
+    if (desktop) return "Desktop";
+    if (mobile) return "Mobile";
+
+    return "Off";
   }
 
   private tileCacheProviderItem(provider: PlaceProviderExport): SettingGroupItem {
     const providerName = provider.name.toLowerCase();
     const supportsTileCache = provider.features?.tileCache === true;
-    const unsupportedReason = provider.features?.tileCacheUnsupportedReason?.trim();
 
     return {
       name: provider.name,
-      desc: supportsTileCache
-        ? "Use the Places tile cache for this provider."
-        : (unsupportedReason ? `Tile caching is not supported. ${unsupportedReason}` : "Tile caching is not supported."),
+      desc: supportsTileCache ? undefined : "Tile caching is not supported.",
       control: {
         type: "toggle",
         key: `${TILE_PROVIDER_KEY_PREFIX}${providerName}`,
-        // Pin the toggle off for an unsupported provider; getControlValue
-        // is never consulted for it because defaultValue only applies when
-        // the resolver yields undefined; the pin comes from disabled + the stored
-        // map never containing an unsupported provider.
         disabled: !supportsTileCache,
         ...(supportsTileCache ? {} : { defaultValue: false }),
       },
@@ -467,7 +782,7 @@ export class PlacesSettingsTab extends PluginSettingTab {
       button.buttonEl.addClass("mod-warning");
       button.onClick(async () => {
         await TileCache.clear();
-        setting.setDesc("0 Entries, 0 mb");
+        setting.setDesc("0 entries, 0 MB");
         button.setButtonText("Cache cleared!");
         new Notice("Places tile cache cleared");
         window.setTimeout(() => {
@@ -481,227 +796,243 @@ export class PlacesSettingsTab extends PluginSettingTab {
   }
 
   private debugItems(): SettingGroupItem[] {
-    return [{
-      name: "Console log level",
-      desc: "Controls which Places logs are written to the developer console. The copied debug log always includes all captured entries.",
-      control: {
-        type: "dropdown",
-        key: "consoleLogLevel",
-        options: {
-          none: "None",
-          error: "Errors",
-          warn: "Warnings and errors",
-          info: "Info, warnings, and errors",
-          debug: "Debug and above",
+    return [
+      {
+        name: "Console log level",
+        desc: "Lowest severity written to the developer console.",
+        control: {
+          type: "dropdown",
+          key: "consoleLogLevel",
+          options: {
+            none: "None",
+            error: "Errors",
+            warn: "Warnings and errors",
+            info: "Info, warnings, and errors",
+            debug: "Debug and above",
+          },
         },
       },
-    }];
+    ];
+  }
+
+  private apiUsagePage(): SettingDefinitionPage {
+    return {
+      type: "page",
+      name: "API usage",
+      desc: "Requests made to provider APIs.",
+      displayValue: () => {
+        const total = PlacesStatsCalculator.aggregate(this.serviceSummaries()).lifetime.totalCalls;
+
+        return total === 1 ? "1 call" : `${total} calls`;
+      },
+      items: [
+        {
+          name: "API usage",
+          searchable: false,
+          render: (setting: Setting) => {
+            setting.settingEl.empty();
+            setting.settingEl.addClass("places-settings-stats-item");
+            this.renderUsageStatistics(setting.settingEl);
+          },
+        },
+      ],
+    };
+  }
+
+  private serviceSummaries(): ServiceSummary[] {
+    return PlacesStatsCalculator.summarizeServices(PlacesPlugin.settings.apiStats);
   }
 
   private renderUsageStatistics(containerEl: HTMLElement): void {
+    containerEl.empty();
     const statsEl = containerEl.createDiv({ cls: "places-settings-stats" });
+    const summaries = this.serviceSummaries();
 
-    const stats = this.getAggregatedStatsFromSettings();
-
-    if (stats.totalCalls === 0) {
+    if (summaries.length === 0) {
       statsEl.createEl("p", {
         text: "No API calls have been made yet.",
         cls: "places-centered places-empty"
       });
-      return;
+    } else {
+      this.addServiceTable(statsEl, summaries, summary => {
+        containerEl.empty();
+        new Setting(containerEl)
+          .setName(`${this.titleCase(summary.provider)} - ${this.serviceTitle(summary)}`)
+          .setHeading()
+          .addButton(button => button.setButtonText("Back to API usage").onClick(() => this.renderUsageStatistics(containerEl)));
+        this.renderServiceDetail(containerEl, summary);
+      });
+      this.addSummaryCards(statsEl, summaries);
     }
 
-    const chartContainer = statsEl.createDiv({ cls: "places-chart-container" });
+    new Setting(statsEl).setName("Reset API stats")
+      .setDesc("Clear usage totals, daily history, and recorded note and block activity.")
+      .addButton(button => button.setButtonText("Reset stats").setDestructive().onClick(async () => {
+        button.setDisabled(true);
 
-    this.addUsageChart(chartContainer, stats);
+        try {
+          await this.plugin.resetApiStats();
+          this.renderUsageStatistics(containerEl);
+          new Notice("API usage statistics reset");
+        } catch (error) {
+          new Notice(`Could not reset API stats: ${getErrorMessage(error)}`);
+        } finally {
+          button.setDisabled(false);
+        }
+      }));
+  }
 
-    const statsGrid = statsEl.createDiv({ cls: "places-stats-grid" });
+  private addSummaryCards(container: HTMLElement, summaries: ServiceSummary[]): void {
+    const stats = PlacesStatsCalculator.aggregate(summaries);
+    const statsGrid = container.createDiv({ cls: "places-stats-grid" });
 
-    const successRate = Math.round(((stats.successfulCalls || 0) / (stats.totalCalls || 1)) * 100);
+    const successRate = stats.lifetime.totalCalls > 0
+      ? Math.round((stats.lifetime.successfulCalls / stats.lifetime.totalCalls) * 100)
+      : 0;
 
-    this.addStatCard(statsGrid, "Total Calls", (stats.totalCalls || 0).toString());
-    this.addStatCard(statsGrid, "Success Rate", `${successRate}%`);
-    this.addStatCard(statsGrid, "Avg Response Time", `${Math.round(stats.averageTime || 0)}ms`);
-    this.addStatCard(statsGrid, "Today", (stats.dailyCalls || 0).toString());
-    this.addStatCard(statsGrid, "This Month", (stats.monthlyCalls || 0).toString());
+    this.addStatCard(statsGrid, "Total calls", stats.lifetime.totalCalls.toString());
+    this.addStatCard(statsGrid, "Success rate", `${successRate}%`);
+    this.addStatCard(statsGrid, "Avg response time", `${Math.round(stats.lifetime.averageTime)}ms`);
+    this.addStatCard(statsGrid, "Cache hits", stats.lifetime.cacheHits.toString());
+    this.addStatCard(statsGrid, "Today", stats.todayCalls.toString());
+    this.addStatCard(statsGrid, "This month", stats.monthCalls.toString());
 
     if (stats.lastCall) {
-      this.addStatCard(statsGrid, "Last Call", new Date(stats.lastCall).toLocaleDateString());
+      this.addStatCard(statsGrid, "Last call", new Date(stats.lastCall).toLocaleDateString());
     }
-
   }
 
-  private addUsageChart(container: HTMLElement, _stats: IPlacesUsageStats): void {
-    const serviceData = this.getServiceHistoryData();
+  private addServiceTable(container: HTMLElement, summaries: ServiceSummary[], onSelect: (summary: ServiceSummary) => void): void {
+    const tableContainer = container.createDiv({ cls: "places-service-table-container" });
+    const table = tableContainer.createEl("table", { cls: "places-service-table places-api-usage-table" });
 
-    if (serviceData.dates.length === 0) {
-      container.createEl("p", {
-        text: "No historical usage data available yet.",
-        cls: "places-centered places-empty"
+    const headerRow = table.createEl("thead").createEl("tr");
+
+    for (const heading of ["Provider", "Service", "Calls", "Cache hits", "Failed", "Avg. time", "Today", "This week", "This month", "% of total"]) {
+      headerRow.createEl("th", { text: heading });
+    }
+
+    const tbody = table.createEl("tbody");
+    const totalCalls = summaries.reduce((sum, summary) => sum + summary.lifetime.totalCalls, 0);
+
+    for (const summary of summaries) {
+      const percentage = totalCalls > 0 ? Math.round((summary.lifetime.totalCalls / totalCalls) * 100) : 0;
+
+      const row = tbody.createEl("tr", { cls: "places-service-row" });
+
+      row.addEventListener("click", event => {
+        event.preventDefault();
+        onSelect(summary);
       });
+      row.createEl("td").createEl("a", {
+        text: this.titleCase(summary.provider), cls: "places-service-link", href: "#",
+        attr: { "aria-label": `View ${this.titleCase(summary.provider)} - ${this.serviceTitle(summary)} usage` },
+      });
+      row.createEl("td", { text: this.serviceTitle(summary) });
+      row.createEl("td", { text: summary.lifetime.totalCalls.toLocaleString() });
+      row.createEl("td", { text: summary.lifetime.cacheHits.toLocaleString() });
+      row.createEl("td", { text: summary.lifetime.failedCalls.toLocaleString() });
+      row.createEl("td", { text: `${Math.round(summary.lifetime.averageTime)}ms` });
+      row.createEl("td", { text: summary.todayCalls.toLocaleString() });
+      row.createEl("td", { text: summary.weekCalls.toLocaleString() });
+      row.createEl("td", { text: summary.monthCalls.toLocaleString() });
+      row.createEl("td", { text: `${percentage}%` });
+    }
+  }
+
+  private renderServiceDetail(container: HTMLElement, summary: ServiceSummary): void {
+    const key = `${summary.provider}:${summary.service}`;
+
+    if (summary.provider === "nominatim" && summary.service === "tilequery") {
+      container.createEl("p", { text: "This is a historical Places statistics label, not a Nominatim API. Current Nominatim lookups are recorded under Geocoding." });
+    }
+
+    this.addDailyHistory(container, summary);
+    this.addOriginTable(container, "Notes", "Note", PlacesStatsCalculator.summarizeOrigins(PlacesPlugin.settings.apiOrigins, 'notes', key), true);
+    this.addOriginTable(container, "Blocks", "Block", PlacesStatsCalculator.summarizeOrigins(PlacesPlugin.settings.apiOrigins, 'blocks', key), false);
+
+    if (summary.service === API_USAGE_SERVICES.tiles) {
+      container.createEl("p", {
+        text: "Tiles, styles, sprites and terrain are shared by every map using this provider, so they are counted per provider rather than per note.",
+        cls: "places-setting-description",
+      });
+    }
+  }
+
+  private addDailyHistory(container: HTMLElement, summary: ServiceSummary): void {
+    const days = PlacesStatsCalculator.summarizeDays(PlacesPlugin.settings.apiStats, `${summary.provider}:${summary.service}`);
+
+    new Setting(container).setName("Recent days").setHeading();
+
+    if (days.length === 0) {
+      container.createEl("p", { text: "No data recorded", cls: "places-centered places-empty" });
+
       return;
     }
 
-    const servicesWithData = serviceData.services.filter(service => service.values.some(v => v > 0));
+    const table = container.createDiv({ cls: "places-service-table-container" }).createEl("table", { cls: "places-service-table" });
+    const headerRow = table.createEl("thead").createEl("tr");
 
-    this.addServiceTable(container, servicesWithData, serviceData.dates);
-  }
-
-  private addServiceTable(container: HTMLElement, services: Array<{name: string, values: number[]}>, _dates: string[]): void {
-    const tableContainer = container.createDiv({ cls: "places-service-table-container" });
-
-    const table = tableContainer.createEl("table", { cls: "places-service-table" });
-
-    const thead = table.createEl("thead");
-    const headerRow = thead.createEl("tr");
-    headerRow.createEl("th", { text: "Provider" });
-    headerRow.createEl("th", { text: "Service" });
-    headerRow.createEl("th", { text: "Total calls" });
-    headerRow.createEl("th", { text: "Avg response time" });
-    headerRow.createEl("th", { text: "Today" });
-    headerRow.createEl("th", { text: "This week" });
-    headerRow.createEl("th", { text: "This month" });
-    headerRow.createEl("th", { text: "% of total" });
+    for (const heading of ["Day", "Calls", "Cache hits", "Failed", "Avg response time"]) {
+      headerRow.createEl("th", { text: heading });
+    }
 
     const tbody = table.createEl("tbody");
 
-    const totalCalls = services.reduce((sum, service) =>
-      sum + service.values.reduce((a, b) => a + b, 0), 0
-    );
-
-    const parsedServices: Array<{fullName: string, provider: string, serviceName: string, values: number[]}> = [];
-
-    for (const service of services) {
-      const colonIndex = service.name.indexOf(':');
-      let provider: string;
-      let serviceName: string;
-
-      if (colonIndex > 0) {
-        provider = service.name.substring(0, colonIndex);
-        serviceName = service.name.substring(colonIndex + 1);
-      } else {
-        // No colon separator - use full name as provider
-        provider = service.name;
-        serviceName = '';
-      }
-
-      parsedServices.push({
-        fullName: service.name,
-        provider: provider.charAt(0).toUpperCase() + provider.slice(1),
-        serviceName: serviceName.charAt(0).toUpperCase() + serviceName.slice(1),
-        values: service.values
-      });
-    }
-
-    parsedServices.sort((a, b) => {
-      const totalA = a.values.reduce((sum, v) => sum + v, 0);
-      const totalB = b.values.reduce((sum, v) => sum + v, 0);
-      return totalB - totalA;
-    });
-
-    for (const service of parsedServices) {
-      const serviceTotalCalls = service.values.reduce((sum, v) => sum + v, 0);
-      const percentage = totalCalls > 0 ? Math.round((serviceTotalCalls / totalCalls) * 100) : 0;
-
-      const serviceStats = this.getServiceSpecificStats(service.fullName);
-
+    for (const day of days) {
       const row = tbody.createEl("tr");
-      row.createEl("td", { text: service.provider });
-      row.createEl("td", { text: service.serviceName });
-      row.createEl("td", { text: serviceTotalCalls.toString() });
-      row.createEl("td", { text: `${Math.round(serviceStats.avgResponseTime || 0)}ms` });
-      row.createEl("td", { text: serviceStats.todayCalls.toString() });
-      row.createEl("td", { text: serviceStats.thisWeekCalls.toString() });
-      row.createEl("td", { text: serviceStats.thisMonthCalls.toString() });
 
-      const percentCell = row.createEl("td");
-      const percentBar = percentCell.createDiv({ cls: "percent-bar-container" });
-      const bar = percentBar.createDiv({ cls: "percent-bar" });
-      bar.setAttribute('data-percentage', `${percentage}`);
-      percentBar.createSpan({ text: `${percentage}%`, cls: "percent-text" });
+      row.createEl("td", { text: day.date });
+      row.createEl("td", { text: day.totalCalls.toString() });
+      row.createEl("td", { text: day.cacheHits.toString() });
+      row.createEl("td", { text: day.failedCalls.toString() });
+      row.createEl("td", { text: `${Math.round(day.averageTime)}ms` });
     }
   }
 
-  private getServiceSpecificStats(serviceName: string): {
-    avgResponseTime: number;
-    todayCalls: number;
-    thisWeekCalls: number;
-    thisMonthCalls: number;
-  } {
-    const apiStats = PlacesPlugin.settings.apiStats as Record<string, IPlacesUsageStats>;
-    const serviceStats = apiStats[serviceName] || {};
+  private addOriginTable(container: HTMLElement, heading: string, columnName: string, origins: OriginSummary[], asLinks: boolean): void {
+    if (origins.length === 0) return;
+    new Setting(container).setName(heading).setHeading();
 
-    const stats = PlacesStatsCalculator.calculateSingleServiceStats(serviceStats);
+    const table = container.createDiv({ cls: "places-service-table-container" }).createEl("table", { cls: "places-service-table" });
+    const headerRow = table.createEl("thead").createEl("tr");
 
-    let thisWeekCalls = 0;
-    if (serviceStats.dailyHistory) {
-      const now = new Date();
-      const dayOfWeek = now.getDay(); // 0 = Sunday, 1 = Monday, etc.
-      const weekStart = new Date(now);
-      weekStart.setDate(now.getDate() - dayOfWeek);
-      const weekStartStr = DateParser.formatDateISO(weekStart);
-      const today = DateParser.formatDateISO(new Date());
+    for (const columnHeading of [columnName, "Calls", "Cache hits", "Failed", "Last call"]) {
+      headerRow.createEl("th", { text: columnHeading });
+    }
 
-      for (const [date, dayStats] of Object.entries(serviceStats.dailyHistory)) {
-        if (date >= weekStartStr && date <= today) {
-          thisWeekCalls += (dayStats).totalCalls || 0;
-        }
+    const tbody = table.createEl("tbody");
+
+    for (const origin of origins.slice(0, ORIGIN_ROW_LIMIT)) {
+      const row = tbody.createEl("tr");
+      const cell = row.createEl("td");
+
+      if (asLinks) {
+        const link = cell.createEl("a", { text: origin.key, href: "#", cls: "places-origin-link" });
+
+        link.addEventListener("click", event => {
+          event.preventDefault();
+          openLocalFile(this.app, origin.key);
+        });
+      } else {
+        cell.setText(origin.key);
       }
+
+      row.createEl("td", { text: origin.calls.toString() });
+      row.createEl("td", { text: origin.cacheHits.toString() });
+      row.createEl("td", { text: origin.failedCalls.toString() });
+      row.createEl("td", { text: origin.lastCall > 0 ? new Date(origin.lastCall).toLocaleDateString() : "" });
     }
-
-    return {
-      avgResponseTime: stats.averageTime || 0,
-      todayCalls: stats.dailyCalls || 0,
-      thisWeekCalls,
-      thisMonthCalls: stats.monthlyCalls || 0
-    };
   }
 
-  private getAggregatedStatsFromSettings(): IPlacesUsageStats {
-    const apiStats = PlacesPlugin.settings.apiStats as Record<string, IPlacesUsageStats>;
-    const aggregateStats = PlacesStatsCalculator.calculateAggregateStats(apiStats);
-
-    return {
-      totalCalls: aggregateStats.totalCalls,
-      successfulCalls: aggregateStats.successfulCalls,
-      failedCalls: aggregateStats.failedCalls,
-      totalTime: aggregateStats.totalTime,
-      averageTime: aggregateStats.averageTime,
-      dailyCalls: aggregateStats.dailyCalls,
-      monthlyCalls: aggregateStats.monthlyCalls,
-      firstCall: aggregateStats.earliestFirstCall,
-      lastCall: aggregateStats.latestLastCall
-    };
+  private serviceTitle(summary: ServiceSummary): string {
+    return this.titleCase(summary.service.replace(/([a-z])([A-Z])/gu, '$1 $2').toLowerCase())
+      + (summary.service === "tilequery" ? " (historical)" : "");
   }
 
-  private getServiceHistoryData(): {dates: string[], services: Array<{name: string, values: number[]}>} {
-    const dateRange = this.getLast14Days();
-    const apiStats = PlacesPlugin.settings.apiStats as Record<string, IPlacesUsageStats>;
-
-    const services = Object.keys(apiStats).map(serviceName => ({
-      name: serviceName,
-      values: PlacesStatsCalculator.getDailyCallDataForDates(apiStats[serviceName], dateRange)
-    }));
-
-    return {
-      dates: dateRange,
-      services: services
-    };
+  private titleCase(value: string): string {
+    return value.charAt(0).toUpperCase() + value.slice(1);
   }
-
-  private getLast14Days(): string[] {
-    const dates = [];
-    const today = new Date();
-
-    for (let i = 13; i >= 0; i--) {
-      const date = new Date(today);
-      date.setDate(today.getDate() - i);
-      dates.push(DateParser.formatDateISO(date));
-    }
-
-    return dates;
-  }
-
 
   private addStatCard(container: HTMLElement, label: string, value: string): void {
     const card = container.createDiv({ cls: "places-stat-card" });

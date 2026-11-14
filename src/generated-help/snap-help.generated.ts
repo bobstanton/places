@@ -141,7 +141,7 @@ export function render(container: HTMLElement, ctx: RenderContext): void {
   td10.appendText(", 500px");
   const row15 = tbody.createEl('tr');
   row15.createEl('td', { text: "width" });
-  row15.createEl('td', { text: "Preview map width" });
+  row15.createEl('td', { text: "Width of everything the block renders, its legend and info included. A percentage measures the note's width, vw the window's" });
   const td11 = row15.createEl('td');
   td11.createEl('strong', { cls: 'places-help-bold', text: "100%" });
   td11.appendText(", 800px");
@@ -155,6 +155,19 @@ export function render(container: HTMLElement, ctx: RenderContext): void {
   row17.createEl('td', { text: "style" });
   row17.createEl('td', { text: "Map style (provider-specific)" });
   row17.createEl('td', { text: "varies by provider" });
+  const row18 = tbody.createEl('tr');
+  row18.createEl('td', { text: "queryParameters" });
+  const td13 = row18.createEl('td');
+  td13.appendText("UI controls that adjust the block without editing it; ");
+  td13.createEl('code', { cls: 'places-help-code', text: "queryParametersPosition" });
+  td13.appendText(", ");
+  td13.createEl('code', { cls: 'places-help-code', text: "queryParametersLayout" });
+  td13.appendText(", and ");
+  td13.createEl('code', { cls: 'places-help-code', text: "queryParametersCollapsed" });
+  td13.appendText(" place them. See ");
+  td13.createEl('code', { cls: 'places-help-code', text: "places-queryparameters-help" });
+  const td14 = row18.createEl('td');
+  td14.createEl('code', { cls: 'places-help-code', text: "- name: limit" });
   container.createEl('h2', { cls: 'places-help-heading places-help-h2', text: "Costing" });
   const para2 = container.createEl('p', { cls: 'places-help-paragraph' });
   para2.appendText("Costing options are passed through verbatim to the provider, see Valhalla's documentation for option details: ");

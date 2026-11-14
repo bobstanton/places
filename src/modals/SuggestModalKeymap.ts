@@ -18,6 +18,7 @@ export function useTextInputHomeEndKeys(modal: SuggestModal<unknown>): void {
   modal.inputEl.addEventListener('keydown', event => {
     if (event.key !== 'Home' && event.key !== 'End') return;
     const position = event.key === 'Home' ? 0 : modal.inputEl.value.length;
+
     event.preventDefault();
     event.stopPropagation();
     modal.inputEl.setSelectionRange(position, position);
@@ -38,10 +39,12 @@ export function renderPlaceAttributions(parentEl: HTMLElement | null, places: Pl
   }
 
   const attributionsEl = createDiv({ cls: "places-attributions" });
+
   for (const attribution of attributions) {
     attributionsEl.createEl("p", {
       text: attribution.replace(/<[^>]*>?/gm, '').replace(/&copy;/g, "©")
     });
   }
+
   parentEl.appendChild(attributionsEl);
 }

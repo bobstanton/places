@@ -10,6 +10,7 @@ export class CompressionLevelModal extends SuggestModal<number> {
 
   getSuggestions(query: string): number[] {
     const trimmed = query.trim();
+
     return trimmed ? this.levels.filter((level) => String(level).includes(trimmed)) : this.levels;
   }
 

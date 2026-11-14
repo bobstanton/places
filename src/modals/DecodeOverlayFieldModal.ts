@@ -14,11 +14,13 @@ export class DecodeOverlayFieldModal extends Modal {
 
   onOpen() {
     const { contentEl } = this;
+
     this.modalEl.addClass("places-decode-overlay-modal");
 
     contentEl.createEl("h1", { text: `Decode ${this.fieldName.toLowerCase()}` });
 
     const decodedSection = contentEl.createDiv({ cls: "places-decode-section" });
+
     decodedSection.createEl("h3", { text: "Decoded content" });
     this.decodedTextarea = decodedSection.createEl("textarea", {
       attr: { spellcheck: "false", placeholder: `Decoded ${this.fieldName} will appear here. Edit to update the encoded value below.` }
@@ -27,6 +29,7 @@ export class DecodeOverlayFieldModal extends Modal {
     this.decodedTextarea.addClass("places-decode-decoded-textarea");
 
     const encodedSection = contentEl.createDiv({ cls: "places-decode-section" });
+
     encodedSection.createEl("h3", { text: "Encoded value" });
     this.encodedTextarea = encodedSection.createEl("textarea", {
       attr: { readonly: "true", spellcheck: "false" }
@@ -44,10 +47,12 @@ export class DecodeOverlayFieldModal extends Modal {
   private loadFromFile(file: TFile) {
     const frontmatter = this.app.metadataCache.getFileCache(file)?.frontmatter ?? {};
     const encodedValue = frontmatter[this.fieldName] as string | undefined;
+
     if (!encodedValue) return;
 
     try {
       const decoded = StringCompressor.decodeAndDecompress(encodedValue);
+
       this.decodedTextarea.value = decoded;
       this.encodedTextarea.value = encodedValue;
     } catch (error) {
@@ -63,10 +68,13 @@ export class DecodeOverlayFieldModal extends Modal {
 
   private encode() {
     const decoded = this.decodedTextarea.value;
+
     if (!decoded.trim()) {
       this.encodedTextarea.value = "";
+
       return;
     }
+
     try {
       this.encodedTextarea.value = StringCompressor.compressAndEncode(decoded);
     } catch {

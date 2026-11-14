@@ -1,108 +1,113 @@
 import type { MapPlace } from "places-shared/place";
-import type { TrackInspection } from "places-shared/settings";
-import { formatKmInSystem, formatKphInSystem, formatMetersInSystem, formatMinPerKmInSystem, km, kph, meters, minPerKm } from "places-shared/units";
-import type { IPlacesPluginSettings, MetricWindow } from "places-shared/settings";
-import type { TrackData, TrackPoint } from "./TrackPointProcessor";
-import { TrackDataService } from "./TrackDataService";
+import { formatMetricWindow, type TrackInspection, type IPlacesPluginSettings, type MetricWindow } from "places-shared/settings";
+import { getSpeedWindow, inspectTrackData } from 'places/core';
+export { inspectTrackData } from 'places/core';
+import type { TrackData } from 'places-shared/geo';
+import { createPerformanceMonitor } from "places-shared/utils";
+import { trackPreparation } from './TrackPreparationWorker';
+import type { FeatureCollection } from 'geojson';
 
-interface Projection { point: TrackPoint; next?: TrackPoint; t: number; distanceMeters: number; }
+interface InspectionLoad {
+  controller: AbortController;
+  promise: Promise<TrackData>;
+  consumers: Set<AbortSignal>;
+  bytes: number;
+  complete: boolean;
+  unscopedConsumers: number;
+}
 
 export class TrackInspectionService {
-  private readonly loadedTracks = new Map<string, Promise<TrackData>>();
-  // `speedWindow` is the block's own setting; the popup's Speed and Pace are
-  // computed by this load, and a block that narrows the window must not read a
-  // track parsed with the global one.
-  constructor(private tracks: TrackDataService, private settings: () => IPlacesPluginSettings, private speedWindow?: MetricWindow) {}
+  private readonly loadedTracks = new Map<string, InspectionLoad>();
+  private readonly geometryIds = new WeakMap<FeatureCollection, number>();
+  private nextGeometryId = 0;
+  private readonly bindings = new WeakMap<AbortSignal, { key: string; release: () => void }>();
+  private readonly maxBytes = 32 * 1024 * 1024;
+  constructor(private settings: () => IPlacesPluginSettings, private speedWindow?: MetricWindow) {}
 
-  async inspect(place: MapPlace, coordinate: { latitude: number; longitude: number }, sourcePath: string): Promise<TrackInspection | null> {
-    if (!place.filePath) return null;
-    let data: TrackData;
+  async inspect(place: MapPlace, coordinate: { latitude: number; longitude: number }, sourcePath: string, signal?: AbortSignal): Promise<TrackInspection | null> {
+    const path = place.filePath;
+    const geometry = place.overlay?.geojson;
+
+    if (signal?.aborted || !geometry) return null;
+    let id = this.geometryIds.get(geometry);
+
+    if (id === undefined) { id = ++this.nextGeometryId; this.geometryIds.set(geometry, id); }
+    const speedWindow = place.settings?.trackSpeedWindow ?? this.speedWindow ?? getSpeedWindow();
+    const key = `geometry:${id}:${formatMetricWindow(speedWindow)}`;
+    const perf = createPerformanceMonitor('track-inspection', { sourcePath, trackPath: path, cached: this.loadedTracks.has(key) }, { enabled: this.settings().developerMode });
+    let load = this.loadedTracks.get(key);
+
+    if (!load) {
+      const controller = new AbortController();
+      const promise = trackPreparation.prepare({ format: 'geojson', geojson: geometry, name: place.name }, speedWindow, controller.signal);
+
+      load = { controller, promise, consumers: new Set(), bytes: 0, complete: false, unscopedConsumers: 0 };
+      this.loadedTracks.set(key, load);
+      const entry = load;
+
+      void entry.promise.then(data => {
+        entry.complete = true;
+        entry.bytes = 1024 + (data.points.length + (data.segments?.reduce((n, points) => n + points.length, 0) ?? 0)) * 384;
+        this.trim();
+      }, () => {
+        if (this.loadedTracks.get(key) === entry) this.loadedTracks.delete(key);
+      });
+    }
+
+    this.loadedTracks.delete(key);
+    this.loadedTracks.set(key, load);
+    if (!signal) load.unscopedConsumers++;
+
+    if (signal && !load.consumers.has(signal)) {
+      this.bindings.get(signal)?.release();
+      load.consumers.add(signal);
+      const entry = load;
+      const release = () => {
+        signal.removeEventListener('abort', release);
+        this.bindings.delete(signal);
+        entry.consumers.delete(signal);
+        queueMicrotask(() => {
+          if (!entry.complete && !entry.consumers.size && !entry.unscopedConsumers) {
+            entry.controller.abort();
+            if (this.loadedTracks.get(key) === entry) this.loadedTracks.delete(key);
+          }
+
+          this.trim();
+        });
+      };
+
+      this.bindings.set(signal, { key, release });
+      signal.addEventListener('abort', release, { once: true });
+    }
+
     try {
-      let pending = this.loadedTracks.get(place.filePath);
-      if (!pending) {
-        pending = this.tracks.loadTrackFromPath(place.filePath, sourcePath, { skipCache: true, speedWindow: this.speedWindow });
-        this.loadedTracks.set(place.filePath, pending);
-      }
-      data = await pending;
-    } catch {
-      this.loadedTracks.delete(place.filePath);
-      return null;
-    }
-    return inspectTrackData(data, coordinate, this.settings());
-  }
-}
+      const data = await perf.measureAsync('load-track', () => load.promise);
 
-export function inspectTrackData(data: TrackData, coordinate: { latitude: number; longitude: number }, settings: IPlacesPluginSettings): TrackInspection | null {
-  const projection = nearestProjection(data, coordinate);
-  return projection ? { fields: formatFields(data, projection, settings) } : null;
-}
+      if (signal?.aborted) return null;
 
-function nearestProjection(data: TrackData, target: { latitude: number; longitude: number }): Projection | null {
-  const paths = data.segments?.length ? data.segments : [data.points];
-  let best: Projection | null = null;
-  for (const points of paths) {
-    if (points.length === 1) {
-      const distanceMeters = planarDistance(points[0], target, target.latitude);
-      if (!best || distanceMeters < best.distanceMeters) best = { point: points[0], t: 0, distanceMeters };
-    }
-    for (let i = 0; i + 1 < points.length; i++) {
-      const a = points[i], b = points[i + 1];
-      const latitude = target.latitude * Math.PI / 180;
-      const scaleX = 111_320 * Math.cos(latitude), scaleY = 110_540;
-      const ax = (a.longitude - target.longitude) * scaleX, ay = (a.latitude - target.latitude) * scaleY;
-      const bx = (b.longitude - target.longitude) * scaleX, by = (b.latitude - target.latitude) * scaleY;
-      const dx = bx - ax, dy = by - ay;
-      const t = dx === 0 && dy === 0 ? 0 : Math.max(0, Math.min(1, -(ax * dx + ay * dy) / (dx * dx + dy * dy)));
-      const distanceMeters = Math.hypot(ax + t * dx, ay + t * dy);
-      if (!best || distanceMeters < best.distanceMeters) best = { point: a, next: b, t, distanceMeters };
+      return perf.measure('nearest-point', () => inspectTrackData(data, coordinate, this.settings()), { points: data.points.length });
+    } catch (error) {
+      if (signal?.aborted) return null;
+
+      throw error;
+    } finally {
+      if (!signal) load.unscopedConsumers--;
+      this.trim();
     }
   }
-  return best;
-}
 
-function planarDistance(a: { latitude: number; longitude: number }, b: { latitude: number; longitude: number }, latitude: number): number {
-  return Math.hypot((a.longitude - b.longitude) * 111_320 * Math.cos(latitude * Math.PI / 180), (a.latitude - b.latitude) * 110_540);
-}
+  private trim(): void {
+    let bytes = 0, count = 0;
 
-function interpolate(a: number | undefined, b: number | undefined, t: number): number | undefined {
-  if (a === undefined || b === undefined) return t === 0 ? a : t === 1 ? b : undefined;
-  return a + (b - a) * t;
-}
+    for (const entry of this.loadedTracks.values()) {
+      if (entry.complete && !entry.consumers.size) { bytes += entry.bytes; count++; }
+    }
 
-function formatFields(data: TrackData, hit: Projection, settings: IPlacesPluginSettings): TrackInspection['fields'] {
-  const next = hit.next;
-  const latitude = interpolate(hit.point.latitude, next?.latitude, hit.t) ?? hit.point.latitude;
-  const longitude = interpolate(hit.point.longitude, next?.longitude, hit.t) ?? hit.point.longitude;
-  const distance = interpolate(hit.point.distanceKm, next?.distanceKm, hit.t);
-  const elevation = interpolate(hit.point.elevationMeters, next?.elevationMeters, hit.t);
-  const timeMs = interpolate(hit.point.time?.getTime(), next?.time?.getTime(), hit.t);
-  const speed = interpolate(hit.point.speedKph, next?.speedKph, hit.t);
-  const fields: Array<{ label: string; value: string }> = [];
-  if (timeMs !== undefined) {
-    const time = new Date(timeMs);
-    fields.push({ label: "Time", value: time.toLocaleString() });
-    const start = data.points.find(point => point.time)?.time;
-    if (start) fields.push({ label: "Elapsed", value: formatDuration(Math.max(0, timeMs - start.getTime())) });
-    const timedWaypoints = data.waypoints.filter(waypoint => waypoint.time).sort((a, b) => a.time!.getTime() - b.time!.getTime());
-    const previous = [...timedWaypoints].reverse().find(waypoint => waypoint.time!.getTime() <= timeMs);
-    const nextWaypoint = timedWaypoints.find(waypoint => waypoint.time!.getTime() > timeMs);
-    if (previous) fields.push({ label: "Previous stop", value: previous.name });
-    if (nextWaypoint) fields.push({ label: "Next stop", value: nextWaypoint.name });
+    for (const [key, entry] of this.loadedTracks) {
+      if (!entry.complete || entry.consumers.size || (bytes <= this.maxBytes && count <= 4)) continue;
+      this.loadedTracks.delete(key);
+      bytes -= entry.bytes;
+      count--;
+    }
   }
-  if (distance !== undefined) fields.push({ label: "Distance from start", value: formatKmInSystem(km(distance), settings.units) });
-  if (speed !== undefined && speed >= 0) {
-    fields.push({ label: "Speed", value: formatKphInSystem(kph(speed), settings.units) });
-    if (speed > 0) fields.push({ label: "Pace", value: formatMinPerKmInSystem(minPerKm(60 / speed), settings.units) });
-  }
-  if (elevation !== undefined) fields.push({ label: "Elevation", value: formatMetersInSystem(meters(elevation), settings.units) });
-  fields.push({ label: "Coordinates", value: `${latitude.toFixed(6)}, ${longitude.toFixed(6)}` });
-  return fields;
-}
-
-function formatDuration(milliseconds: number): string {
-  const totalSeconds = Math.round(milliseconds / 1000);
-  const hours = Math.floor(totalSeconds / 3600);
-  const minutes = Math.floor((totalSeconds % 3600) / 60);
-  const seconds = totalSeconds % 60;
-  return hours > 0 ? `${hours}h ${minutes}m` : minutes > 0 ? `${minutes}m ${seconds}s` : `${seconds}s`;
 }

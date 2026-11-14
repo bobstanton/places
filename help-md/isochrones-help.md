@@ -20,7 +20,7 @@ isochrones:
       - 10 min
       - 20 min
     centers:
-      - "{this}"
+      - {this.location}
   - name: stadia comparison
     provider: stadia
     mode: walk
@@ -28,10 +28,12 @@ isochrones:
       - 10 min
       - 20 min
     centers:
-      - "{this}"
+      - {this.location}
 ~~~
 
-`ranges` is a YAML list where every value has a time or distance unit. Supported examples include `30 min`, `2 hr`, `500 m`, `5 km`, `3 mile`, and `1000 ft`. Time and distance values may be mixed in the same group. Centers are a list of note links, `{this}`, wikilinks or coordinates. A list item that is exactly one `{parameter.*}` placeholder expands to one center per entry of the referenced `list` parameter. See `places-queryparameters-help`.
+`ranges` is a YAML list where every value has a time or distance unit. Supported examples include `30 min`, `2 hr`, `500 m`, `5 km`, `3 mile`, and `1000 ft`. Time and distance values may be mixed in the same group. Centers are a list of note links, `{this}`, `{this.location}`, wikilinks or coordinates. `{this}` uses the current note's `Location`; `{this.location}` names that property explicitly and property matching is case-insensitive. Quotes around a brace placeholder are optional. A list item that is exactly one `{parameter.*}` placeholder expands to one center per entry of the referenced `list` parameter. See `places-queryparameters-help`.
+
+`showOnMap: true`, `icon`, or `icons` in the query-parameter definition display markers for the selected centers. See Location parameters in `places-queryparameters-help`.
 
 Add `minZoom` and `maxZoom` inside a group to show that generated overlay only at specific map zoom levels. 
 
@@ -134,5 +136,3 @@ Traffic support is provider-specific. Mapbox uses its `driving-traffic` profile 
 | `strokeWidth`   | `stroke-width`   | Line width in pixels                 |
 | `strokeOpacity` | `stroke-opacity` | Line opacity from 0 to 1             |
 | `fillOpacity`   | `fill-opacity`   | Polygon fill opacity from 0 to 1     |
-
-

@@ -1,4 +1,4 @@
-import type { MapRenderPlan, MapCameraIntent } from "places-shared/render";
+import { withPlanCamera, type MapRenderPlan, type MapCameraIntent } from "places-shared/render";
 import type { MapSurfaceLifecycleEvent, MapSurfaceLifecycleState } from "places-shared/map";
 import type { MapRenderRequest } from "places-shared/settings";
 
@@ -6,20 +6,16 @@ export type MapSurfacePendingReason = 'awaiting-load' | 'awaiting-size' | `tempo
 
 export interface MapSurfaceDriver {
   isAttached(): boolean;
-  // True when the container is connected AND has real layout size. False for a background/display:none tab, which is connected but 0-size.
   hasLayoutSize?(): boolean;
   lifecycle(): Readonly<MapSurfaceLifecycleState>;
   onLifecycleEvent(listener: (state: Readonly<MapSurfaceLifecycleState>, event: MapSurfaceLifecycleEvent) => void): () => void;
-  // Full surface render into the container (provider.processPlaceCodeBlock path).
   render(plan: MapRenderPlan): Promise<{ rendered: boolean; reason?: string }>;
-  // In-place data update of the live map.
   update(previous: MapRenderPlan | null, next: MapRenderPlan): Promise<{ refreshed: boolean; status?: 'requires-rebuild' | 'temporarily-unavailable'; reason?: string }>;
-  // Post-creation camera application.
   applyCamera(camera: MapCameraIntent, request: MapRenderRequest): { applied: boolean; reason?: string };
-  // Live whole-marker visibility toggle (deny-list of placeIds); absent/no-op on providers that cannot filter markers in place.
+  rememberFittedViewport?(plan: MapRenderPlan): void;
   applyMarkerVisibility?(hiddenPlaceIds: readonly string[]): void;
-  // Escalation: full block/view rebuild. The controller only calls this while attached.
   rerender(reason: string): Promise<void>;
+  resolveCamera?(plan: MapRenderPlan): MapCameraIntent;
   warn(message: string, details?: Record<string, unknown>): void;
   debug?(message: string, details?: Record<string, unknown>): void;
 }
@@ -44,16 +40,6 @@ export interface MapSurfaceControllerState {
   disposed: boolean;
 }
 
-// Reconciler for one map surface. Owns the desired MapRenderPlan and converges
-// the live map toward it: renders when nothing is applied, updates in place when
-// the plan changes, escalates to a rebuild on structural declines (while attached),
-// and applies fit-data camera intent once the surface is loaded and sized.
-// Intent is never dropped - unsatisfiable steps go pending and retry on
-// lifecycle transitions; intent pending too long WARNs.
-//
-// Camera policy: only 'fit-data' moves the camera post-creation, and only while
-// the user has not taken over the camera. 'explicit' and 'preserve' are fully
-// handled at map construction.
 export class MapSurfaceController {
   private desiredPlan: MapRenderPlan | null = null;
   private appliedPlan: MapRenderPlan | null = null;
@@ -68,6 +54,10 @@ export class MapSurfaceController {
   private activeReconcile: Promise<void> | null = null;
   private dirty = false;
   private disposed = false;
+  private userCameraInteracted = false;
+  private fittedLoadingData = false;
+  private fittedCameraValid = false;
+  private rememberedBoundsSignature: string | null = null;
   private readonly unsubscribeLifecycle: () => void;
   private readonly pendingWarnMs: number;
   private readonly scheduler: NonNullable<MapSurfaceControllerOptions['scheduler']>;
@@ -85,18 +75,6 @@ export class MapSurfaceController {
     });
   }
 
-  // Adopt a surface that was just rendered outside the controller (the factory
-  // renders initially through the existing provider path). cameraSatisfied
-  // marks whether the construction-time camera could see real layout - a map
-  // created at zero size fit garbage bounds and must be re-fit once sized.
-  seedApplied(plan: MapRenderPlan, state: { cameraSatisfied: boolean }): void {
-    if (this.disposed) return;
-    this.desiredPlan = plan;
-    this.appliedPlan = plan;
-    this.fittedBoundsSignature = plan.camera.kind !== 'fit-data' || state.cameraSatisfied ? plan.boundsSignature : null;
-    void this.reconcile();
-  }
-
   // Every plan change enters here. Never drops intent; latest plan wins.
   setPlan(next: MapRenderPlan, meta?: { source?: string }): void {
     if (this.disposed) return;
@@ -107,39 +85,62 @@ export class MapSurfaceController {
     void this.reconcile();
   }
 
-  // Context loss / rehydrate: forget applied state, keep the desired plan, re-render.
+  setMarkerVisibility(hiddenIds: readonly string[]): void {
+    if (!this.desiredPlan) return;
+    this.setPlan({
+      ...this.desiredPlan,
+      markerVisibilityHiddenIds: hiddenIds,
+      runtime: { ...this.desiredPlan.runtime, markerVisibilityHiddenIds: hiddenIds },
+    }, { source: 'marker-filter' });
+  }
+
   restartSurface(reason: string): void {
     if (this.disposed) return;
     this.driver.debug?.('map surface restart', { reason });
+
+    if (this.desiredPlan && this.driver.resolveCamera) {
+      this.desiredPlan = withPlanCamera(this.desiredPlan, this.driver.resolveCamera(this.desiredPlan));
+    }
+
     this.appliedPlan = null;
     this.fittedBoundsSignature = null;
+    this.fittedCameraValid = false;
+    this.rememberedBoundsSignature = null;
     this.renderFailedSignature = null;
     this.declinedSignature = null;
-    // Layers are gone after a context loss; force the visibility filter to reapply.
     this.appliedMarkerVisibilityKey = null;
     void this.reconcile();
   }
 
-  // Single-flight with re-run-when-dirty: overlapping calls fold into one loop,
-  // and awaiting resolves once the loop (including the caller's plan) settles.
   reconcile(): Promise<void> {
     if (this.disposed) return Promise.resolve();
+
     if (this.activeReconcile) {
       this.dirty = true;
+
       return this.activeReconcile;
     }
-    const loop = (async () => {
+
+    const loop = Promise.resolve().then(async () => {
       try {
         do {
+          if (this.disposed) return;
           this.dirty = false;
+
           await this.reconcileOnce();
         } while (this.dirty && !this.disposed);
       } finally {
         this.activeReconcile = null;
       }
-    })();
+    });
+
     this.activeReconcile = loop;
+
     return loop;
+  }
+
+  storesPlansOnly(): boolean {
+    return !this.appliedPlan && this.driver.hasLayoutSize?.() === false;
   }
 
   getState(): Readonly<MapSurfaceControllerState> {
@@ -161,89 +162,148 @@ export class MapSurfaceController {
 
   private async reconcileOnce(): Promise<void> {
     const desired = this.desiredPlan;
+
     if (!desired) {
       this.clearPending();
+
       return;
     }
 
+    this.userCameraInteracted ||= this.driver.lifecycle().userCameraInteracted;
+
     if (!this.appliedPlan) {
+      if (this.driver.hasLayoutSize?.() === false) {
+        this.setPending('awaiting-size');
+
+        return;
+      }
+
       if (this.renderFailedSignature === desired.signature) return;
       const result = await this.driver.render(desired);
+
       if (this.disposed) return;
+
       if (!result.rendered) {
         this.renderFailedSignature = desired.signature;
         this.driver.warn('map surface render failed', { reason: result.reason });
+
         return;
       }
+
       this.appliedPlan = desired;
       this.fittedBoundsSignature = desired.camera.kind !== 'fit-data' || this.driver.lifecycle().sized
         ? desired.boundsSignature
         : null;
+      this.fittedCameraValid = desired.camera.kind === 'fit-data' && this.driver.lifecycle().sized;
       this.options.onPlanApplied?.(desired);
     }
 
     if (this.appliedPlan.signature !== desired.signature) {
       if (this.declinedSignature === desired.signature) {
         this.clearPending();
+
         return;
       }
+
       const result = await this.driver.update(this.appliedPlan, desired);
+
       if (this.disposed) return;
+
       if (result.refreshed) {
         this.appliedPlan = desired;
         this.options.onPlanApplied?.(desired);
       } else if (result.status === 'requires-rebuild') {
         if (this.driver.isAttached()) {
-          this.driver.debug?.('map surface update declined; rebuilding', { reason: result.reason });
-          // Rebuild tears this controller down and creates a fresh one.
-          await this.driver.rerender(result.reason ?? 'update declined');
+          if (desired.dataState === 'loading' || this.appliedPlan.dataState === 'loading') {
+            const camera = this.driver.resolveCamera?.(desired) ?? { kind: 'preserve' as const };
+            const rebuilt = await this.driver.render(withPlanCamera(desired, camera));
+
+            if (this.disposed) return;
+
+            if (!rebuilt.rendered) {
+              this.declinedSignature = desired.signature;
+              this.driver.warn('map surface loading rebuild failed', { reason: rebuilt.reason });
+
+              return;
+            }
+
+            this.appliedPlan = desired;
+            this.appliedMarkerVisibilityKey = null;
+            this.options.onPlanApplied?.(desired);
+          } else {
+            this.driver.debug?.('map surface update declined; rebuilding', { reason: result.reason });
+            await this.driver.rerender(result.reason ?? 'update declined');
+
+            return;
+          }
+        } else {
+          this.setPending(`declined-detached:${result.reason ?? 'unknown'}`);
+
           return;
         }
-        // A rebuild while detached would race Obsidian's reattach of the same
-        // elements; hold the intent and retry on the next lifecycle transition.
-        this.setPending(`declined-detached:${result.reason ?? 'unknown'}`);
-        return;
       } else if (result.status === 'temporarily-unavailable') {
         this.setPending(`temporarily-unavailable:${result.reason ?? 'unknown'}`);
+
         return;
       } else {
         this.driver.debug?.('map surface update declined; holding current surface', { reason: result.reason });
         this.declinedSignature = desired.signature;
         this.clearPending();
+
         return;
       }
     } else if (this.appliedPlan !== desired) {
-      // Same content rebuilt into a new plan object; adopt without touching the map.
+      const completed = this.appliedPlan.dataState !== desired.dataState;
+
       this.appliedPlan = desired;
+      if (completed) this.options.onPlanApplied?.(desired);
     }
 
-    // Live marker visibility rides outside the plan signature (like camera), and a
-    // visibility-only parameter change lands here with an unchanged signature -
-    // no setData - and is applied with a single setFilter instead.
     this.reconcileMarkerVisibility(this.appliedPlan);
 
     const applied = this.appliedPlan;
-    if (applied.camera.kind === 'fit-data' && this.fittedBoundsSignature !== applied.boundsSignature) {
+
+    if (applied.camera.kind === 'fit-data' && this.fittedBoundsSignature !== applied.boundsSignature
+      && !(applied.dataState === 'loading' && this.fittedLoadingData)) {
       const lifecycle = this.driver.lifecycle();
-      if (lifecycle.userCameraInteracted) {
-        // The user owns the camera now; data-driven fits stop permanently.
+
+      if (this.userCameraInteracted || lifecycle.userCameraInteracted) {
         this.driver.debug?.('map surface fit skipped - user owns the camera', { boundsSignature: applied.boundsSignature });
         this.fittedBoundsSignature = applied.boundsSignature;
+        if (applied.dataState === 'loading') this.fittedLoadingData = true;
       } else if (lifecycle.phase !== 'loaded') {
         this.setPending('awaiting-load');
+
         return;
       } else if (!lifecycle.sized) {
         this.setPending('awaiting-size');
+
         return;
       } else {
         const result = this.driver.applyCamera(applied.camera, { config: applied.config, runtime: applied.runtime });
+
+        this.fittedCameraValid = result.applied;
+
         if (result.applied) {
           this.driver.debug?.('map surface camera applied', { camera: applied.camera.kind, boundsSignature: applied.boundsSignature });
         } else {
           this.driver.warn('map surface camera not applied', { reason: result.reason });
         }
+
         this.fittedBoundsSignature = applied.boundsSignature;
+        if (applied.dataState === 'loading') this.fittedLoadingData = true;
       }
+    }
+
+    const lifecycle = this.driver.lifecycle();
+
+    if (applied.camera.kind === 'fit-data' && applied.dataState !== 'loading'
+      && this.fittedCameraValid && this.fittedBoundsSignature === applied.boundsSignature
+      && this.rememberedBoundsSignature !== applied.boundsSignature
+      && lifecycle.phase === 'loaded' && lifecycle.sized
+      && !this.userCameraInteracted && !lifecycle.userCameraInteracted) {
+      this.driver.rememberFittedViewport?.(applied);
+      this.rememberedBoundsSignature = applied.boundsSignature;
     }
 
     this.clearPending();
@@ -254,8 +314,10 @@ export class MapSurfaceController {
   // untouched. Idempotent: the same key skips the driver call.
   private reconcileMarkerVisibility(plan: MapRenderPlan): void {
     const hiddenIds = plan.markerVisibilityHiddenIds;
+
     if (hiddenIds === undefined) return;
     const key = hiddenIds.join('');
+
     if (key === this.appliedMarkerVisibilityKey) return;
     this.appliedMarkerVisibilityKey = key;
     this.driver.applyMarkerVisibility?.(hiddenIds);
@@ -280,10 +342,13 @@ export class MapSurfaceController {
       // ResizeObserver reports real size. Only a laid-out surface still stuck is
       // anomalous and worth a warning.
       const notLaidOut = this.driver.hasLayoutSize ? !this.driver.hasLayoutSize() : !this.driver.isAttached();
+
       if (notLaidOut && (this.pending.reason === 'awaiting-size' || this.pending.reason.startsWith('declined-detached:'))) {
         this.driver.debug?.('map surface intent held while not laid out', details);
+
         return;
       }
+
       this.driver.warn('map surface intent pending', details);
     }, this.pendingWarnMs);
   }
@@ -293,6 +358,7 @@ export class MapSurfaceController {
       this.scheduler.cancel(this.pendingWarnTimer);
       this.pendingWarnTimer = null;
     }
+
     this.pending = null;
   }
 }

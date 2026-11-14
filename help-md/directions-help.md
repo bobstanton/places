@@ -85,33 +85,33 @@ Add `traffic: true` to a driving group to route around typical traffic. Mapbox h
 
 Route labels are on by default; the default text is distance plus time. Override the total-route text globally in settings, per block with `routeLabelTemplate`, or inside a group with `labelTemplate`. The template resolves against the whole route, for example `labelTemplate: {this.end_name} · {this.distance_text}`:
 
-| Placeholder                                          | Description                                            |
-| ---------------------------------------------------- | ------------------------------------------------------ |
-| `{this.start_name}`, `{this.end_name}`               | First and last waypoint names                          |
-| `{this.distance_text}`, `{this.duration_text}`       | Formatted totals, such as `12.4 mi` and `25 min`       |
-| `{this.distance_meters}`, `{this.duration_seconds}`  | Numeric totals                                         |
-| `{this.mode}`                                        | `drive`, `walk`, or `bike`                             |
-| `{this.name}`                                        | The group `name` with the route number appended        |
-| `{this.waypoints}`                                   | Every waypoint name, in visit order                    |
+| Placeholder                                         | Description                                      |
+| --------------------------------------------------- | ------------------------------------------------ |
+| `{this.start_name}`, `{this.end_name}`              | First and last waypoint names                    |
+| `{this.distance_text}`, `{this.duration_text}`      | Formatted totals, such as `12.4 mi` and `25 min` |
+| `{this.distance_meters}`, `{this.duration_seconds}` | Numeric totals                                   |
+| `{this.mode}`                                       | `drive`, `walk`, or `bike`                       |
+| `{this.name}`                                       | The group `name` with the route number appended  |
+| `{this.waypoints}`                                  | Every waypoint name, in visit order              |
 
 `metricLabels: legs` shows distance and time between each stop. `metricLabels: both` shows the total plus each leg. `metricLabels: none` hides generated metric labels. Customize per-leg labels with `legLabelTemplate`, resolved against each leg:
 
-| Placeholder                                          | Description                            |
-| ---------------------------------------------------- | -------------------------------------- |
-| `{this.from_name}`, `{this.to_name}`                 | The leg's start and end waypoint names |
-| `{this.distance_text}`, `{this.duration_text}`       | Formatted leg metrics                  |
-| `{this.distance_meters}`, `{this.duration_seconds}`  | Numeric leg metrics                    |
-| `{this.index}`                                       | Leg position, starting at 0            |
+| Placeholder                                         | Description                            |
+| --------------------------------------------------- | -------------------------------------- |
+| `{this.from_name}`, `{this.to_name}`                | The leg's start and end waypoint names |
+| `{this.distance_text}`, `{this.duration_text}`      | Formatted leg metrics                  |
+| `{this.distance_meters}`, `{this.duration_seconds}` | Numeric leg metrics                    |
+| `{this.index}`                                      | Leg position, starting at 0            |
 
 Each waypoint marker is labeled too: `Start:`, `Stop 2:`, and `End:` by default. Customize them with `waypointLabelTemplate`, set globally in settings, per block, or inside a group. It resolves against each waypoint:
 
-| Placeholder          | Description                                     |
-| -------------------- | ----------------------------------------------- |
-| `{this.name}`        | Waypoint name                                   |
-| `{this.role}`        | `start`, `stop`, or `end`                       |
-| `{this.role_label}`  | `Start`, `Stop 2`, `End`                        |
-| `{this.index}`       | Position in the route, starting at 0            |
-| `{this.icon}`        | The linked note's icon; empty for a coordinate  |
-| `{this.path}`        | The linked note's path; empty for a coordinate  |
+| Placeholder         | Description                                    |
+| ------------------- | ---------------------------------------------- |
+| `{this.name}`       | Waypoint name                                  |
+| `{this.role}`       | `start`, `stop`, or `end`                      |
+| `{this.role_label}` | `Start`, `Stop 2`, `End`                       |
+| `{this.index}`      | Position in the route, starting at 0           |
+| `{this.icon}`       | The linked note's icon; empty for a coordinate |
+| `{this.path}`       | The linked note's path; empty for a coordinate |
 
 For example, `waypointLabelTemplate: {this.name}` drops the role prefixes, and an explicitly empty value hides the waypoint labels while keeping the markers. The same key labels GPX `<wpt>` markers on overlays. One global template styles both.

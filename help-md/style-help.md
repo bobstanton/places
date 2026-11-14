@@ -27,35 +27,35 @@ Declarations are written in CSS syntax. Native markers apply the translated subs
 
 Each declaration must end with a semicolon (;), even if it's the only one.
 
-| Operator | Description                    | Example                                                  |
-| -------- | ------------------------------ | -------------------------------------------------------- |
-| (none)   | Unconditional - applies to all | `=> color: #ffffff`                                      |
-| <        | Less than                      | `Rating < 20 => opacity: 0.4`                            |
-| >        | Greater than                   | `Rating > 80 => filter: drop-shadow(0 0 4px gold)`       |
-| <=       | Less than or equal             | `Priority <= 3 => border: 2px solid red`                 |
-| >=       | Greater than or equal          | `Stars >= 4 => background: gold`                         |
-| ==       | Equals (strings or numbers)    | `Type == "restaurant" => color: orange`                  |
-| !=       | Not equals                     | `Type != "cafe" => opacity: 0.7`                         |
-| (truthy) | Property exists and is truthy  | `Favorite => filter: hue-rotate(45deg)`                  |
-| !        | Inverts any condition          | `!isLinked => opacity: 0.5`                              |
-| IN       | Value is in a comma list; `tag IN` matches any listed tag | `Type IN "cafe", "bar" => color: orange`     |
-| AND      | Both conditions must be true   | `Rating > 80 AND tag:favorite => border: 2px solid gold` |
-| OR       | Either condition can be true   | `tag:restaurant OR tag:cafe => color: #e67e22`           |
+| Operator | Description                                               | Example                                                  |
+| -------- | --------------------------------------------------------- | -------------------------------------------------------- |
+| (none)   | Unconditional - applies to all                            | `=> color: #ffffff`                                      |
+| <        | Less than                                                 | `Rating < 20 => opacity: 0.4`                            |
+| >        | Greater than                                              | `Rating > 80 => filter: drop-shadow(0 0 4px gold)`       |
+| <=       | Less than or equal                                        | `Priority <= 3 => border: 2px solid red`                 |
+| >=       | Greater than or equal                                     | `Stars >= 4 => background: gold`                         |
+| ==       | Equals (strings or numbers)                               | `Type == "restaurant" => color: orange`                  |
+| !=       | Not equals                                                | `Type != "cafe" => opacity: 0.7`                         |
+| (truthy) | Property exists and is truthy                             | `Favorite => filter: hue-rotate(45deg)`                  |
+| !        | Inverts any condition                                     | `!isLinked => opacity: 0.5`                              |
+| IN       | Value is in a comma list; `tag IN` matches any listed tag | `Type IN "cafe", "bar" => color: orange`                 |
+| AND      | Both conditions must be true                              | `Rating > 80 AND tag:favorite => border: 2px solid gold` |
+| OR       | Either condition can be true                              | `tag:restaurant OR tag:cafe => color: #e67e22`           |
 
 The left side is a place field: a frontmatter property or query column, a `tag:<name>` check, or the marker's core `icon` and `name` fields. Field names are matched case-insensitively; a query column named `icon` or `name` overrides the core field. `debug: parameters` on the block lists every field its conditions can see.
 
 On the right side, `{PropertyName}` interpolates that place's value into the declaration.
 
-A rule can continue its declarations across following lines. Everything belongs to the current rule until the next line containing `=>`, which starts a new one.
+A rule can continue its declarations across following lines when the rules are written as a YAML text block (`|`). A line containing `=>` starts a new rule.
 
 ~~~places
-iconStyles:
-  - Favorite =>
-      font-size: 200%;
-      opacity: 0.5;
-  - Interest Level == "High" =>
-      font-size: 175%;
-      opacity: 0.33;
+iconStyles: |
+  Favorite =>
+    font-size: 200%;
+    opacity: 0.5;
+  Interest Level == "High" =>
+    font-size: 175%;
+    opacity: 0.33;
 ~~~
 
 ### Precedence and Merging
@@ -64,7 +64,8 @@ Rules apply in this order, each overriding the last:
 
 1. Default `iconStyles`/`labelStyles` rules from Places settings
 2. Code block or Bases `iconStyles`/`labelStyles` rules
-3. Frontmatter `iconStyle`/`labelStyle` properties
+3. Query `iconStyles`/`labelStyles` columns
+4. Note `iconStyles`/`labelStyles` properties
 
 Within one source, every matching rule merges and the **last one wins per property**. Put the general rule first and the sharper thresholds after it.
 
@@ -72,7 +73,7 @@ Within one source, every matching rule merges and the **last one wins per proper
 
 Global style rules live in Places settings under Default icon styles and Default label styles.
 
-On a self-note map (a block with no `query`, `dataview`, or embedded places, showing the note's own location), `min-zoom`/`max-zoom` declarations in the global defaults are ignored: de-emphasis rules assume a crowd, and zoom-hiding a map's only subject would leave it looking empty. Other default styling (opacity, badges, halos) still applies, and zoom rules written in the block itself apply verbatim.
+On a self-note map (a block with no `query`, `dataview`, or `places` list, showing the note's own location), `min-zoom`/`max-zoom` declarations in the global defaults are ignored: de-emphasis rules assume a crowd, and zoom-hiding a map's only subject would leave it looking empty. Other default styling (opacity, badges, halos) still applies, and zoom rules written in the block itself apply verbatim.
 
 ### CSS Class Assignment
 
@@ -109,19 +110,30 @@ iconStyles:
 
 On the default native renderer, these icon properties are translated to GL layer properties or baked into the marker's style image:
 
-| Property                                                                                                 | Native Translation                         | Example                                 |
-| -------------------------------------------------------------------------------------------------------- | ------------------------------------------ | --------------------------------------- |
-| `opacity`                                                                                                | `icon-opacity`                             | `opacity: 0.25;`                        |
-| `font-size` (percentage)                                                                                 | `icon-size`                                | `font-size: 200%;`                      |
-| `font-size` with zoom stops                                                                              | zoom-interpolated `icon-size`              | `font-size: 25% @z7, 87.5% @z15;`       |
-| `content` (+ `content-size`, `content-opacity`, `content-order`, `content-offset-x`, `content-offset-y`) | badge glyph composited into the icon image | `content: "🚫"; content-opacity: 0.75;` |
-| `filter: drop-shadow(...)`                                                                               | halo baked into the icon image             | `filter: drop-shadow(0 0 8px white);`   |
-| `text-shadow`                                                                                            | halo baked into the icon image             | `text-shadow: 0 0 3px black;`           |
-| `min-zoom` / `max-zoom`                                                                                  | zoom filter on the symbol layer            | `min-zoom: 13;`                         |
-| `display: none` / `opacity: 0`                                                                           | marker excluded                            | `display: none;`                        |
-| `z-index`                                                                                                | label priority (`symbol-sort-key`)         | `z-index: 100;`                         |
+| Property                                                                                                 | Native Translation                         | Example                                                                   |
+| -------------------------------------------------------------------------------------------------------- | ------------------------------------------ | ------------------------------------------------------------------------- |
+| `opacity`                                                                                                | `icon-opacity`                             | `opacity: 0.25;`                                                          |
+| `font-size` (percentage)                                                                                 | `icon-size`                                | `font-size: 200%;`                                                        |
+| `font-size` with zoom stops                                                                              | zoom-interpolated `icon-size`              | `font-size: 25% @z7, 87.5% @z15;`                                         |
+| `content` (+ `content-size`, `content-opacity`, `content-order`, `content-offset-x`, `content-offset-y`) | badge glyph composited into the icon image | `content: "🚫"; content-opacity: 0.75;`                                    |
+| `filter: drop-shadow(...)`                                                                               | halo baked into the icon image             | `filter: drop-shadow(0 0 8px white);`                                     |
+| `text-shadow`                                                                                            | halo baked into the icon image             | `text-shadow: 0 0 3px black;`                                             |
+| `background-color`, `border`, `border-radius`                                                            | backing box baked into the icon image      | `background-color: #2563eb; border: 2px solid white; border-radius: 50%;` |
+| `min-zoom` / `max-zoom`                                                                                  | zoom filter on the symbol layer            | `min-zoom: 13;`                                                           |
+| `display: none` / `opacity: 0`                                                                           | marker excluded                            | `display: none;`                                                          |
+| `z-index`                                                                                                | label priority (`symbol-sort-key`)         | `z-index: 100;`                                                           |
 
-Other icon CSS (`transform`, `border`, animations, `calc()` values) requires `markerRenderer: html`:
+`iconImage` replaces the glyph with a picture: a vault path, the absolute path of a file outside the vault (what VaultQuery returns for an external folder), a URL, or a per-place template such as `{this.path}`. The picture is cropped to fill the marker, a square and unbordered by default. `iconImageStyles` frames it, in the same rule syntax as `iconStyles`: `background-color`, `border`, and `border-radius` apply, and `border-radius: 50%` rounds it. Glyph rules never frame a picture, so a `border` written for emoji markers leaves the photographs alone. A picture that has not decoded yet, or a file that is missing, leaves that place its glyph. Both renderers draw it; the native renderer bakes it into the marker image, and each picture is its own image rather than one shared by every place with the same glyph.
+
+A backing box draws behind the glyph on both renderers. `border-radius: 50%` is a circle, a pixel radius rounds a square, and the border draws inside the box. Its size follows the HTML marker's own proportion, so the glyph sits inside it at any `font-size`. `filter: drop-shadow` and `text-shadow` still apply to the glyph, not to the box.
+
+~~~places
+iconStyles:
+  - => background-color: #2563eb; border: 2px solid white; border-radius: 50%
+  - Rating > 80 => background-color: gold
+~~~
+
+Other icon CSS (`transform`, animations, `calc()` values) requires `markerRenderer: html`:
 
 ~~~places
 mapProvider: leaflet
@@ -173,7 +185,7 @@ Only these properties are translated:
 | `max-width`      | `text-max-width`             | `max-width: 8em;`                 |
 | `z-index`        | `symbol-sort-key`            | `z-index: 10;`                    |
 
-**Default label halo:** default labels get a subtle white halo for legibility. When any label style is provided with `labelStyles` or frontmatter `labelStyle`, the built-in halo is not added; the label uses only the provided style. Add `text-shadow` to keep a halo on styled labels.
+**Default label halo:** default labels get a subtle white halo for legibility. When any label style is provided with `labelStyles` or note `labelStyles`, the built-in halo is not added; the label uses only the provided style. Add `text-shadow` to keep a halo on styled labels.
 
 **Halo from `text-shadow`:** the blur radius (third value) sets halo softness and the offsets set halo width; a `0 0` shadow uses the blur radius as the width. `text-shadow: 2px 2px 0 black` is a crisp 2px outline, while `text-shadow: 0 0 3px black` is a soft glow.
 
@@ -213,20 +225,21 @@ labelStyles:
   - Rating < 4 => min-zoom: 13
 ~~~
 
-The same zoom fields can live in frontmatter:
+The same zoom fields work in the code block, as query columns, or as individual note properties:
 
 ~~~yaml
 ---
 Location: 41.408, -75.662
 Rating: 3
-Marker Min Zoom: 13
-Label Min Zoom: 13
-Track Min Zoom: 10
-Overlay Max Zoom: 14
+markerMinZoom: 13
+labelMinZoom: 13
+trackMinZoom: 10
+overlayMaxZoom: 14
 ---
+
 ~~~
 
-`Marker Min Zoom` / `Marker Max Zoom` apply to marker icons, `Label Min Zoom` / `Label Max Zoom` apply to labels, and `Track` or `Overlay` zoom fields apply to that note's track or embedded overlay.
+`markerMinZoom` / `markerMaxZoom` apply to marker icons, `labelMinZoom` / `labelMaxZoom` apply to labels, and `trackMinZoom` / `trackMaxZoom` or `overlayMinZoom` / `overlayMaxZoom` apply to tracks or embedded overlays. The most specific value wins for each bound: query row, note, then block. Style-rule zoom declarations also constrain the resulting range.
 
 ## Coloring Markers
 
@@ -249,8 +262,11 @@ iconStyles:
 A plain number rotates every marker the same way:
 
 ~~~places
-icon: ➤
 iconRotation: 45
+places:
+  - Location: 41.408, -75.662
+    Name: Rotated arrow
+    icon: ➤
 ~~~
 
 A template rotates each marker by its own data. It resolves against the same per-place context as `labelTemplate`. Any column a query returns is available:
@@ -282,14 +298,14 @@ dataview: FROM "Places"
 
 The template resolves against the place:
 
-| Placeholder                                | Description                                                                                          |
-| ------------------------------------------ | ---------------------------------------------------------------------------------------------------- |
-| `{this.name}`                              | The place name                                                                                       |
-| `{this.title}`, `{this.filename}`          | The filename without its extension                                                                   |
-| `{this.path}`                              | The full vault path                                                                                  |
-| `{this.icon}`                              | The marker icon                                                                                      |
-| `{this.latitude}`, `{this.longitude}`      | Coordinates                                                                                          |
-| `{this.tags}`                              | The note's tags                                                                                      |
+| Placeholder                                 | Description                                                                                                                             |
+| ------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `{this.name}`                               | The place name                                                                                                                          |
+| `{this.title}`, `{this.filename}`           | The filename without its extension                                                                                                      |
+| `{this.path}`                               | The full vault path                                                                                                                     |
+| `{this.icon}`                               | The marker icon                                                                                                                         |
+| `{this.latitude}`, `{this.longitude}`       | Coordinates                                                                                                                             |
+| `{this.tags}`                               | The note's tags                                                                                                                         |
 | `{this.Rating}`, `{this['Elevation Gain']}` | Any frontmatter property or query column, by display name, lowercase, or spaces-as-underscores form; bracket form for names with spaces |
 
 Available helper functions (h.):
@@ -303,15 +319,19 @@ Available helper functions (h.):
 - `h.truncate(text, length, suffix)` - Truncate with suffix (default: 200, "...")
 - `h.lower(text)`, `h.upper(text)`, `h.capitalize(text)`, `h.trim(text)`
 
-Examples:
+Choose one template for each block:
 
 ~~~places
 # Remove city suffix ("Dunder Mifflin (Scranton)" -> "Dunder Mifflin")
 labelTemplate: {h.before(this.name, '(')}
+~~~
 
+~~~places
 # Remove prefix ("Park - Trail" -> "Trail")
 labelTemplate: {h.afterLast(this.name, ' - ')}
+~~~
 
+~~~places
 # JavaScript expression
 labelTemplate: {this.name.split(',')[0].trim()}
 ~~~
@@ -346,7 +366,7 @@ Names arrive kebab-cased: `Interest Level` becomes `data-interest-level`. Tags b
 
 **Where data attributes come from:**
 - **Dataview queries**: All frontmatter properties from the source note
-- **VaultQuery SQL**: Columns in the query beyond path/title/location/icon/overlay_source/overlay_cache. Use the `places` view, which exposes every single-value frontmatter property as a lowercase column, or add custom columns with JOINs
+- **VaultQuery SQL**: Selected data columns plus metadata from the referenced note. Query values win for ordinary data; query setting columns override note presentation properties. Serialized overlay data and note content are excluded from metadata. Both `places` and `places_tracks` expose all indexed scalar properties
 - **Frontmatter (no query)**: All properties from the note's frontmatter
 
 ~~~places
@@ -400,28 +420,124 @@ css: |
 | Gentle scaling (80-150%)   | `calc(var(--places-icon-font-size) * clamp(0.8, calc(var(--map-zoom) * 0.0875 - 0.35), 1.5))`          |
 | Compact scaling (25-87.5%) | `calc(var(--places-icon-font-size) * clamp(0.25, calc(var(--map-zoom) * 0.078125 - 0.296875), 0.875))` |
 
-## Per-Note Styling
+## Note and query overrides
 
-Override icon and label styles for individual notes using frontmatter properties.
+Notes use individual frontmatter properties. Query columns use **exactly the same names**, including dots: `track.colorBy`, `track.defaultVisibility`, and so on. There is no `places:` or `settings:` container and no JSON column. Code blocks keep the corresponding nested settings.
 
-| Property    | Description                                  | Example                                 |
-| ----------- | -------------------------------------------- | --------------------------------------- |
-| trackDefaultVisibility | Show or hide this note's overlay on initial map load, overriding the block's `track.defaultVisibility` | visible, hidden |
-| iconStyle   | Declarations applied to the icon             | "opacity: 0.8; font-size: 150%"         |
-| labelStyle  | Declarations applied to the label            | "color: purple; text-shadow: 0 0 2px black" |
-
-Frontmatter styles are translated the same way as `iconStyles`/`labelStyles` rules.
+Precedence is **query rows > note properties > code block > global defaults**. Missing or null values inherit. Explicit `false`, `0`, and empty strings are preserved where the setting supports them. Style rules append in block, note, and query order; the last matching declaration wins. Explicit popup content lists replace the inherited list. Renderer option-only overrides retain the inherited content.
 
 ```yaml
 ---
 Location: 41.408, -75.662
-iconStyle: "opacity: 0.8; font-size: 150%"
-labelStyle: "color: purple; text-shadow: 0 0 2px black"
 Rating: 95
-Favorite: true
-Type: restaurant
+track.colorBy: elevation
+track.defaultVisibility: visible
+track.style: "4 solid red"
+iconStyles:
+  - '=> opacity: 0.8; font-size: 150%'
+labelStyles:
+  - '=> color: purple; text-shadow: 0 0 2px black'
+popup.content.renderer: knap
+popup.content.options.templateFile: Templates/Rating.knap.md
 ---
 ```
+
+A query can supply different settings per row using ordinary expressions and quoted aliases:
+
+~~~places
+query: |
+  SELECT path, title, location, icon, overlay_source, overlay_cache,
+         'grade' AS "track.colorBy",
+         CASE WHEN rating >= 4 THEN 'visible' ELSE 'hidden' END AS "track.defaultVisibility",
+         'knap' AS "popup.content.renderer",
+         'Templates/Rating.knap.md' AS "popup.content.options.templateFile"
+  FROM places_tracks
+track:
+  colorBy: none
+  defaultVisibility: hidden
+~~~
+
+See `places-query-help` for indexed column names and for returning per-place templates without resolving their placeholders before SQL runs.
+
+Both `places` and `places_tracks` include all indexed property columns. A returned `path` also loads that note's presentation properties and metadata, even with a narrow projection. The query must still return `location` and any icon or overlay geometry it needs. Synthetic rows without `path` can use the same setting columns.
+
+| Per-place setting                                                                     | Effect                                                                                     |
+| ------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| `track.colorBy`                                                                       | `none`, `elevation`, `grade`, `speed`, or `pace`                                           |
+| `track.defaultVisibility`                                                             | Initial track state: `visible` or `hidden`                                                 |
+| `track.style`                                                                         | Track width, dashes, color, opacity, and optional outline style; unspecified parts inherit |
+| `track.outline`                                                                       | Show or hide the track outline                                                             |
+| `track.labels.visibility`                                                             | `all`, `none`, or a selection of `start`, `midpoint`, `end`                                |
+| `track.labels.start`, `track.labels.midpoint`, `track.labels.end`                     | Individual path-label templates; empty text suppresses a slot                              |
+| `labelTemplate`                                                                       | Marker label template                                                                      |
+| `iconRotation`                                                                        | Clockwise degrees or a per-place template                                                  |
+| `iconImage`                                                                           | Picture drawn as the marker: a vault path, a URL, or a per-place template                  |
+| `iconImageStyles`                                                                     | Conditional rules framing that picture; the same syntax as `iconStyles`                    |
+| `iconStyles`, `labelStyles`                                                           | The same conditional rule lists used by the code block                                     |
+| `popup.content`                                                                       | `note` includes the note body; `none` suppresses the body                                  |
+| `popup.content.renderer`, `popup.content.options.templateFile`                        | Renderer selection and external Knap template file                                         |
+| `popup.content.0.renderer`, `popup.content.0.options.templateFile`, `popup.content.1` | Ordered sections using numeric positions; the last example accepts `note`                  |
+| `markerMinZoom`, `markerMaxZoom`                                                      | Marker icon zoom limits                                                                    |
+| `labelMinZoom`, `labelMaxZoom`                                                        | Marker label zoom limits                                                                   |
+| `trackMinZoom`, `trackMaxZoom`                                                        | Track zoom limits                                                                          |
+| `overlayMinZoom`, `overlayMaxZoom`                                                    | Embedded-overlay zoom limits; also constrain note tracks                                   |
+
+For a custom popup, save `Rating: {{ rating }}` in `Templates/Rating.knap.md` and select the `knap` renderer. For multiple sections, use separate properties:
+
+```yaml
+popup.content.0.renderer: knap
+popup.content.0.options.templateFile: Templates/Rating.knap.md
+popup.content.1: note
+```
+
+A note or a `places:` entry also accepts the nested `popup:` form the code block uses. Setting it together with `popup.content` properties is an error:
+
+~~~places
+places:
+  - Location: 41.408, -75.662
+    Name: Dunder Mifflin Scranton
+    phone: 570-555-0100
+    popup:
+      content:
+        - renderer: knap
+          options:
+            templateFile: Templates/Front desk.knap.md
+~~~
+
+Save `**Front desk:** {{ phone }}` in `Templates/Front desk.knap.md`. The same setting names work as SQL aliases. Missing or null indexed sections are omitted. Use either a single section or numbered sections. `popup.content: none` clears the body. `iconStyles` and `labelStyles` accept note lists or query text with newline-separated rules; numbered properties such as `iconStyles.0` also work.
+
+Popup overrides resolve against the place's data and query row. Explicit content replaces the inherited list. Option-only overrides retain its sections. A note section needs a linked note; Knap templates also work on synthetic query rows. Invalid settings report an error rather than silently dropping the marker.
+
+Map-wide settings stay in the block: providers, dimensions, camera, clustering, `showLabels`, search and query controls, terrain, legend, route generation, heatmap configuration, track details, direction arrows, and grade/speed averaging. In particular, `showLabels: false` still hides all labels even when a note supplies templates.
+
+### Renderer options
+
+Each renderer section accepts `options`:
+
+```yaml
+popup:
+  content:
+    renderer: image.preview
+    options:
+      fields: [captured, camera_model]
+```
+
+The same paths apply to note properties and query columns:
+
+```sql
+'image.preview' AS "popup.content.renderer",
+'captured, camera_model' AS "popup.content.options.fields"
+```
+
+An option-only override retains the inherited renderer and content list:
+
+```sql
+'camera_model' AS "popup.content.options.fields"
+```
+
+For multiple sections, `popup.content.1.options.fields` targets the second section. Option mappings merge by key; lists replace. Missing or null options inherit. Explicit content replaces the list and its options; `popup.content: none` clears the body. Option-only overrides require an inherited renderer at the specified position and cannot share a layer with replacement sections.
+
+`image.preview` accepts `options.fields` as a list or comma-separated text. Fields appear in order; missing values are omitted. Omission retains the default metadata. `[]` in YAML or an empty SQL string hides all metadata while retaining the image. Supported image fields include `description`, `captured`, `captured_local`, `camera_make`, `camera_model`, `lens_model`, `iso`, `exposure_time`, `exposure_time_text`, `f_number`, `focal_length`, and `focal_length_35mm`. Other selected columns display as labeled values.
 
 ## Highlighting Linked Notes
 
@@ -447,41 +563,38 @@ The `CASE WHEN` creates an `isLinked` column that is `'true'` for notes linked f
 
 ## Track Styling
 
-Customize the appearance of individual tracks/routes using frontmatter properties or embedded place syntax.
-
-| Property         | Description                   | Example Values                       |
-| ---------------- | ----------------------------- | ------------------------------------ |
-| `trackStyle` | Styling shorthand (see below) | "4 dashed #39e657; 8 solid #000 0.3" |
+Use the `track.style` note property or query column, or the nested `track.style` setting in the code block. It controls line width, dashes, color, opacity, and an optional outline.
 
 ### Track Style Syntax
 
-The `trackStyle` property defines main line and optional outline styling in a single property:
+Separate the line and optional outline styles with a semicolon:
 
-- Format: "weight style color [opacity]; outline-weight outline-style outline-color [outline-opacity]"
-- No semicolon = no outline
-- With semicolon = outline enabled
-- Style can be "solid" or "dashed"
-- Opacity is optional (defaults to 1)
+`weight style color [opacity]; outline-weight outline-style outline-color [outline-opacity]`
+
+- `weight` is the line width in pixels and must be positive.
+- `style` is `solid` or `dashed`.
+- `color` accepts CSS names such as `red` and 3/4/6/8-digit hex values such as `#e63946`.
+- `opacity` ranges from `0` (transparent) to `1` (opaque). If omitted, it keeps the imported value or defaults to `0.9` for the line and `1` for the outline.
+- Unspecified style parts inherit from less specific settings or the imported geometry. Leaving out the semicolon preserves the inherited outline policy. Use `track.outline: false` to disable it. The line and outline can use different dash styles.
+
+Color names and `solid`/`dashed` ignore capitalization. Invalid values produce an error.
 
 ```yaml
----
-Location: 41.408, -75.662
-Overlay Source: <compressed track data>
-trackStyle: "4 solid #e63946 0.9; 8 solid #000000 0.5"
----
+track.style: '4 solid #e63946 0.9; 8 solid #000000 0.5'
+
 ```
 
-### Polyline Coloring Modes
+### Track Coloring Modes
 
-Use `track.colorBy` to automatically color polylines based on data:
+Use `track.colorBy` to automatically color tracks based on data:
 
 | Mode        | Description                                                       |
 | ----------- | ----------------------------------------------------------------- |
-| `none`      | Single solid color (default)                                      |
+| `none`      | Single color (dashed by default)                                  |
 | `elevation` | Color by absolute elevation (blue=low to white=high)              |
 | `grade`     | Color by terrain steepness (blue=downhill, gray=flat, red=uphill) |
-| `speed`     | Color by speed, averaged over `speedWindow` (needs GPX timestamps) |
-| `pace`      | Color by pace, same data as speed with the ramp inverted           |
+| `speed`     | Averaged over `speedWindow`                                       |
+| `pace`      | Minutes per mile or kilometer, averaged over `speedWindow`        |
 
 ~~~places
 mapProvider: leaflet
@@ -490,12 +603,17 @@ track:
   gradeWindow: 100ft
 ~~~
 
-Individual notes can override the code block setting using the `trackColorBy` frontmatter property:
+The `track.colorBy` note property overrides block coloring when the query omits it:
 
 ```yaml
 ---
-trackColorBy: elevation
+track.colorBy: elevation
 ---
+
 ```
 
-`track.gradeWindow` is the span the rolling grade is measured over. Smaller values show more detail, larger values smooth out noise. It takes a distance (`100ft`, `50m`, `0.1mi`) or, on charts, a time (`10min`). `track.speedWindow` does the same for speed and pace, defaulting to `200m`; a time window such as `30s` reads better across stops, where a distance window spans the whole pause. Both default from the matching settings in Places settings, and `gradeDistance:` is still accepted as the older spelling of `gradeWindow:` (an unlabelled number of feet).
+`track.gradeWindow` measures rolling grade over a distance, defaulting to `100ft`. Smaller values show more detail; larger values smooth out noise. Use `100ft`, `50m`, or `0.1mi` in maps. Charts use the root `gradeWindow:` setting and also accept time windows such as `10min`.
+
+`track.speedWindow` averages speed and pace over a distance or time, defaulting to `200m`. A time window such as `30s` limits how much of a stop contributes to the average. Charts use the root `speedWindow:` setting.
+
+`gradeDistance:` accepts a number of feet under `track:` for maps and at the root for charts. `gradeWindow` takes precedence when both are present.

@@ -1,31 +1,29 @@
+import { VaultQueryPreparingError } from "./VaultQueryServiceBase";
 import { logger } from "places-shared/utils";
 import { migrateQueryParameterSourcePath } from "./QueryParameterState";
 import { resolveCurrentSourcePath } from "./SourcePathRenames";
-
-// Tracks active map containers that use queries and can be refreshed when data changes.
-// Automatically refreshes maps when VaultQuery indexes files that might affect query results.
-//
-// The service only routes events and tracks container liveness. How a block
-// re-renders itself - including re-reading its current source text and
-// patching a renamed source path into its render context - is owned by the
-// registrant's refresh handler (see MapRefreshInputs.createMapRefreshInputResolver).
+import { queryReadsTables, relationKeys, tablesForIndexedFile } from "./QueryTableScope";
+import type { FileIndexedSource } from "vaultquery/api";
 
 export interface MapRefreshOptions {
-  // True when the user clicked the refresh button; bypasses caches.
   manual?: boolean;
+  parameters?: boolean;
 }
 
 // Re-renders the block. Receives the current source path (kept up to date across renames).
 export type MapRefreshHandler = (sourcePath: string, options?: MapRefreshOptions) => Promise<void>;
 
+export type MapDataChange = 'all' | 'dataview' | { tables: readonly string[] };
+
+export type QueryRelationResolver = (query: string) => Promise<{ relations: string[]; complete: boolean } | null>;
+
 export interface MapRefreshRegistration {
   sourcePath: string;
   refresh: MapRefreshHandler;
   usesVaultQuery: boolean;
+  query?: string;
   usesDataview: boolean;
-  // Whether the query uses {this.} placeholders that depend on the current file's metadata
   usesSelfReferencingPlaceholders?: boolean;
-  // Direct note dependencies outside the source note, such as places listed by wikilink.
   dependencyPaths?: Iterable<string>;
 }
 
@@ -34,42 +32,71 @@ interface TrackedMap {
   sourcePath: string;
   refresh: MapRefreshHandler;
   usesVaultQuery: boolean;
+  query?: string;
+  resolvedTables?: ReadonlySet<string>;
   usesDataview: boolean;
   usesSelfReferencingPlaceholders: boolean;
   dependencyPaths: Set<string>;
-  // Refresh was skipped because container was disconnected - execute it when container reconnects
   needsRefreshOnReconnect: boolean;
-  // Temporary disconnect timestamp used to tolerate Obsidian DOM virtualization
-  detachedAt?: number;
 }
 
 export interface RefreshableBlockEntry {
   onRefresh: () => Promise<void>;
   autoRefresh?: boolean;
   shouldAutoRefresh?: (changedPath?: string) => boolean;
-  // Note the block lives in; enables note-scoped parameter refreshes.
   sourcePath?: string;
-  // True when the block's settings resolve {parameter.*} placeholders.
   usesParameters?: boolean;
+  query?: string | null;
+}
+
+export interface BlockFileChange {
+  path: string;
+  source?: FileIndexedSource;
 }
 
 export interface RefreshAllBlocksOptions {
   force?: boolean;
   changedPath?: string;
   changedPaths?: string[];
+  fileChanges?: BlockFileChange[];
 }
 
 export type RefreshableBlockRegistration = symbol;
 
+interface MapRefreshWork {
+  pending: MapRefreshOptions | null;
+  promise: Promise<boolean>;
+  cancelRetry?: () => void;
+}
+
 export class MapRefreshService {
   private static instance: MapRefreshService | null = null;
+  private queryRelationResolver?: QueryRelationResolver;
   private trackedMaps: Map<HTMLElement, TrackedMap> = new Map();
-  private trackedBlocks: Map<HTMLElement, RefreshableBlockEntry & { registration: RefreshableBlockRegistration }> = new Map();
+  private reconnectObservers = new Map<HTMLElement, IntersectionObserver>();
+  private trackedBlocks: Map<HTMLElement, RefreshableBlockEntry & { registration: RefreshableBlockRegistration; resolvedTables?: ReadonlySet<string> }> = new Map();
+  private blockRefreshWork = new Map<HTMLElement, { pending: boolean; promise: Promise<void> }>();
+  private containerRefreshWork = new Map<HTMLElement, MapRefreshWork>();
   private refreshDebounceTimer: number | null = null;
+  private refreshWorkInFlight = false;
   private pendingRefreshContainers: Set<HTMLElement> = new Set();
-  private dataChangeListeners: Set<() => void> = new Set();
-  private static readonly DETACHED_MAP_TTL_MS = 60000;
+  private dataChangeListeners: Set<(change: MapDataChange) => void> = new Set();
   private static readonly DATA_REFRESH_DEBOUNCE_MS = 200;
+  private static readonly INDEX_REFRESH_DEBOUNCE_MS = 750;
+  private static readonly INDEX_CHURN_MAX_DEBOUNCE_MS = 60000;
+  private static readonly CHURN_FAST_RETRY_MAX_MS = 1500;
+  private static readonly CHURN_BACKOFF_COST_FACTOR = 2;
+  private indexChurnDebounceMs = 0;
+  private static readonly BULK_INDEX_FILE_COUNT = 128;
+  private static readonly BULK_INDEX_WINDOW_MS = 30000;
+  private static readonly BULK_INDEX_REFRESH_DEBOUNCE_MS = 5000;
+  private static readonly BULK_INDEX_REFRESH_COST_FACTOR = 9;
+  private static readonly BULK_INDEX_MAX_DEBOUNCE_MS = 30000;
+  private lastRefreshCostMs = 0;
+  private static readonly REFRESH_MAX_WAIT_MS = 15000;
+  private recentIndexing: Array<{ at: number; count: number }> = [];
+  private pendingSince: number | null = null;
+  private static readonly SOURCE_MODIFIED_REFRESH_DEBOUNCE_MS = 600;
   private static readonly RECONNECT_REFRESH_DEBOUNCE_MS = 150;
 
   private constructor() {}
@@ -78,42 +105,95 @@ export class MapRefreshService {
     if (MapRefreshService.instance === null) {
       MapRefreshService.instance = new MapRefreshService();
     }
+
     return MapRefreshService.instance;
   }
 
+  setQueryRelationResolver(resolver: QueryRelationResolver | undefined): void {
+    this.queryRelationResolver = resolver;
+    if (resolver) this.resolveTrackedQueries();
+  }
+
+  private resolveTrackedQueries(): void {
+    for (const tracked of this.trackedMaps.values()) this.resolveTrackedQuery(tracked);
+    for (const tracked of this.trackedBlocks.values()) this.resolveTrackedQuery(tracked);
+  }
+
+  private resolveTrackedQuery(tracked: { query?: string | null; resolvedTables?: ReadonlySet<string> }): void {
+    const resolver = this.queryRelationResolver;
+    const query = tracked.query;
+
+    if (!resolver || !query || tracked.resolvedTables) return;
+
+    void resolver(query)
+      .then(resolved => {
+        if (!resolved?.complete || tracked.query !== query) return;
+        tracked.resolvedTables = relationKeys(resolved.relations);
+      })
+      .catch((error: unknown) => logger.debug('map query relations unresolved; refreshing on every index change', { error }));
+  }
+
   registerMap(container: HTMLElement, registration: MapRefreshRegistration): void {
+    this.stopReconnectWatch(container);
+    this.containerRefreshWork.get(container)?.cancelRetry?.();
     this.trackedMaps.set(container, {
       container,
       sourcePath: resolveCurrentSourcePath(registration.sourcePath),
       refresh: registration.refresh,
       usesVaultQuery: registration.usesVaultQuery,
+      query: registration.query,
       usesDataview: registration.usesDataview,
       usesSelfReferencingPlaceholders: registration.usesSelfReferencingPlaceholders ?? false,
       dependencyPaths: new Set(registration.dependencyPaths ?? []),
       needsRefreshOnReconnect: false
     });
+
+    this.resolveTrackedQuery(this.trackedMaps.get(container)!);
   }
 
   updateMapDependencies(container: HTMLElement, dependencyPaths: Iterable<string>): void {
     const tracked = this.trackedMaps.get(container);
+
     if (!tracked) {
       return;
     }
+
     tracked.dependencyPaths = new Set(dependencyPaths);
   }
 
+  queueContainerRefresh(container: HTMLElement): void {
+    const tracked = this.trackedMaps.get(container);
+
+    if (!tracked) return;
+
+    if (!this.isContainerConnected(container)) {
+      this.deferUntilReconnect(tracked);
+
+      return;
+    }
+
+    this.pendingRefreshContainers.add(container);
+    this.schedulePendingWork();
+  }
+
   unregisterMap(container: HTMLElement): void {
+    this.stopReconnectWatch(container);
+    this.containerRefreshWork.get(container)?.cancelRetry?.();
+    this.containerRefreshWork.delete(container);
     this.trackedMaps.delete(container);
     this.pendingRefreshContainers.delete(container);
   }
 
   registerBlock(container: HTMLElement, entry: RefreshableBlockEntry): RefreshableBlockRegistration {
     const registration = Symbol('refreshable-block');
+
     this.trackedBlocks.set(container, {
       ...entry,
       sourcePath: entry.sourcePath ? resolveCurrentSourcePath(entry.sourcePath) : undefined,
       registration
     });
+    this.resolveTrackedQuery(this.trackedBlocks.get(container)!);
+
     return registration;
   }
 
@@ -123,55 +203,70 @@ export class MapRefreshService {
         if (registration !== undefined && this.trackedBlocks.get(registeredContainer)?.registration !== registration) {
           continue;
         }
+
         this.trackedBlocks.delete(registeredContainer);
       }
     }
   }
 
-  // Refresh everything in a note that resolves parameters, after a note-scoped
-  // parameter changed (places-parameters strip, map context menu, selection
-  // action). Maps self-limit through the data fingerprint: a map whose
-  // parameter signature did not change skips as unchanged data.
   refreshParameterConsumers(sourcePath: string): void {
     sourcePath = resolveCurrentSourcePath(sourcePath);
     this.queueRefreshes(tracked => resolveCurrentSourcePath(tracked.sourcePath) === sourcePath, 'note-parameters-changed');
+
     for (const [container, entry] of Array.from(this.trackedBlocks.entries())) {
       if (!container.isConnected) {
         this.trackedBlocks.delete(container);
         continue;
       }
+
       if (!entry.sourcePath || resolveCurrentSourcePath(entry.sourcePath) !== sourcePath || !entry.usesParameters) {
         continue;
       }
-      void entry.onRefresh().catch(error => logger.error('Parameter consumer refresh failed', error));
+
+      void this.runBlockRefresh(container).catch(error => logger.error('Parameter consumer refresh failed', error));
     }
   }
 
   async refreshAllBlocks(options: RefreshAllBlocksOptions = {}): Promise<void> {
     const promises: Promise<void>[] = [];
+    const changes: BlockFileChange[] = [
+      ...(options.fileChanges ?? []),
+      ...(options.changedPaths ?? (options.changedPath ? [options.changedPath] : [])).map(path => ({ path })),
+    ];
 
     for (const [container, entry] of Array.from(this.trackedBlocks.entries())) {
       if (!container.isConnected) {
         this.trackedBlocks.delete(container);
         continue;
       }
+
       if (!options.force && !entry.autoRefresh) {
         continue;
       }
-      if (!options.force && entry.shouldAutoRefresh) {
-        const changedPaths = options.changedPaths ?? (options.changedPath ? [options.changedPath] : []);
-        const shouldRefresh = changedPaths.length === 0
-          ? entry.shouldAutoRefresh()
-          : changedPaths.some(path => entry.shouldAutoRefresh?.(path));
+
+      if (!options.force) {
+        const shouldRefresh = changes.length === 0
+          ? entry.shouldAutoRefresh?.() ?? true
+          : changes.some(({ path, source }) => {
+            if (entry.shouldAutoRefresh && !entry.shouldAutoRefresh(path)) return false;
+            const tables = source ? tablesForIndexedFile(source, path) : null;
+
+            if (!tables || entry.query === undefined) return true;
+            if (entry.sourcePath && path === resolveCurrentSourcePath(entry.sourcePath)) return true;
+
+            return entry.query !== null && queryReadsTables(entry.query, tables, entry.resolvedTables);
+          });
+
         if (!shouldRefresh) {
-          logger.debug('Block refresh skipped', { changedPaths });
           continue;
         }
       }
-      promises.push(entry.onRefresh());
+
+      promises.push(this.runBlockRefresh(container));
     }
 
     const results = await Promise.allSettled(promises);
+
     for (const result of results) {
       if (result.status === 'rejected') {
         logger.error('Block refresh failed', result.reason);
@@ -202,141 +297,252 @@ export class MapRefreshService {
     }
 
     try {
-      await matchingEntry.onRefresh();
+      await this.runBlockRefresh(matchingContainer!);
+
       return true;
     }
     catch (error) {
       logger.error('Block refresh failed', error);
+
       return false;
     }
   }
 
-  // Notified whenever anything moves through this service that could change
-  // what a block would render: file and index events, provider table changes,
-  // parameter changes, manual refreshes. PlacesRenderPreparer drops its
-  // completed-prepare cache on this signal.
-  onDataChanged(listener: () => void): () => void {
+  private runBlockRefresh(container: HTMLElement): Promise<void> {
+    const active = this.blockRefreshWork.get(container);
+
+    if (active) {
+      active.pending = true;
+
+      return active.promise;
+    }
+
+    let resolve!: () => void;
+    let reject!: (error: unknown) => void;
+    const promise = new Promise<void>((done, failed) => { resolve = done; reject = failed; });
+    const work = { pending: true, promise };
+
+    this.blockRefreshWork.set(container, work);
+
+    void (async () => {
+      try {
+        while (work.pending && container.isConnected && this.blockRefreshWork.get(container) === work) {
+          work.pending = false;
+          const entry = this.trackedBlocks.get(container);
+
+          if (!entry) break;
+
+          try {
+            await entry.onRefresh();
+          } catch (error) {
+            if (!work.pending) throw error;
+          }
+        }
+
+        resolve();
+      } catch (error) {
+        reject(error);
+      } finally {
+        if (this.blockRefreshWork.get(container) === work) this.blockRefreshWork.delete(container);
+      }
+    })();
+
+    return promise;
+  }
+
+  onDataChanged(listener: (change: MapDataChange) => void): () => void {
     this.dataChangeListeners.add(listener);
+
     return () => this.dataChangeListeners.delete(listener);
   }
 
-  private notifyDataChanged(): void {
-    for (const listener of this.dataChangeListeners) listener();
+  private notifyDataChanged(change: MapDataChange = 'all'): void {
+    for (const listener of this.dataChangeListeners) listener(change);
   }
 
-  // Refresh one container immediately. Defaults to a manual refresh (the user
-  // wants fresh data, not cached data); pass `{}` for programmatic refreshes
-  // like query parameter changes that should keep caches warm.
   async refreshContainerNow(container: HTMLElement, options: MapRefreshOptions = { manual: true }): Promise<boolean> {
-    // The query cache may stay warm on a parameter change, but a prepared render
-    // does not: prepare results key on block text, and the parameter values that
-    // just changed are session state outside that key.
     this.notifyDataChanged();
-    const tracked = this.trackedMaps.get(container);
-    if (!tracked || !this.isContainerConnected(container)) {
+
+    if (!this.trackedMaps.has(container) || !this.isContainerConnected(container)) {
       return false;
     }
 
-    try {
-      await tracked.refresh(tracked.sourcePath, options);
-      return true;
-    } catch (error) {
-      logger.error(`Error refreshing map:`, error);
-      return false;
-    }
+    return this.runContainerRefresh(container, options);
   }
 
-  // Called when a source file is modified (via vault 'modify' event).
-  // Refreshes maps in the modified note that are not backed by VaultQuery.
-  // VaultQuery maps wait for file-indexed events, keeping routine mobile editor
-  // saves from forcing immediate map work before the index catches up.
+  private runContainerRefresh(container: HTMLElement, options: MapRefreshOptions): Promise<boolean> {
+    const active = this.containerRefreshWork.get(container);
+
+    if (active) {
+      active.pending = {
+        manual: Boolean(active.pending?.manual) || Boolean(options.manual),
+        parameters: (active.pending ? Boolean(active.pending.parameters) : true) && Boolean(options.parameters),
+      };
+
+      return active.promise;
+    }
+
+    const work: MapRefreshWork = { pending: null, promise: Promise.resolve(false) };
+
+    work.promise = Promise.resolve().then(async () => {
+      let next: MapRefreshOptions | null = options;
+      let refreshed = false;
+      let retries = 0;
+
+      try {
+        while (next && this.isContainerConnected(container) && this.containerRefreshWork.get(container) === work) {
+          const current: MapRefreshOptions = next;
+
+          work.pending = null;
+          const tracked = this.trackedMaps.get(container);
+
+          if (!tracked) break;
+          const attemptStarted = performance.now();
+
+          try {
+            await tracked.refresh(tracked.sourcePath, current);
+            refreshed = true;
+            retries = 0;
+            this.indexChurnDebounceMs = 0;
+          } catch (error) {
+            const attemptMs = performance.now() - attemptStarted;
+
+            if (error instanceof VaultQueryPreparingError && retries < 2 && attemptMs < MapRefreshService.CHURN_FAST_RETRY_MAX_MS) {
+              const timerWindow = activeWindow;
+
+              await new Promise<void>(resolve => {
+                const finish = (): void => { timerWindow.clearTimeout(timer); work.cancelRetry = undefined; resolve(); };
+                const timer = timerWindow.setTimeout(finish, 500 * ++retries);
+
+                work.cancelRetry = finish;
+              });
+              if (this.trackedMaps.get(container) !== tracked) break;
+              const pending = work.pending as MapRefreshOptions | null;
+
+              next = {
+                manual: Boolean(current.manual || pending?.manual),
+                parameters: Boolean(current.parameters && (!pending || pending.parameters)),
+              };
+              continue;
+            }
+
+            if (error instanceof VaultQueryPreparingError) {
+              this.indexChurnDebounceMs = Math.min(MapRefreshService.INDEX_CHURN_MAX_DEBOUNCE_MS,
+                Math.max(MapRefreshService.INDEX_REFRESH_DEBOUNCE_MS * 2, this.indexChurnDebounceMs * 2,
+                  attemptMs * MapRefreshService.CHURN_BACKOFF_COST_FACTOR));
+              logger.warn('map refresh outpaced by the index; waiting longer',
+                { nextDebounceMs: this.indexChurnDebounceMs, attemptMs: Math.round(attemptMs), sourcePath: tracked.sourcePath });
+            } else {
+              logger.error(`Error refreshing map:`, error);
+            }
+
+            refreshed = false;
+          }
+
+          next = work.pending;
+        }
+      } finally {
+        if (this.containerRefreshWork.get(container) === work) this.containerRefreshWork.delete(container);
+      }
+
+      return refreshed;
+    });
+    this.containerRefreshWork.set(container, work);
+
+    return work.promise;
+  }
+
   onSourceFileModified(modifiedPath: string): void {
     logger.debug('map refresh source file modified', { modifiedPath });
     this.queueRefreshes(tracked =>
       tracked.sourcePath === modifiedPath
       && !tracked.usesVaultQuery
-    , 'source-file-modified');
+    , 'source-file-modified', MapRefreshService.SOURCE_MODIFIED_REFRESH_DEBOUNCE_MS, false);
   }
 
-  // Called when a file is indexed by VaultQuery.
-  // Query-backed maps refresh after indexed data changes. Non-query maps in the
-  // indexed note also refresh here because they read frontmatter through
-  // Obsidian's metadata cache, which can lag behind the raw vault modify event.
-  onFileIndexed(indexedPath: string): void {
-    logger.debug('map refresh file indexed', { indexedPath });
+  onSourceContextChanged(path: string): void {
+    this.queueRefreshes(tracked => tracked.sourcePath === path && tracked.usesSelfReferencingPlaceholders,
+      'source-context-changed', MapRefreshService.SOURCE_MODIFIED_REFRESH_DEBOUNCE_MS, false);
+  }
+
+  onFileIndexed(indexedPath: string, source: FileIndexedSource = 'note'): void {
+    this.onFilesIndexed([indexedPath], source);
+  }
+
+  onFilesIndexed(indexedPaths: readonly string[], source: FileIndexedSource = 'note'): void {
+    if (!indexedPaths.length) return;
+    const tables = source === 'note' ? null
+      : [...new Set(indexedPaths.flatMap(path => tablesForIndexedFile(source, path) ?? []))];
+
+    logger.debug('map refresh files indexed', { files: indexedPaths.length, first: indexedPaths[0], source, tables });
     this.queueRefreshes(tracked =>
       (
         tracked.usesVaultQuery
-        && (tracked.sourcePath !== indexedPath || tracked.usesSelfReferencingPlaceholders)
+        && (!tables || queryReadsTables(tracked.query, tables, tracked.resolvedTables))
+        && (indexedPaths.some(path => tracked.sourcePath !== path) || tracked.usesSelfReferencingPlaceholders)
       )
       || (
         !tracked.usesVaultQuery
-        && tracked.sourcePath === indexedPath
+        && indexedPaths.includes(tracked.sourcePath)
       )
-      || tracked.dependencyPaths.has(indexedPath)
-    , 'file-indexed');
+      || indexedPaths.some(path => tracked.dependencyPaths.has(path))
+    , 'file-indexed', this.indexRefreshDelay(indexedPaths.length), tables ? { tables } : 'all');
   }
 
-  // Called when VaultQuery drops a deleted note from the index. Query-backed
-  // maps refresh, and the deleted note's marker leaves the map; maps that named
-  // the note as a dependency (linkedPlaces, tracks) refresh and forget it. A
-  // map whose own note was deleted disappears with its view, and there is no
-  // self-path case. Dataview maps are covered by dataview-index-changed.
   onFileRemoved(removedPath: string): void {
     logger.debug('map refresh file removed', { removedPath });
-    this.queueRefreshes(tracked => tracked.usesVaultQuery || tracked.dependencyPaths.delete(removedPath), 'file-removed');
+    this.queueRefreshes(
+      tracked => tracked.usesVaultQuery || tracked.dependencyPaths.delete(removedPath),
+      'file-removed',
+      MapRefreshService.INDEX_REFRESH_DEBOUNCE_MS,
+    );
   }
 
-  // Called when Obsidian renames a file. MarkdownPostProcessorContext.sourcePath
-  // can remain stale for already-rendered code blocks, and tracked maps keep their
-  // own mutable source path and use it for subsequent refresh preparation.
   onFileRenamed(oldPath: string, newPath: string): void {
     logger.debug('map refresh file renamed', { oldPath, newPath });
     migrateQueryParameterSourcePath(oldPath, newPath);
+
     for (const entry of this.trackedBlocks.values()) {
       if (entry.sourcePath === oldPath) entry.sourcePath = newPath;
     }
+
     this.queueRefreshes(tracked => {
       if (tracked.sourcePath === oldPath) {
         tracked.sourcePath = newPath;
+
         return true;
       }
+
       if (tracked.dependencyPaths.delete(oldPath)) {
         tracked.dependencyPaths.add(newPath);
+
         return true;
       }
-      return tracked.usesVaultQuery;
-    }, 'file-renamed');
+
+      return false;
+    }, 'file-renamed', undefined, false);
   }
 
-  // Called when VaultQuery finishes a full indexing pass. This catches maps
-  // that first rendered against a partial startup database after their relevant
-  // per-file events had already fired.
   onVaultIndexed(): void {
     logger.debug('map refresh vault indexed');
+    this.indexChurnDebounceMs = 0;
+    this.recentIndexing = [];
+    this.resolveTrackedQueries();
     this.queueRefreshes(tracked => tracked.usesVaultQuery, 'vault-indexed');
   }
 
-  onProviderTablesChanged(): void {
-    logger.debug('map refresh provider tables changed');
-    this.queueRefreshes(tracked => tracked.usesVaultQuery, 'provider-tables-changed');
+  onProviderTablesChanged(tables: readonly string[] = []): void {
+    logger.debug('map refresh provider tables changed', { tables });
+    this.queueRefreshes(tracked => tracked.usesVaultQuery && queryReadsTables(tracked.query, tables, tracked.resolvedTables),
+      'provider-tables-changed', undefined, tables.length ? { tables } : 'all');
   }
 
-  // Called when Dataview re-indexes (its `dataview:refresh-views` signal). A DQL
-  // query can select any note: like a VaultQuery map on vault-indexed, a
-  // `dataview:` map must re-run when the vault's Dataview index changes, not only
-  // when its own note is edited. This is the Dataview-native equivalent of the
-  // VaultQuery index events above; without it, `dataview:` maps went stale on
-  // cross-note edits (the tracked `usesDataview` flag was never read).
   onDataviewIndexChanged(): void {
     logger.debug('map refresh dataview index changed');
-    this.queueRefreshes(tracked => tracked.usesDataview, 'dataview-index-changed');
+    this.queueRefreshes(tracked => tracked.usesDataview, 'dataview-index-changed', undefined, 'dataview');
   }
 
-  private queueRefreshes(shouldRefresh: (tracked: TrackedMap) => boolean, reason: string): void {
-    // Before match filtering: the signal invalidates prepared results for every
-    // block, tracked live maps included or not.
-    this.notifyDataChanged();
+  private queueRefreshes(shouldRefresh: (tracked: TrackedMap) => boolean, reason: string, delayMs?: number, change: MapDataChange | false = 'all'): void {
     let matched = 0;
     const matchedMaps: Array<{
       sourcePath: string;
@@ -345,6 +551,7 @@ export class MapRefreshService {
       usesSelfReferencingPlaceholders: boolean;
       connected: boolean;
     }> = [];
+
     for (const [container, tracked] of this.trackedMaps) {
       if (!shouldRefresh(tracked)) {
         continue;
@@ -352,6 +559,7 @@ export class MapRefreshService {
 
       matched++;
       const connected = this.isContainerConnected(container);
+
       matchedMaps.push({
         sourcePath: tracked.sourcePath,
         usesVaultQuery: tracked.usesVaultQuery,
@@ -359,8 +567,9 @@ export class MapRefreshService {
         usesSelfReferencingPlaceholders: tracked.usesSelfReferencingPlaceholders,
         connected,
       });
+
       if (!connected) {
-        tracked.needsRefreshOnReconnect = true;
+        this.deferUntilReconnect(tracked);
         logger.debug('map refresh deferred until reconnect', {
           reason,
           sourcePath: tracked.sourcePath,
@@ -374,6 +583,7 @@ export class MapRefreshService {
       this.pendingRefreshContainers.add(container);
     }
 
+    if (matched || change) this.notifyDataChanged(change || 'all');
     logger.debug('map refresh queued', {
       reason,
       matched,
@@ -385,82 +595,138 @@ export class MapRefreshService {
       return;
     }
 
-    this.schedulePendingWork();
+    this.schedulePendingWork(delayMs);
+  }
+
+  private indexRefreshDelay(indexedCount: number): number {
+    const now = Date.now();
+
+    this.recentIndexing.push({ at: now, count: indexedCount });
+    const windowStart = now - MapRefreshService.BULK_INDEX_WINDOW_MS;
+
+    while (this.recentIndexing.length > 0 && this.recentIndexing[0].at < windowStart) this.recentIndexing.shift();
+
+    const recentFiles = this.recentIndexing.reduce((total, entry) => total + entry.count, 0);
+    const bulk = recentFiles >= MapRefreshService.BULK_INDEX_FILE_COUNT
+      ? Math.min(MapRefreshService.BULK_INDEX_MAX_DEBOUNCE_MS, Math.max(
+        MapRefreshService.BULK_INDEX_REFRESH_DEBOUNCE_MS,
+        this.lastRefreshCostMs * MapRefreshService.BULK_INDEX_REFRESH_COST_FACTOR))
+      : 0;
+
+    return Math.max(MapRefreshService.INDEX_REFRESH_DEBOUNCE_MS, this.indexChurnDebounceMs, bulk);
   }
 
   private schedulePendingWork(delayMs = MapRefreshService.DATA_REFRESH_DEBOUNCE_MS): void {
-    if (this.refreshDebounceTimer) {
+    if (this.refreshDebounceTimer !== null) {
       window.clearTimeout(this.refreshDebounceTimer);
     }
 
+    const now = Date.now();
+
+    this.pendingSince ??= now;
+    const waited = now - this.pendingSince;
+    const maxWait = Math.max(MapRefreshService.REFRESH_MAX_WAIT_MS, delayMs);
+    const capped = Math.max(0, Math.min(delayMs, maxWait - waited));
+
+    logger.debug('map refresh scheduled', { delayMs: Math.round(delayMs), cappedMs: Math.round(capped), waitedMs: waited, lastRefreshCostMs: Math.round(this.lastRefreshCostMs) });
+
     this.refreshDebounceTimer = window.setTimeout(() => {
       void this.executePendingWork();
-    }, delayMs);
+    }, capped);
   }
 
   private async executePendingWork(): Promise<void> {
-    const containersToRefresh = Array.from(this.pendingRefreshContainers);
-    this.pendingRefreshContainers.clear();
     this.refreshDebounceTimer = null;
-    logger.debug('map refresh executing pending work', {
-      refreshCount: containersToRefresh.length,
-    });
 
-    this.cleanupExpiredDetachedMaps();
+    if (this.refreshWorkInFlight) {
+      logger.debug('map refresh execution coalesced with active work', {
+        pendingRefreshCount: this.pendingRefreshContainers.size,
+      });
 
-    for (const container of containersToRefresh) {
-      const tracked = this.trackedMaps.get(container);
-      if (tracked && this.isContainerConnected(container)) {
-        try {
-          await tracked.refresh(tracked.sourcePath);
-        } catch (error) {
-          logger.error(`Error auto-refreshing map:`, error);
-        }
-      }
-    }
-  }
-
-  // Periodically inspect tracked maps and restore any that became reconnectable.
-  checkAndRestoreMaps(): void {
-    const now = Date.now();
-
-    for (const [container, tracked] of this.trackedMaps) {
-      if (!this.isContainerConnected(container)) {
-        tracked.detachedAt ??= now;
-        continue;
-      }
-
-      tracked.detachedAt = undefined;
-
-      if (tracked.needsRefreshOnReconnect) {
-        tracked.needsRefreshOnReconnect = false;
-        this.pendingRefreshContainers.add(container);
-      }
-    }
-
-    this.cleanupExpiredDetachedMaps(now);
-
-    if (this.pendingRefreshContainers.size === 0) {
       return;
     }
 
-    this.schedulePendingWork(MapRefreshService.RECONNECT_REFRESH_DEBOUNCE_MS);
+    const containersToRefresh = Array.from(this.pendingRefreshContainers);
+
+    this.pendingRefreshContainers.clear();
+    this.pendingSince = null;
+    if (containersToRefresh.length === 0) return;
+
+    this.refreshWorkInFlight = true;
+    logger.debug('map refresh executing pending work', {
+      refreshCount: containersToRefresh.length,
+    });
+    const started = performance.now();
+
+    try {
+      for (const container of containersToRefresh) {
+        const tracked = this.trackedMaps.get(container);
+
+        if (!tracked) continue;
+
+        if (!this.isContainerConnected(container)) {
+          this.deferUntilReconnect(tracked);
+          continue;
+        }
+
+        const refreshed = await this.runContainerRefresh(container, {});
+
+        if (!refreshed && this.trackedMaps.get(container) === tracked && !this.isContainerConnected(container)) {
+          this.deferUntilReconnect(tracked);
+        }
+      }
+    } finally {
+      this.refreshWorkInFlight = false;
+      this.lastRefreshCostMs = performance.now() - started;
+
+      if (this.pendingRefreshContainers.size > 0 && this.refreshDebounceTimer === null) {
+        this.schedulePendingWork();
+      }
+    }
   }
 
-  private cleanupExpiredDetachedMaps(now: number = Date.now()): void {
+  private deferUntilReconnect(tracked: TrackedMap): void {
+    tracked.needsRefreshOnReconnect = true;
+    const container = tracked.container;
+    const Observer = container.ownerDocument?.defaultView?.IntersectionObserver;
+
+    if (!Observer || this.reconnectObservers.has(container)) return;
+
+    const observer = new Observer(records => {
+      if (this.trackedMaps.get(container) === tracked && records.some(record => record.isIntersecting)) {
+        this.checkAndRestoreMaps();
+      }
+    });
+
+    this.reconnectObservers.set(container, observer);
+    observer.observe(container);
+  }
+
+  private stopReconnectWatch(container: HTMLElement): void {
+    this.reconnectObservers.get(container)?.disconnect();
+    this.reconnectObservers.delete(container);
+  }
+
+  checkAndRestoreMaps(): void {
+    let restored = false;
+
     for (const [container, tracked] of this.trackedMaps) {
-      if (!tracked.detachedAt) {
+      if (!this.isContainerConnected(container)) {
         continue;
       }
 
       if (tracked.needsRefreshOnReconnect) {
-        continue;
-      }
-
-      if (now - tracked.detachedAt > MapRefreshService.DETACHED_MAP_TTL_MS) {
-        this.unregisterMap(container);
+        this.stopReconnectWatch(container);
+        tracked.needsRefreshOnReconnect = false;
+        this.pendingRefreshContainers.add(container);
+        restored = true;
+        logger.debug('map refresh restored after reconnect', { sourcePath: tracked.sourcePath, query: tracked.query });
       }
     }
+
+    if (!restored) return;
+
+    this.schedulePendingWork(MapRefreshService.RECONNECT_REFRESH_DEBOUNCE_MS);
   }
 
   // Maps in background tabs are still refreshed when they become visible again:
@@ -476,16 +742,22 @@ export class MapRefreshService {
     this.checkAndRestoreMaps();
   }
 
-  // Called when the plugin is unloaded; also resets the singleton.
   cleanup(): void {
-    if (this.refreshDebounceTimer) {
+    if (this.refreshDebounceTimer !== null) {
       window.clearTimeout(this.refreshDebounceTimer);
       this.refreshDebounceTimer = null;
     }
 
+    for (const container of this.reconnectObservers.keys()) this.stopReconnectWatch(container);
     this.trackedMaps.clear();
     this.trackedBlocks.clear();
+    this.blockRefreshWork.clear();
+    for (const work of this.containerRefreshWork.values()) work.cancelRetry?.();
+    this.containerRefreshWork.clear();
+    this.refreshWorkInFlight = false;
     this.pendingRefreshContainers.clear();
+    this.pendingSince = null;
+    this.recentIndexing = [];
     this.dataChangeListeners.clear();
 
     MapRefreshService.instance = null;

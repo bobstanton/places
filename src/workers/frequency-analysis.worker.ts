@@ -1,9 +1,4 @@
-// Runs heatmap analysis off the main thread; esbuild bundles the imported strategy classes into the worker.
-
-import { FrequencyTrackData, StrategyOptions } from "../services/strategies/IFrequencyStrategy";
-import { OpacityStackingStrategy } from "../services/strategies/OpacityStackingStrategy";
-import { TrackCorridorStrategy } from "../services/strategies/TrackCorridorStrategy";
-import { DensityCloudStrategy } from "../services/strategies/DensityCloudStrategy";
+import { DensityCloudStrategy, OpacityStackingStrategy, TrackCorridorStrategy, type FrequencyTrackData, type StrategyOptions } from 'places/core/strategies';
 import { getErrorMessage } from "places-shared/worker-safe";
 
 interface WorkerRequest {
@@ -29,6 +24,7 @@ self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
       id,
       error: 'Unknown message type'
     });
+
     return;
   }
 
@@ -49,6 +45,7 @@ self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
         id,
         error: `Unknown strategy: ${strategy}`
       });
+
       return;
     }
 
@@ -62,7 +59,6 @@ self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
       id,
       result
     });
-
   } catch (error) {
     self.postMessage({
       type: 'error',

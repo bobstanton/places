@@ -1,17 +1,18 @@
 import { logger as rootLogger } from "places-shared/utils";
-import { createLoadingIndicator } from "places-shared/ui";
+import { applyBlockWidth, createLoadingIndicator } from "places-shared/obsidian/ui";
 import { App, MarkdownPostProcessorContext } from "obsidian";
 import { formatKmInSystem, formatMetersInSystem, km, meters, Meters, UnitsSystem } from "places-shared/units";
 import { parseBoolean, parseBooleanOptional, parseShortDistanceAsMeters, conditionalProps } from "places-shared/settings";
 import { renderError, renderErrorWithHelp, formatDisplayCoordinate, getErrorMessage } from "places-shared/utils";
 import PlacesPlugin from "../main";
 import { BlockParameterSupport } from "../services/BlockParameters";
-import { ParsedCodeBlock, optionalStringSetting, parseCodeBlock } from "../services/CodeBlockParser";
+import { ParsedCodeBlock, optionalStringSetting, parseCodeBlock } from 'places/core';
 import { TrackDataService, TrackData } from "../services/TrackDataService";
 import { TrackComparisonService, TrackComparisonResult, DirectionRelationship } from "../services/TrackComparisonService";
-import { PlacesCodeBlockProcessor } from "./PlacesCodeBlockProcessor";
 import { renderTrackPreviewMap } from "./TrackMapPreview";
-import { registerRefreshableCodeBlock, renderHoverPlaceholder, createOwnNoteEditRefreshGuard } from "./RefreshableCodeBlock";
+import { registerRefreshableCodeBlock, createTrackFileRefreshGuard } from "./RefreshableCodeBlock";
+import { renderHoverPlaceholder } from "places-shared/obsidian/ui";
+import { BlockRefreshRegistry } from "../services/BlockRefreshRegistry";
 
 const logger = rootLogger.scope('places-compare');
 
@@ -54,17 +55,18 @@ export class CompareTracksBlockProcessor {
     if (renderHoverPlaceholder(el, '🗺️ Track comparison preview not available in hover')) return;
 
     const parsed = parseCodeBlock(source);
+    const autoRefresh = parsed.settings.autorefresh;
     const parameters = await this.blockParameters.apply(parsed, el, ctx);
+
     registerRefreshableCodeBlock({
+      autoRefresh,
       source,
       el,
       ctx,
       process: (src, container, context) => this.processCodeBlock(src, container, context),
-      shouldAutoRefresh: createOwnNoteEditRefreshGuard(source, ctx.sourcePath),
-      cleanup: () => {
-        const mapContainer = el.querySelector<HTMLElement>('.places-map-container');
-        if (mapContainer) PlacesCodeBlockProcessor.cleanupMapContainer(mapContainer);
-      },
+      shouldAutoRefresh: createTrackFileRefreshGuard(source, ctx.sourcePath,
+        [parsed.settings.track1, parsed.settings.track2].filter((value): value is string => typeof value === 'string' && value.trim() !== ''),
+        (input, sourcePath) => this.trackDataService.resolveTrackFile(input, sourcePath)),
       ariaLabel: 'Refresh comparison',
       onError: error => logger.error('Refresh comparison failed:', error),
       usesParameters: parameters !== null,
@@ -72,6 +74,8 @@ export class CompareTracksBlockProcessor {
 
     try {
       const settings = this.parseSettings(parsed);
+
+      applyBlockWidth(el, settings.width);
 
       if (!settings.track1 || !settings.track2) {
         renderError(el, {
@@ -83,6 +87,7 @@ export class CompareTracksBlockProcessor {
           text: "Example: track1: [[path/to/track1.md]]",
           cls: "places-muted"
         });
+
         return;
       }
 
@@ -95,6 +100,7 @@ export class CompareTracksBlockProcessor {
           title: "Track 1 Not Found",
           message: `File not found: ${settings.track1}`
         });
+
         return;
       }
 
@@ -104,6 +110,7 @@ export class CompareTracksBlockProcessor {
           title: "Track 2 Not Found",
           message: `File not found: ${settings.track2}`
         });
+
         return;
       }
 
@@ -114,26 +121,11 @@ export class CompareTracksBlockProcessor {
 
       try {
         track1Data = await this.trackDataService.loadTrackFromPath(settings.track1, ctx.sourcePath, { skipCache: true });
-      } catch {
-        loading.remove();
-        renderError(el, {
-          icon: "⚠️",
-          title: "No Track Data",
-          message: `${settings.track1} does not contain valid track data.`
-        });
-        return;
-      }
-
-      try {
         track2Data = await this.trackDataService.loadTrackFromPath(settings.track2, ctx.sourcePath, { skipCache: true });
-      } catch {
+      } catch (error) {
         loading.remove();
-        renderError(el, {
-          icon: "⚠️",
-          title: "No Track Data",
-          message: `${settings.track2} does not contain valid track data.`
-        });
-        return;
+
+        throw error;
       }
 
       if (track1Data.points.length < 2) {
@@ -143,6 +135,7 @@ export class CompareTracksBlockProcessor {
           title: "Insufficient Track Data",
           message: `${settings.track1} needs at least 2 points for comparison.`
         });
+
         return;
       }
 
@@ -153,6 +146,7 @@ export class CompareTracksBlockProcessor {
           title: "Insufficient Track Data",
           message: `${settings.track2} needs at least 2 points for comparison.`
         });
+
         return;
       }
 
@@ -168,13 +162,13 @@ export class CompareTracksBlockProcessor {
         track1Data.points,
         track2Data.points
       );
+
       result.track1Name = this.app.metadataCache.fileToLinktext(track1File, ctx.sourcePath, true);
       result.track2Name = this.app.metadataCache.fileToLinktext(track2File, ctx.sourcePath, true);
 
       loading.remove();
 
       await this.renderOutput(el, result, settings, ctx);
-
     } catch (error) {
       logger.error("Error in places-compare code block:", error);
       renderErrorWithHelp(el, {
@@ -183,8 +177,6 @@ export class CompareTracksBlockProcessor {
         message: getErrorMessage(error)
       });
     } finally {
-      // Render after the content and any internal el.empty(); 'above' placement
-      // still displays the strip on top.
       await parameters?.renderStrip();
     }
   }
@@ -233,6 +225,7 @@ export class CompareTracksBlockProcessor {
     });
 
     const summary = header.createEl("p");
+
     summary.textContent = this.generateSummary(result);
   }
 
@@ -257,6 +250,7 @@ export class CompareTracksBlockProcessor {
       case 'continuation': {
         const gapPoint = result.divergencePoints.find(p => p.type === 'continuation-gap');
         const gapText = gapPoint?.gapDistanceMeters ? ` with ${Math.round(gapPoint.gapDistanceMeters)}m gap` : '';
+
         return `Tracks appear to be a continuation of each other${gapText}.`;
       }
 
@@ -267,18 +261,13 @@ export class CompareTracksBlockProcessor {
   }
 
   private async renderMiniMap(container: HTMLElement, result: TrackComparisonResult, settings: CompareTracksBlockSettings, ctx: MarkdownPostProcessorContext): Promise<void> {
-    const mapContainer = container.createDiv({ cls: "places-compare-map places-map-container" });
-    mapContainer.setCssProps({
-      '--places-compare-map-height': settings.height,
-      '--places-compare-map-width': settings.width
-    });
-
     await renderTrackPreviewMap({
-      mapContainer,
+      host: container,
+      mapContainerClass: "places-compare-map",
       ctx,
+      onRerenderRequested: () => BlockRefreshRegistry.refreshForElement(container).then(() => undefined),
       mapProviderName: settings.mapProvider,
       height: settings.height,
-      width: settings.width,
       style: settings.style,
       tracks: [
         { name: result.track1Name, icon: "🔵", coordinates: result.track1Coordinates.map(c => [c.longitude, c.latitude]), color: '#2196F3', lineStyle: 'solid', filePath: result.track1Path },
@@ -292,11 +281,13 @@ export class CompareTracksBlockProcessor {
     const metricsContainer = container.createDiv({ cls: "places-compare-metrics" });
 
     const overlapSection = metricsContainer.createDiv({ cls: "places-compare-section" });
+
     overlapSection.createEl("h4", { text: "Overlap analysis", cls: "places-compare-section-title" });
 
     const overlapContent = overlapSection.createDiv({ cls: "places-compare-overlap" });
 
     const line1 = overlapContent.createDiv();
+
     line1.appendText(`${result.track1OverlapPercent.toFixed(1)}% of `);
     line1.createEl("code", { text: result.track1Name });
     line1.appendText(` follows `);
@@ -304,6 +295,7 @@ export class CompareTracksBlockProcessor {
     line1.appendText(`'s route`);
 
     const line2 = overlapContent.createDiv();
+
     line2.appendText(`${result.track2OverlapPercent.toFixed(1)}% of `);
     line2.createEl("code", { text: result.track2Name });
     line2.appendText(` follows `);
@@ -315,6 +307,7 @@ export class CompareTracksBlockProcessor {
     overlapContent.createDiv({ text: `Shape similarity (Fréchet): ${Math.round(result.frechetSimilarity * 100)}%` });
 
     const comparisonSection = metricsContainer.createDiv({ cls: "places-compare-section" });
+
     comparisonSection.createEl("h4", { text: "Track comparison", cls: "places-compare-section-title" });
 
     const lengthDiff = Math.abs((result.track1LengthKm as number) - (result.track2LengthKm as number));
@@ -330,10 +323,12 @@ export class CompareTracksBlockProcessor {
     if (hasElevation) {
       gainDiff = Math.abs((result.elevation.track1.gainMeters as number) - (result.elevation.track2.gainMeters as number));
       const maxGain = Math.max(result.elevation.track1.gainMeters, result.elevation.track2.gainMeters);
+
       gainSignificant = maxGain > 0 && (gainDiff / maxGain) > 0.1;
 
       lossDiff = Math.abs((result.elevation.track1.lossMeters as number) - (result.elevation.track2.lossMeters as number));
       const maxLoss = Math.max(result.elevation.track1.lossMeters, result.elevation.track2.lossMeters);
+
       lossSignificant = maxLoss > 0 && (lossDiff / maxLoss) > 0.1;
     }
 
@@ -341,42 +336,54 @@ export class CompareTracksBlockProcessor {
     const table = tableWrapper.createEl("table", { cls: "places-similar-table-element" });
 
     const headerRow = table.createEl("tr", { cls: "places-similar-row" });
+
     headerRow.createEl("th", { text: "", cls: "places-similar-cell" });
     headerRow.createEl("th", { text: "Distance", cls: "places-similar-cell places-compare-value" });
+
     if (hasElevation) {
       headerRow.createEl("th", { text: "Elevation gain", cls: "places-similar-cell places-compare-value" });
       headerRow.createEl("th", { text: "Elevation loss", cls: "places-similar-cell places-compare-value" });
     }
 
     const track1Row = table.createEl("tr", { cls: "places-similar-row" });
+
     track1Row.createEl("td", { text: result.track1Name, cls: "places-similar-cell" });
     track1Row.createEl("td", { text: formatKmInSystem(result.track1LengthKm, this.units, 2), cls: "places-similar-cell places-compare-value" });
+
     if (hasElevation) {
       track1Row.createEl("td", { text: formatMetersInSystem(result.elevation.track1.gainMeters, this.units), cls: "places-similar-cell places-compare-value" });
       track1Row.createEl("td", { text: formatMetersInSystem(result.elevation.track1.lossMeters, this.units), cls: "places-similar-cell places-compare-value" });
     }
 
     const track2Row = table.createEl("tr", { cls: "places-similar-row" });
+
     track2Row.createEl("td", { text: result.track2Name, cls: "places-similar-cell" });
     track2Row.createEl("td", { text: formatKmInSystem(result.track2LengthKm, this.units, 2), cls: "places-similar-cell places-compare-value" });
+
     if (hasElevation) {
       track2Row.createEl("td", { text: formatMetersInSystem(result.elevation.track2.gainMeters, this.units), cls: "places-similar-cell places-compare-value" });
       track2Row.createEl("td", { text: formatMetersInSystem(result.elevation.track2.lossMeters, this.units), cls: "places-similar-cell places-compare-value" });
     }
 
     const diffRow = table.createEl("tr", { cls: "places-similar-row" });
+
     diffRow.createEl("td", { text: "Difference", cls: "places-similar-cell" });
     const distDiffCls = lengthSignificant ? "places-similar-cell places-compare-value places-compare-value-significant" : "places-similar-cell places-compare-value";
+
     diffRow.createEl("td", { text: formatKmInSystem(km(lengthDiff), this.units, 2), cls: distDiffCls });
+
     if (hasElevation) {
       const gainDiffCls = gainSignificant ? "places-similar-cell places-compare-value places-compare-value-significant" : "places-similar-cell places-compare-value";
+
       diffRow.createEl("td", { text: formatMetersInSystem(meters(gainDiff), this.units), cls: gainDiffCls });
       const lossDiffCls = lossSignificant ? "places-similar-cell places-compare-value places-compare-value-significant" : "places-similar-cell places-compare-value";
+
       diffRow.createEl("td", { text: formatMetersInSystem(meters(lossDiff), this.units), cls: lossDiffCls });
     }
 
     if (result.divergencePoints.length > 0) {
       const keyPointsSection = metricsContainer.createDiv({ cls: "places-compare-section" });
+
       keyPointsSection.createEl("h4", { text: "Key points", cls: "places-compare-section-title" });
 
       for (const point of result.divergencePoints) {
@@ -387,16 +394,20 @@ export class CompareTracksBlockProcessor {
         const text = point.gapDistanceMeters
           ? `${icon} ${label} at (${formatDisplayCoordinate(point.coordinate)}) - ${Math.round(point.gapDistanceMeters)}m gap`
           : `${icon} ${label} at (${formatDisplayCoordinate(point.coordinate)})`;
+
         keyPointsSection.createDiv({ text });
       }
     }
 
     if (result.relationship === 'no-overlap' && result.closestApproachMeters !== undefined) {
       const approachSection = metricsContainer.createDiv({ cls: "places-compare-section" });
+
       approachSection.createEl("h4", { text: "Closest approach", cls: "places-compare-section-title" });
 
       const approachTable = this.createTable(approachSection);
+
       this.addTableRow(approachTable, "Distance", formatMetersInSystem(meters(result.closestApproachMeters), this.units));
+
       if (result.closestApproachLocation) {
         this.addTableRow(approachTable, "Location", formatDisplayCoordinate(result.closestApproachLocation));
       }
@@ -405,11 +416,13 @@ export class CompareTracksBlockProcessor {
 
   private createTable(container: HTMLElement): HTMLTableElement {
     const tableWrapper = container.createDiv({ cls: "places-similar-table" });
+
     return tableWrapper.createEl("table", { cls: "places-similar-table-element" });
   }
 
   private addTableRow(table: HTMLTableElement, label: string, value: string): void {
     const row = table.createEl("tr", { cls: "places-similar-row" });
+
     row.createEl("td", { text: label, cls: "places-similar-cell" });
     row.createEl("td", { text: value, cls: "places-similar-cell places-compare-value" });
   }
@@ -420,7 +433,7 @@ export class CompareTracksBlockProcessor {
       'opposite': 'Opposite directions',
       'mixed': 'Mixed directions'
     };
+
     return labels[direction];
   }
-
 }

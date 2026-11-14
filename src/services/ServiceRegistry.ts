@@ -35,6 +35,7 @@ export class ServiceRegistry<TService> {
 
   getFirst(): TService | undefined {
     const first = this.services.values().next();
+
     return first.done ? undefined : first.value;
   }
 
@@ -48,6 +49,7 @@ export class ServiceRegistry<TService> {
 
     for (const name of names) {
       const service = this.get(name);
+
       if (service) {
         results.push({ name, service });
       }

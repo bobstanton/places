@@ -1,30 +1,26 @@
-import { logger as rootLogger } from "places-shared/utils";
-import { BasesView, debounce, Menu, Notice, QueryController, type BasesPropertyId } from "obsidian";
+import { logger as rootLogger, createPerformanceMonitor, renderMapSurfaceError, getErrorMessage, hashString36, scalarToString, sleep } from "places-shared/utils";
+import { BasesView, debounce, Menu, QueryController, type BasesPropertyId } from "obsidian";
 type ViewOption = { displayName: string; type: string; key?: string; default?: string | boolean; placeholder?: string; items?: ViewOption[] };
-import { type TrackColorBy } from "places-shared/track";
-import { createElevationLegend, createGradeLegend, getElevationRange, getLegendPosition } from "../ui/ColorLegend";
-import { type Meters } from "places-shared/units";
-import { MapPlace, Overlay, OverlayResult } from "places-shared/overlay";
-import { type Place } from "places-shared/place";
-import { MarkerStyleService, MarkerStyleConfig, setMapRecoveryState, clearMapRecoveryState, suppressMapContextLossDuring, cleanupMapProviderStates } from "places-shared/map";
-import { createMapRenderPlan, resolveCameraIntent, type MapCameraIntent, type CreateMapRenderPlanOptions as MapRenderPlanOptions } from "places-shared/render";
-import { DEFAULT_MAP_HEIGHT, type MetricWindow } from "places-shared/settings";
+import { MapPlace, Overlay } from "places-shared/overlay";
+import { PlacesBoundingBox } from "places-shared/geo";
+import { MapLoadingProgress } from "../ui/MapLoadingProgress";
+import { createMapRenderPlan, resolveCameraIntent, type MapCameraIntent, type MapRenderPlan, type CreateMapRenderPlanOptions as MapRenderPlanOptions } from "places-shared/render";
+import { CODED_MAP_DEFAULTS, DEFAULT_MAP_HEIGHT, mapConfigPaths, parseMapConfigPatch, type MapBlockSettings, type MetricWindow } from "places-shared/settings";
 import { IMapBlockProcessor } from "places-shared/services";
-import { renderMapSurfaceError, getErrorMessage, hashString36, scalarToString } from "places-shared/utils";
 import { BasesDataAdapter } from "./BasesDataAdapter";
 import { TrackInspectionService } from "../services/TrackInspectionService";
-import { applyIconRotation } from "../services/IconRotationService";
 import PlacesPlugin from "../main";
-import { missingMapProviderError } from "../services/MissingPluginError";
 import { OverlayService } from "../services/OverlayService";
-import { getLabelTemplateService } from "../services/LabelTemplateService";
-import { injectPathLabels } from "../services/PathLabelService";
-import { getMapSurfaceController, disposeMapSurfaceController } from "../services/MapSurfaceControllers";
-import { resolveMapSettings } from "../services/MapSettingsResolver";
-import { mapConfigPaths } from "places-shared/settings";
-import { createFloatingButtonContainer, createGeocodingSearchButton, createMarkerSearchButton, createMarkerSearchToggle, CREATE_NOTE_ACTION_ID, type GeocodingSearchButtonHandle } from "../services/MapFloatingControls";
-import { createFloatingRefreshButton } from "places-shared/ui";
+import { getMapSurfaceController } from "../services/MapSurfaceControllers";
+import { cleanupMapContainer } from "../services/MapSurfaceCleanup";
+import { resolveMapSettings, type ResolvedMapSettings } from "../services/MapSettingsResolver";
 import { renderMapSurface } from "../services/MapSurfaceRenderer";
+import type { MapSurfaceController } from "../services/MapSurfaceController";
+import { MarkerStyleService } from "places-shared/map";
+import type { PlaceLabelOutcome } from "../services/LabelTemplateService";
+import { postProcessPlaces, summarizeLabelOutcomes } from "../services/PlacesRenderPreparer";
+import { PlaceLabelCaches } from '../services/LabelResultCache';
+import { createOverlayLoadProgress, handleSearchResultAction, renderMapContentErrors, type MapContentError } from "../services/MapSurfaceChrome";
 
 const logger = rootLogger.scope('Places Bases');
 
@@ -32,6 +28,8 @@ const PlacesMapViewType = 'places-map';
 
 const DEFAULT_MAP_PROVIDER = '';
 const BASES_RENDER_DEBOUNCE_MS = 150;
+const CONFIG_ERRORS_CLASS = 'places-bases-config-error';
+const OVERLAY_ERRORS_CLASS = 'places-bases-overlay-error';
 
 export interface PropertyMappings {
   location: string;
@@ -42,11 +40,13 @@ export interface PropertyMappings {
   titleId: BasesPropertyId | null;
 }
 
-interface AsyncOverlayLoad {
-  promise: Promise<{
-    overlays: Overlay[];
-    errors: Array<{ path: string; error: string; type: string }>;
-  }>;
+interface BasesPlanInput {
+  dataState?: MapRenderPlan['dataState'];
+  places: MapPlace[];
+  overlays: Overlay[];
+  resolved: ResolvedMapSettings;
+  camera: MapCameraIntent;
+  mapSource: { path: string; lineStart: number };
 }
 
 export class PlacesBasesView extends BasesView {
@@ -55,40 +55,9 @@ export class PlacesBasesView extends BasesView {
   containerEl: HTMLElement;
   mapContainerEl: HTMLElement;
 
-  private mapProvider: string = '';
+  private mapProvider = '';
   private mapHeight: string = DEFAULT_MAP_HEIGHT;
-  private mapStyle: string = '';
-  private initialZoom?: number;
-  private initialCenter?: string;
-  private minZoom?: number;
-  private trackColorBy?: TrackColorBy;
-  private trackDirectionArrows?: number;
-  private showLabels: boolean = true;
-  private trackDefaultVisibility: string = '';
-  private trackGradeWindow = '';
-  private trackOutline?: boolean;
-  private markerRenderer: string = '';
-  private clusterThreshold?: number;
-  private clusterGeoJsonOverlays?: boolean;
-  private poiDiscovery: boolean = true;
-  private pitch: boolean = false;
-  private terrainProvider = '';
-  private terrainExaggeration = '';
-  private colorReliefOpacity = '';
-  private overlays: string = '';
-  private customCss: string = '';
-  private iconStyles: string = '';
-  private labelStyles: string = '';
-  private labelTemplate: string = '';
-  private iconRotation: string = '';
-  private legend: string = 'hidden';
-  private trackLabelsVisibility: string = '';
-  private trackLabelsStart: string = '';
-  private trackLabelsMidpoint: string = '';
-  private trackLabelsEnd: string = '';
-  private debug: boolean = false;
-  private heatmapLayer: boolean = false;
-  private heatmapColorScheme: string = '';
+  private overlays = '';
   private propertyMappings: PropertyMappings = {
     location: "Location",
     icon: "icon",
@@ -99,7 +68,6 @@ export class PlacesBasesView extends BasesView {
   };
 
   private currentMapProcessor: IMapBlockProcessor | null = null;
-  private currentPlaces: MapPlace[] = [];
   private needsFullRender = false;
   private overlayService: OverlayService;
   private lastUpdateSignature: string | null = null;
@@ -109,34 +77,23 @@ export class PlacesBasesView extends BasesView {
   private renderGeneration = 0;
   private renderTimer: number | null = null;
   private hasRenderedMap = false;
-  private needsProviderRetry = false;
   private readonly viewId = PlacesBasesView.nextViewId();
+  private readonly perf = createPerformanceMonitor('bases-view', { viewId: this.viewId }, { enabled: PlacesPlugin.settings.developerMode });
   private static activeViews = new Set<PlacesBasesView>();
   private static viewSequence = 0;
 
   private static nextViewId(): number {
     PlacesBasesView.viewSequence += 1;
+
     return PlacesBasesView.viewSequence;
   }
 
-  constructor(private readonly queryController: QueryController, scrollEl: HTMLElement) {
+  constructor(private readonly queryController: QueryController, scrollEl: HTMLElement, private readonly labelCaches = new PlaceLabelCaches()) {
     super(queryController);
     this.scrollEl = scrollEl;
     this.containerEl = scrollEl.createDiv({ cls: 'places-bases-container is-loading', attr: { tabIndex: '0' } });
     this.mapContainerEl = this.containerEl.createDiv({ cls: 'places-bases-map', attr: { tabIndex: '0' } });
-    this.overlayService = new OverlayService(this.app);
-  }
-
-  private getCombinedIconStyles(): string {
-    return [PlacesPlugin.settings.defaultIconStyles, this.iconStyles]
-      .filter((value): value is string => Boolean(value?.trim()))
-      .join('\n');
-  }
-
-  private getCombinedLabelStyles(): string {
-    return [PlacesPlugin.settings.defaultLabelStyles, this.labelStyles]
-      .filter((value): value is string => Boolean(value?.trim()))
-      .join('\n');
+    this.overlayService = new OverlayService(this.app, id => PlacesPlugin.getOverlayPreset(id));
   }
 
   onload(): void {
@@ -147,6 +104,7 @@ export class PlacesBasesView extends BasesView {
       evt.stopPropagation();
       this.mapContainerEl.focus();
     };
+
     this.registerDomEvent(this.mapContainerEl, 'mousedown', handleInteractionStart);
     this.registerDomEvent(this.mapContainerEl, 'touchstart', handleInteractionStart, { passive: true });
 
@@ -154,16 +112,18 @@ export class PlacesBasesView extends BasesView {
       evt.preventDefault();
       this.showContextMenu(evt);
     });
-
   }
 
   onunload(): void {
+    this.renderGeneration++;
     PlacesBasesView.activeViews.delete(this);
     this.logDebug('view unloaded', { activeViews: PlacesBasesView.activeViews.size });
+
     if (this.renderTimer !== null) {
       window.clearTimeout(this.renderTimer);
       this.renderTimer = null;
     }
+
     this.cleanupMap();
   }
 
@@ -187,53 +147,51 @@ export class PlacesBasesView extends BasesView {
 
   private computeDataSignature(): string {
     const entries = this.data?.data ?? [];
+
     return entries
       .map((e, index) => `${index}:${e.file.path}:${e.file.stat.mtime}`)
       .join('|');
   }
 
   private createTrackInspector(speedWindow: MetricWindow | undefined, sourcePath: string | undefined): MapRenderPlanOptions['inspectTrack'] {
-    const tracks = PlacesPlugin.getTrackDataService();
-    if (!tracks) return undefined;
-    const service = new TrackInspectionService(tracks, () => PlacesPlugin.settings, speedWindow);
-    return (place, coordinate) => service.inspect(place, coordinate, sourcePath ?? '');
+    const service = new TrackInspectionService(() => PlacesPlugin.settings, speedWindow);
+
+    return (place, coordinate, signal) => service.inspect(place, coordinate, sourcePath ?? '', signal);
   }
 
+  private collectRawSettings(): Record<string, unknown> {
+    const raw: Record<string, unknown> = {};
 
-  // Copy any declared map setting the explicit reads above do not already handle.
-  // Runs last and never overwrites: a view keeps its own behaviour for the keys it
-  // interprets, and a setting added for code blocks reaches this view without a
-  // second edit here. Dotted paths become the nested shape resolveMapSettings parses.
-  private fillDeclaredConfig(target: Record<string, unknown>): void {
     for (const path of mapConfigPaths()) {
-      const value = this.config.get(path);
+      const value = coerceViewOptionValue(path, this.config.get(path));
+
       if (value === undefined || value === null || value === '') continue;
 
       const segments = path.split('.');
-      let node = target;
-      let occupied = false;
-      for (const segment of segments.slice(0, -1)) {
-        const next = node[segment];
-        if (next !== undefined && (typeof next !== 'object' || next === null)) { occupied = true; break; }
-        node = (next as Record<string, unknown>) ?? (node[segment] = {});
-      }
-      if (occupied) continue;
+      let node = raw;
 
-      const leaf = segments[segments.length - 1];
-      if (node[leaf] === undefined) node[leaf] = value;
+      for (const segment of segments.slice(0, -1)) {
+        node = (node[segment] as Record<string, unknown> | undefined) ?? (node[segment] = {});
+      }
+
+      node[segments[segments.length - 1]] = value;
     }
+
+    raw.mapProvider = this.mapProvider;
+    raw.width = '100%';
+
+    return raw;
   }
 
   private computeConfigSignature(): string {
-    // Map settings come from the shared list, so a setting added for code blocks
-    // changes this view's signature too. The rest are Bases-only: which column
-    // supplies a place's location, title and icon.
-    const configKeys = [...mapConfigPaths(), 'overlays', 'heatmapColorScheme',
+    const configKeys = [...mapConfigPaths(), 'overlays',
       'locationProperty', 'titleProperty', 'iconProperty'];
+
     return configKeys.map(k => scalarToString(this.config.get(k))).join(',');
   }
 
   public onDataUpdated(): void {
+    this.perf.mark('data-updated', { entries: this.data?.data?.length ?? 0, mapExists: this.hasRenderedMap });
     this.containerEl.removeClass('is-loading');
     this.scheduleMapUpdate();
   }
@@ -242,6 +200,7 @@ export class PlacesBasesView extends BasesView {
     const dataSignature = this.computeDataSignature();
     const configSignature = this.computeConfigSignature();
     const sig = `${dataSignature}||${configSignature}`;
+
     if (!options.force && sig === this.lastUpdateSignature) {
       this.logDebug('onDataUpdated skipped', {
         reason: 'signature unchanged',
@@ -249,6 +208,7 @@ export class PlacesBasesView extends BasesView {
         dataHash: hashString36(dataSignature),
         configHash: hashString36(configSignature)
       });
+
       return;
     }
 
@@ -262,6 +222,7 @@ export class PlacesBasesView extends BasesView {
     this.lastDataSignature = dataSignature;
     this.lastConfigSignature = configSignature;
     this.pendingRenderReason = reason;
+    this.renderGeneration++;
 
     if (this.renderTimer !== null) {
       window.clearTimeout(this.renderTimer);
@@ -269,6 +230,7 @@ export class PlacesBasesView extends BasesView {
     }
 
     const renderDelay = this.hasRenderedMap ? BASES_RENDER_DEBOUNCE_MS : 0;
+
     this.logDebug('render scheduled', {
       reason,
       delayMs: renderDelay,
@@ -280,7 +242,6 @@ export class PlacesBasesView extends BasesView {
     this.renderTimer = window.setTimeout(() => {
       this.renderTimer = null;
       this.loadConfig();
-      this.renderGeneration++;
       void this.renderMapGuarded();
     }, renderDelay);
   }
@@ -296,16 +257,20 @@ export class PlacesBasesView extends BasesView {
   }
 
   private async renderMapGuarded(): Promise<void> {
+    const generation = this.renderGeneration;
+
     try {
       await this.renderMap();
     } catch (error) {
-      this.reportRenderError(error);
+      if (generation === this.renderGeneration) this.reportRenderError(error);
     }
   }
 
   private async updateMapNow(reason: string): Promise<void> {
+    this.labelCaches.clear();
     const dataSignature = this.computeDataSignature();
     const configSignature = this.computeConfigSignature();
+
     this.lastUpdateSignature = `${dataSignature}||${configSignature}`;
     this.lastDataSignature = dataSignature;
     this.lastConfigSignature = configSignature;
@@ -318,134 +283,19 @@ export class PlacesBasesView extends BasesView {
 
     this.loadConfig();
     this.renderGeneration++;
+
     await this.renderMapGuarded();
   }
 
-  private getStringConfig(key: string, fallback = ''): string {
+  private readText(key: string): string {
     const value = this.config.get(key);
-    return typeof value === 'string' && value.trim() ? value : fallback;
-  }
 
-  private getBooleanConfig(key: string, fallback: boolean): boolean {
-    const value = this.config.get(key);
-    if (value === undefined) return fallback;
-    return value === true || value === 'true';
-  }
-
-  private getOptionalNumberConfig(key: string): number | undefined {
-    const value = this.config.get(key);
-    const parsed = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : NaN;
-    return Number.isFinite(parsed) ? parsed : undefined;
-  }
-
-  private getHeightConfig(key: string, fallback: string): string {
-    const value = this.config.get(key);
-    if (typeof value === 'string' && value.trim()) return value;
-    if (typeof value === 'number') return value + 'px';
-    return fallback;
-  }
-
-  private getOptionalBooleanConfig(key: string): boolean | undefined {
-    const value = this.config.get(key);
-    if (value === undefined) return undefined;
-    return value === true || value === 'true';
-  }
-
-  private getEnumConfig<T extends string>(key: string, validValues: readonly T[]): T | undefined {
-    const value = this.config.get(key);
-    return typeof value === 'string' && validValues.includes(value as T) ? value as T : undefined;
-  }
-
-  private getDirectionArrowScaleConfig(): number | undefined {
-    const value = this.config.get('track.directionArrows');
-    if (typeof value === 'boolean') return value ? 1 : 0;
-    return this.getOptionalNumberConfig('track.directionArrows');
-  }
-
-  private buildTerrainSetting(): Record<string, unknown> | undefined {
-    const terrain: Record<string, unknown> = {};
-    if (this.terrainProvider) terrain.provider = this.terrainProvider;
-    if (this.terrainExaggeration) terrain.exaggeration = this.terrainExaggeration;
-    if (this.colorReliefOpacity) terrain.colorRelief = { opacity: this.colorReliefOpacity };
-    return Object.keys(terrain).length > 0 ? terrain : undefined;
-  }
-
-  private getInitialCenterConfig(): string | undefined {
-    const value = this.config.get('initialCenter');
-    if (typeof value === 'string' && value.trim()) return value;
-    if (Array.isArray(value) && value.length >= 2) return `${String(value[0])},${String(value[1])}`;
-    return undefined;
+    return typeof value === 'string' && value.trim() ? value : '';
   }
 
   private loadConfig(): void {
-    this.resetConfigDefaults();
-
-    const explicitProvider = this.getStringConfig('mapProvider') || undefined;
-    this.mapProvider = PlacesPlugin.resolveMapProvider(explicitProvider);
-
-    this.mapHeight = this.getHeightConfig('height', this.mapHeight);
-
-    this.trackColorBy = this.getEnumConfig<TrackColorBy>('track.colorBy', ['none', 'elevation', 'grade', 'speed', 'pace']);
-
-    this.trackDirectionArrows = this.getDirectionArrowScaleConfig();
-
-    this.showLabels = this.getBooleanConfig('showLabels', this.showLabels);
-
-    this.trackDefaultVisibility = this.getStringConfig('track.defaultVisibility', this.trackDefaultVisibility);
-
-    this.trackGradeWindow = this.getStringConfig('track.gradeWindow');
-
-    this.trackOutline = this.getOptionalBooleanConfig('track.outline');
-
-    this.markerRenderer = this.getEnumConfig<'native' | 'html'>('markerRenderer', ['native', 'html']) ?? '';
-
-    this.clusterThreshold = this.getOptionalNumberConfig('clusterThreshold');
-
-    this.clusterGeoJsonOverlays = this.getOptionalBooleanConfig('clusterGeoJsonOverlays');
-
-    this.poiDiscovery = this.getBooleanConfig('poiDiscovery', PlacesPlugin.settings.poiDiscovery);
-
-    this.pitch = this.getBooleanConfig('pitch', this.pitch);
-
-    this.terrainProvider = this.getStringConfig('terrain.provider');
-    this.terrainExaggeration = this.getStringConfig('terrain.exaggeration');
-    this.colorReliefOpacity = this.getStringConfig('terrain.colorRelief.opacity');
-
-    this.mapStyle = this.getStringConfig('style', this.mapStyle);
-
-    this.initialZoom = this.getOptionalNumberConfig('initialZoom');
-
-    this.initialCenter = this.getInitialCenterConfig();
-
-    this.minZoom = this.getOptionalNumberConfig('minZoom');
-
-    this.overlays = this.getStringConfig('overlays', this.overlays);
-
-    this.customCss = this.getStringConfig('css', this.customCss);
-
-    this.iconStyles = this.getStringConfig('iconStyles', this.iconStyles);
-
-    this.labelStyles = this.getStringConfig('labelStyles', this.labelStyles);
-
-    this.labelTemplate = this.getStringConfig('labelTemplate');
-    this.iconRotation = this.getStringConfig('iconRotation');
-
-    this.legend = this.getStringConfig('legend', 'hidden');
-
-    this.trackLabelsVisibility = this.getStringConfig('track.labels.visibility');
-
-    this.trackLabelsStart = this.getStringConfig('track.labels.start');
-
-    this.trackLabelsMidpoint = this.getStringConfig('track.labels.midpoint');
-
-    this.trackLabelsEnd = this.getStringConfig('track.labels.end');
-
-    this.debug = this.getBooleanConfig('debug', this.debug);
-
-    this.heatmapLayer = this.getBooleanConfig('heatmapLayer', this.heatmapLayer);
-
-    this.heatmapColorScheme = this.getStringConfig('heatmapColorScheme');
-
+    this.mapProvider = PlacesPlugin.resolveMapProvider(this.readText('mapProvider') || undefined);
+    this.overlays = this.readText('overlays');
     this.propertyMappings = {
       location: "Location",
       icon: "icon",
@@ -454,54 +304,36 @@ export class PlacesBasesView extends BasesView {
       iconId: this.config.getAsPropertyId('iconProperty'),
       titleId: this.config.getAsPropertyId('titleProperty')
     };
-
-    this.mapContainerEl.setCssProps({
-      '--places-map-height': this.mapHeight
-    });
   }
 
-  private resetConfigDefaults(): void {
-    this.mapProvider = PlacesPlugin.resolveMapProvider(undefined);
-    this.mapHeight = DEFAULT_MAP_HEIGHT;
-    this.mapStyle = '';
-    this.initialZoom = undefined;
-    this.initialCenter = undefined;
-    this.minZoom = undefined;
-    this.trackColorBy = undefined;
-    this.trackDirectionArrows = undefined;
-    this.showLabels = true;
-    this.trackDefaultVisibility = '';
-    this.trackGradeWindow = '';
-    this.trackOutline = undefined;
-    this.markerRenderer = '';
-    this.clusterThreshold = undefined;
-    this.clusterGeoJsonOverlays = undefined;
-    this.poiDiscovery = PlacesPlugin.settings.poiDiscovery;
-    this.pitch = false;
-    this.terrainProvider = '';
-    this.terrainExaggeration = '';
-    this.colorReliefOpacity = '';
-    this.overlays = '';
-    this.customCss = '';
-    this.iconStyles = '';
-    this.labelStyles = '';
-    this.labelTemplate = '';
-    this.iconRotation = '';
-    this.legend = 'hidden';
-    this.trackLabelsVisibility = '';
-    this.trackLabelsStart = '';
-    this.trackLabelsMidpoint = '';
-    this.trackLabelsEnd = '';
-    this.debug = false;
-    this.heatmapLayer = false;
-    this.heatmapColorScheme = '';
-    this.propertyMappings = {
-      location: "Location",
-      icon: "icon",
-      title: "",
-      locationId: null,
-      iconId: null,
-      titleId: null
+  private buildPlan(input: BasesPlanInput): { plan: MapRenderPlan; errors: MapContentError[] } {
+    const terrain = PlacesPlugin.resolveTerrainRuntime(input.resolved.config);
+    const plan = createMapRenderPlan({
+      perf: this.perf,
+      surfaceKind: 'bases-view',
+      dataState: input.dataState,
+      places: input.places,
+      overlays: input.overlays,
+      config: input.resolved.config,
+      clusteringEnabled: input.resolved.clusteringEnabled,
+      source: input.mapSource,
+      camera: input.camera,
+      placeNoteHost: PlacesPlugin.placeNoteHost,
+      reverseGeocodeHost: PlacesPlugin.reverseGeocodeHost,
+      onPlaceAction: (place, actionId) => handleSearchResultAction(place, actionId, input.mapSource.path),
+      inspectTrack: this.createTrackInspector(input.resolved.config.trackSpeedWindow, input.mapSource.path),
+      trackLoader: PlacesPlugin.getTrackDataService(),
+      popupRenderers: PlacesPlugin.getPopupRenderers(),
+      terrainDem: terrain.terrainDem,
+      reliefDem: terrain.reliefDem,
+    });
+
+    return {
+      plan,
+      errors: [
+        ...terrain.errors.map(e => ({ ...e, type: 'Terrain' })),
+        ...plan.errors.map(e => ({ ...e, type: 'Overlay' })),
+      ],
     };
   }
 
@@ -510,10 +342,17 @@ export class PlacesBasesView extends BasesView {
 
     if (!this.data) {
       logger.warn('No data available for map rendering');
+
       return;
     }
 
-    const places = BasesDataAdapter.convertToMapPlaces(this.data.data ?? [], this.app, this.propertyMappings);
+    const places = await this.perf.measureAsync('convert-entries', () => BasesDataAdapter.convertToMapPlaces(this.data.data ?? [], this.app, this.propertyMappings, {
+      isCanceled: () => myGeneration !== this.renderGeneration,
+      onTiming: timing => this.perf.mark('conversion-profile', timing),
+    }));
+
+    if (myGeneration !== this.renderGeneration) return;
+    this.perf.mark('render-started', { rows: this.data.data?.length ?? 0, places: places.length, reason: this.pendingRenderReason });
     this.logDebug('render started', {
       generation: myGeneration,
       reason: this.pendingRenderReason,
@@ -526,427 +365,210 @@ export class PlacesBasesView extends BasesView {
       this.logDebug('full cleanup', { reason: 'no places' });
       this.cleanupMap();
       this.showNoPlacesMessage();
+
       return;
     }
 
-    const labelTemplate = this.labelTemplate || PlacesPlugin.settings.defaultLabelTemplate;
-    if (labelTemplate) {
-      const labelService = getLabelTemplateService();
-      const result = await labelService.processPlaces(places, labelTemplate);
-      if (myGeneration !== this.renderGeneration) return;
-      if (result.errors.length > 0) {
-        logger.warn(`${result.errors.length} label template error(s)`);
-      }
-    }
+    const provider = PlacesPlugin.getMapProvider(this.mapProvider) ?? null;
 
-    const styleConfig: MarkerStyleConfig = {
-      css: this.customCss,
-      iconStyles: MarkerStyleService.parseRules(this.getCombinedIconStyles()),
-      labelStyles: MarkerStyleService.parseRules(this.getCombinedLabelStyles())
-    };
-    MarkerStyleService.processPlaces(places, styleConfig);
-    const rotation = await applyIconRotation(places, this.iconRotation);
-    if (myGeneration !== this.renderGeneration) return;
-    if (rotation.errors.length > 0) logger.warn(`${rotation.errors.length} icon rotation error(s)`);
-
-    const provider = PlacesPlugin.getMapProvider(this.mapProvider);
-    if (!provider) {
-      this.needsProviderRetry = true;
-      this.logDebug('full cleanup', { reason: 'provider missing', provider: this.mapProvider });
-      this.cleanupMap();
-      this.showMapProviderError();
-      return;
-    }
-    this.needsProviderRetry = false;
-
-    const hasAsyncOverlayWork = Boolean(this.overlays);
-    const overlayLoadPromise: Promise<OverlayResult> = this.overlays
-      ? this.overlayService.loadOverlays(this.overlays)
-      : Promise.resolve({ overlays: [], errors: [] as Array<{ path: string; error: string }> });
-
+    const rawSettings = this.collectRawSettings();
+    const blockPatch = parseMapConfigPatch(rawSettings);
+    const blockSettings: MapBlockSettings = { ...CODED_MAP_DEFAULTS, ...blockPatch };
     const mapSource = { path: this.getViewportStateSourcePath(), lineStart: 0 };
 
-    const rawSettings: Record<string, unknown> = {
-      mapProvider: this.mapProvider,
-      height: this.mapHeight,
-      width: '100%',
-      showLabels: this.showLabels,
-      poiDiscovery: this.poiDiscovery,
-      pitch: this.pitch,
-      debug: this.debug,
-      heatmapLayer: this.heatmapLayer,
-      legend: this.legend,
-    };
+    const initial = resolveMapSettings({ providerName: this.mapProvider, rawBlockSettings: rawSettings, blockPatch, placeCount: places.length });
 
-    if (this.mapStyle) {
-      rawSettings.style = this.mapStyle;
-    }
-    if (this.initialZoom !== undefined) {
-      rawSettings.initialZoom = this.initialZoom;
-    }
-    if (this.initialCenter) {
-      rawSettings.initialCenter = this.initialCenter;
-    }
-    if (this.minZoom !== undefined) {
-      rawSettings.minZoom = this.minZoom;
-    }
-    const track: Record<string, unknown> = {};
-    if (this.trackGradeWindow) {
-      track.gradeWindow = this.trackGradeWindow;
-    }
-    if (this.trackColorBy) {
-      track.colorBy = this.trackColorBy;
-    }
-    if (this.trackDirectionArrows !== undefined) {
-      track.directionArrows = this.trackDirectionArrows;
-    }
-    if (this.trackDefaultVisibility) {
-      track.defaultVisibility = this.trackDefaultVisibility;
-    }
-    if (this.trackOutline !== undefined) {
-      track.outline = this.trackOutline;
-    }
-    const terrainSetting = this.buildTerrainSetting();
-    if (terrainSetting) {
-      rawSettings.terrain = terrainSetting;
-    }
-    if (this.markerRenderer) {
-      rawSettings.markerRenderer = this.markerRenderer;
-    }
-    if (this.clusterThreshold !== undefined) {
-      rawSettings.clusterThreshold = this.clusterThreshold;
-    }
-    if (this.clusterGeoJsonOverlays !== undefined) {
-      rawSettings.clusterGeoJsonOverlays = this.clusterGeoJsonOverlays;
-    }
-    const badgeCss = MarkerStyleService.buildBadgeCss(places);
-    const combinedCss = [this.customCss, badgeCss].filter(Boolean).join('\n');
-    if (combinedCss) {
-      rawSettings.css = combinedCss;
-    }
-    if (this.heatmapColorScheme) {
-      rawSettings.heatmapColorScheme = this.heatmapColorScheme;
-    }
-    const trackLabels: Record<string, unknown> = {};
-    if (this.trackLabelsVisibility) {
-      trackLabels.visibility = this.trackLabelsVisibility;
-    }
-    if (this.trackLabelsStart) {
-      trackLabels.start = this.trackLabelsStart;
-    }
-    if (this.trackLabelsMidpoint) {
-      trackLabels.midpoint = this.trackLabelsMidpoint;
-    }
-    if (this.trackLabelsEnd) {
-      trackLabels.end = this.trackLabelsEnd;
-    }
-    if (Object.keys(trackLabels).length > 0) {
-      track.labels = trackLabels;
-    }
-    if (Object.keys(track).length > 0) {
-      rawSettings.track = track;
-    }
+    this.mapHeight = initial.config.height;
+    this.mapContainerEl.setCssProps({ '--places-map-height': this.mapHeight });
+    const camera = resolveCameraIntent(initial.config, mapSource, { rememberedFit: 'ignore' });
 
-    // Unset reads as undefined, not ''. The label cascade tests `blockValue !== undefined`,
-    // so an empty string counts as "the view set this to nothing" and stops the fall-through
-    // to the global and coded defaults - which is every path label a view would otherwise show.
-    const unsetAsUndefined = (value: string): string | undefined => (value.trim() === '' ? undefined : value);
-    await injectPathLabels(places, {
-      showLabels: this.showLabels,
-      trackLabelsVisibility: unsetAsUndefined(this.trackLabelsVisibility),
-      trackLabelsStart: unsetAsUndefined(this.trackLabelsStart),
-      trackLabelsMidpoint: unsetAsUndefined(this.trackLabelsMidpoint),
-      trackLabelsEnd: unsetAsUndefined(this.trackLabelsEnd),
-    }, PlacesPlugin.settings);
+    if (!blockSettings.heatmapLayer && (this.needsFullRender || this.currentMapProcessor !== provider || !getMapSurfaceController(this.mapContainerEl))) {
+      const bounds = PlacesBoundingBox.fromPlaces(places);
 
-    const overlayErrors: Array<{ path: string; error: string; type: string }> = [];
-
-    if (myGeneration !== this.renderGeneration) return;
-
-    const asyncOverlayLoad: AsyncOverlayLoad | undefined = hasAsyncOverlayWork
-      ? {
-        promise: overlayLoadPromise.then(overlayResult => ({
-          overlays: overlayResult.overlays,
-          errors: overlayResult.errors.map(e => ({ ...e, type: 'Overlay' })),
-        }))
+      for (const place of places) {
+        if (place.overlay?.geojson) bounds.extend(PlacesBoundingBox.fromImmutableGeoJSON(place.overlay.geojson));
       }
-      : undefined;
 
-    const overlays: Overlay[] = [];
+      const anchors: MapPlace[] = bounds.getLatLngBounds().map(([latitude, longitude]) => ({
+        latitude, longitude, name: '', icon: '', metadata: { boundsAnchor: true },
+        iconStyle: { inlineCss: 'display: none', classes: [], opacity: 0 },
+      }));
+      const preview = this.buildPlan({ places: anchors, overlays: [], resolved: initial, camera, mapSource, dataState: 'loading' });
 
-    this.fillDeclaredConfig(rawSettings);
-    const { config, clusteringEnabled } = resolveMapSettings({
-      providerName: this.mapProvider,
-      rawBlockSettings: rawSettings,
-      placeCount: places.length,
-    });
-    const terrain = PlacesPlugin.resolveTerrainRuntime(config);
-    overlayErrors.push(...terrain.errors.map(e => ({ ...e, type: 'Terrain' })));
-    const renderPlan = createMapRenderPlan({
-      surfaceKind: 'bases-view',
-      places,
-      overlays,
-      config,
-      clusteringEnabled,
-      source: mapSource,
-      camera: resolveCameraIntent(config, mapSource),
-      placeNoteHost: PlacesPlugin.placeNoteHost,
-      reverseGeocodeHost: PlacesPlugin.reverseGeocodeHost,
-      onPlaceAction: this.handleSearchResultAction,
-      // Clicking a track shows its distance/elevation/speed, as in a places block.
-      inspectTrack: this.createTrackInspector(config.trackSpeedWindow, mapSource.path),
-      trackLoader: PlacesPlugin.getTrackDataService(),
-      terrainDem: terrain.terrainDem,
-      reliefDem: terrain.reliefDem,
-      // No contextMenuActions: those come from a block's `queryParameters`, which
-      // a Bases view has no equivalent of. mapTools are likewise omitted
-      // deliberately.
-    });
-    const legendPosition = getLegendPosition(renderPlan.config.trackColorBy, renderPlan.config.legend);
+      if (!await this.applyPlan(provider, preview.plan, myGeneration) || myGeneration !== this.renderGeneration) return;
+    }
 
+    let resolved = initial;
+    let labelErrors: MapContentError[] = [];
+
+    if (!blockSettings.heatmapLayer) {
+      const perf = createPerformanceMonitor('bases-prepare', { places: places.length, provider: this.mapProvider }, { enabled: PlacesPlugin.settings.developerMode });
+      const progress = this.addChild(new MapLoadingProgress(this.mapContainerEl, () => undefined));
+
+      try {
+        const labelOutcomes = new WeakMap<MapPlace, PlaceLabelOutcome>();
+        const baseCss = blockSettings.css;
+        let batchSize = 64;
+        let batchCount = 0;
+        const preparationStarted = performance.now();
+
+        for (let offset = 0; offset < places.length;) {
+          const started = performance.now();
+          const end = Math.min(places.length, offset + batchSize);
+          const settings = { ...blockSettings, css: baseCss };
+          const fresh = places.slice(offset, end);
+
+          await postProcessPlaces(fresh, settings, {
+            labelCaches: this.labelCaches, labelOutcomes,
+            providerName: this.mapProvider, rawBlockSettings: rawSettings, blockPatch,
+            placeCount: places.length, selfNoteMap: false, perf,
+          });
+          if (myGeneration !== this.renderGeneration) return;
+          const prepareMs = performance.now() - started;
+
+          batchCount++;
+          perf.mark('prepared-batch', { batch: batchCount, added: end - offset, places: end, totalPlaces: places.length, prepareMs });
+          offset = end;
+          progress.setPhase(`Loading places (${end} ready)`);
+
+          if (end < places.length) {
+            await sleep(0);
+            if (myGeneration !== this.renderGeneration) return;
+          }
+
+          batchSize = Math.max(8, Math.min(256, Math.round(batchSize * 50 / Math.max(1, prepareMs))));
+        }
+
+        const badgeCss = MarkerStyleService.buildBadgeCss(places);
+        const css = [baseCss, badgeCss].filter(Boolean).join('\n');
+
+        resolved = resolveMapSettings({
+          providerName: this.mapProvider, rawBlockSettings: rawSettings, blockPatch,
+          blockOverrides: css !== (baseCss ?? '') ? { css } : undefined,
+          placeCount: places.length,
+        });
+        perf.mark('preparation-complete', { batches: batchCount, places: places.length, durationMs: performance.now() - preparationStarted });
+        labelErrors = (summarizeLabelOutcomes(places, blockSettings, labelOutcomes)?.errors ?? []).map(e => ({ path: e.filePath || e.placeName, error: e.message, type: 'Label Template' }));
+      } finally {
+        progress.remove();
+        this.removeChild(progress);
+      }
+    }
+
+    const planPerf = createPerformanceMonitor('bases-plan', { places: places.length, provider: this.mapProvider }, { enabled: PlacesPlugin.settings.developerMode });
+    const built = planPerf.measure('build-plan', () => this.buildPlan({ places, overlays: [], resolved, camera, mapSource }));
+
+    built.errors.push(...labelErrors);
+    if (!await this.applyPlan(provider, built.plan, myGeneration) || myGeneration !== this.renderGeneration) return;
+    renderMapContentErrors(this.containerEl, built.errors, CONFIG_ERRORS_CLASS);
+
+    if (this.overlays) {
+      this.attachAsyncOverlayLoad({ places, resolved, camera, mapSource }, myGeneration);
+    }
+  }
+
+  private async applyPlan(provider: IMapBlockProcessor | null, plan: MapRenderPlan, myGeneration: number): Promise<MapSurfaceController | null> {
     const configSignature = this.computeConfigSignature();
-    const controller = this.needsFullRender ? undefined : getMapSurfaceController(this.mapContainerEl);
-    if (controller && this.currentMapProcessor === provider) {
+    const existing = this.needsFullRender ? undefined : getMapSurfaceController(this.mapContainerEl);
+
+    if (existing && provider && this.currentMapProcessor === provider) {
       this.logDebug('plan handed to surface controller', {
         reason: this.pendingRenderReason,
-        places: renderPlan.places.length,
+        places: plan.places.length,
         configHash: hashString36(configSignature),
-        planHash: hashString36(renderPlan.signature),
+        planHash: hashString36(plan.signature),
       });
-      controller.setPlan(renderPlan, { source: 'bases-update' });
-      await controller.reconcile();
-      if (asyncOverlayLoad) {
-        this.attachAsyncOverlayLoad(asyncOverlayLoad, { places: renderPlan.places, rawSettings, mapSource, camera: renderPlan.camera });
-      }
-      return;
+      existing.setPlan(plan, { source: 'bases-update' });
+      await existing.reconcile();
+
+      return existing;
     }
 
     this.logDebug('full render', {
       reason: this.pendingRenderReason,
       provider: this.mapProvider,
-      places: renderPlan.places.length,
-      clusteringEnabled,
+      places: plan.places.length,
+      clusteringEnabled: plan.clusteringEnabled,
       configHash: hashString36(configSignature),
-      planHash: hashString36(renderPlan.signature),
+      planHash: hashString36(plan.signature),
     });
 
     this.needsFullRender = false;
     this.cleanupMap();
-    this.removeErrorPanel();
-
     this.currentMapProcessor = provider;
-    this.currentPlaces = renderPlan.places;
 
-    try {
-      if (legendPosition === 'top') {
-        this.addMapLegend('top', renderPlan.config.trackColorBy, renderPlan.places);
-      }
+    const surface = await renderMapSurface({
+      host: this.containerEl,
+      mapContainer: this.mapContainerEl,
+      places: plan.places,
+      providerName: this.mapProvider,
+      config: plan.config,
+      clusteringEnabled: plan.clusteringEnabled,
+      height: plan.config.height,
+      focusOnInteraction: false,
+      registerCleanup: false,
+      renderPlan: plan,
+      onRerenderRequested: reason => {
+        this.needsFullRender = true;
+        this.scheduleMapUpdate({ force: true, reason: `rebuild: ${reason}` });
 
-      const surface = await renderMapSurface({
-        host: this.containerEl,
-        mapContainer: this.mapContainerEl,
-        places: renderPlan.places,
-        providerName: this.mapProvider,
-        config: renderPlan.config,
-        clusteringEnabled,
-        focusOnInteraction: false,
-        registerCleanup: false,
-        renderPlan,
-        onRerenderRequested: reason => {
-          this.needsFullRender = true;
-          this.scheduleMapUpdate({ force: true, reason: `rebuild: ${reason}` });
-          return Promise.resolve();
-        },
-        onPlanApplied: plan => {
-          this.currentPlaces = plan.places;
-          this.removeErrorPanel();
-          this.addFloatingButtons();
-        },
-      });
-      if (!surface.rendered) {
-        this.lastUpdateSignature = null;
-        return;
-      }
-      // After renderMapSurface: the factory registered controller-based
-      // recovery; the Bases view owns its full-rebuild path instead.
-      setMapRecoveryState(this.mapContainerEl, {
-        rehydrate: () => {
-          this.needsFullRender = true;
-          this.scheduleMapUpdate({ force: true, reason: 'recovery' });
-        },
-        cleanup: () => this.cleanupMapInstance(),
-      });
-      if (myGeneration !== this.renderGeneration) return;
-      this.hasRenderedMap = true;
-      this.logDebug('full render complete', {
-        provider: this.mapProvider,
-        places: renderPlan.places.length,
-        configHash: hashString36(configSignature),
-        planHash: hashString36(renderPlan.signature),
-      });
+        return Promise.resolve();
+      },
+      chrome: { onRefresh: () => this.updateMapNow('manual refresh') },
+    });
 
-      this.addFloatingButtons();
+    if (!surface.rendered || !surface.controller) {
+      this.lastUpdateSignature = null;
 
-      if (legendPosition === 'bottom') {
-        this.addMapLegend('bottom', renderPlan.config.trackColorBy, renderPlan.places);
-      }
-
-      if (overlayErrors.length > 0) {
-        this.showErrorPanel(overlayErrors);
-      }
-
-      if (asyncOverlayLoad) {
-        this.attachAsyncOverlayLoad(asyncOverlayLoad, {
-          places: renderPlan.places,
-          rawSettings,
-          mapSource,
-          camera: renderPlan.camera,
-        });
-      }
-    } catch (error) {
-      this.reportRenderError(error);
+      return null;
     }
+
+    if (myGeneration !== this.renderGeneration) return null;
+    this.hasRenderedMap = true;
+    this.logDebug('full render complete', {
+      provider: this.mapProvider,
+      places: plan.places.length,
+      configHash: hashString36(configSignature),
+      planHash: hashString36(plan.signature),
+    });
+
+    return surface.controller;
   }
 
-  private attachAsyncOverlayLoad(
-    asyncOverlayLoad: AsyncOverlayLoad,
-    options: {
-      places: MapPlace[];
-      rawSettings: Record<string, unknown>;
-      mapSource: { path: string; lineStart: number };
-      camera: MapCameraIntent;
-    }
-  ): void {
-    const progress = this.createOverlayLoadProgress();
-    void asyncOverlayLoad.promise
+  private attachAsyncOverlayLoad(options: Omit<BasesPlanInput, 'overlays'>, generation: number): void {
+    const progress = createOverlayLoadProgress(this.containerEl);
+
+    void this.overlayService.loadOverlays(this.overlays)
       .then(async overlayResult => {
         progress.remove();
+        if (generation !== this.renderGeneration) return;
+        const errors: MapContentError[] = overlayResult.errors.map(e => ({ ...e, type: 'Overlay' }));
 
-        if (overlayResult.overlays.length === 0) {
-          if (overlayResult.errors.length > 0) {
-            this.showErrorPanel(overlayResult.errors);
+        if (overlayResult.overlays.length > 0) {
+          const next = this.buildPlan({ ...options, overlays: overlayResult.overlays });
+
+          errors.push(...next.plan.errors.map(e => ({ ...e, type: 'Overlay' })));
+          const controller = getMapSurfaceController(this.mapContainerEl);
+
+          if (controller) {
+            controller.setPlan(next.plan, { source: 'async-overlays' });
+
+            await controller.reconcile();
           }
-          return;
         }
 
-        const { config, clusteringEnabled } = resolveMapSettings({
-          providerName: this.mapProvider,
-          rawBlockSettings: options.rawSettings,
-          placeCount: options.places.length,
-        });
-        const asyncTerrain = PlacesPlugin.resolveTerrainRuntime(config);
-        const nextRenderPlan = createMapRenderPlan({
-          surfaceKind: 'bases-view',
-          places: options.places,
-          overlays: overlayResult.overlays,
-          config,
-          clusteringEnabled,
-          source: options.mapSource,
-          camera: options.camera,
-          placeNoteHost: PlacesPlugin.placeNoteHost,
-      reverseGeocodeHost: PlacesPlugin.reverseGeocodeHost,
-          inspectTrack: this.createTrackInspector(config.trackSpeedWindow, options.mapSource.path),
-          trackLoader: PlacesPlugin.getTrackDataService(),
-          terrainDem: asyncTerrain.terrainDem,
-          reliefDem: asyncTerrain.reliefDem,
-        });
-        const allErrors = [
-          ...overlayResult.errors,
-          ...nextRenderPlan.errors.map(e => ({ ...e, type: 'Overlay' })),
-        ];
-
-        // A stale or disposed controller means the surface was rebuilt, and the
-        // rebuild's own overlay load supersedes this one.
-        const controller = getMapSurfaceController(this.mapContainerEl);
-        if (controller) {
-          controller.setPlan(nextRenderPlan, { source: 'async-overlays' });
-          await controller.reconcile();
-        }
-        if (allErrors.length > 0) {
-          this.showErrorPanel(allErrors);
-        }
+        if (generation === this.renderGeneration) renderMapContentErrors(this.containerEl, errors, OVERLAY_ERRORS_CLASS);
       })
       .catch(error => {
         progress.remove();
+        if (generation !== this.renderGeneration) return;
         logger.error('Async overlay loading failed', error);
-        this.showErrorPanel([{
+        renderMapContentErrors(this.containerEl, [{
           path: 'overlays',
           error: getErrorMessage(error),
           type: 'Overlay'
-        }]);
+        }], OVERLAY_ERRORS_CLASS);
       });
-  }
-
-  private createOverlayLoadProgress(): { remove: () => void } {
-    this.containerEl.querySelector('.places-overlay-load-progress')?.remove();
-    this.containerEl.addClass('places-refresh-progress-host');
-    const bar = this.containerEl.createDiv({ cls: 'places-refresh-progress places-overlay-load-progress' });
-    return {
-      remove: () => {
-        bar.remove();
-        if (!this.containerEl.querySelector('.places-refresh-progress')) {
-          this.containerEl.removeClass('places-refresh-progress-host');
-        }
-      }
-    };
-  }
-
-  private showErrorPanel(errors: Array<{ path: string; error: string; type: string }>): void {
-    this.removeErrorPanel();
-    const panel = this.containerEl.createDiv({ cls: 'places-error-panel' });
-
-    const header = panel.createDiv({ cls: 'places-error-panel-header' });
-    header.createSpan({ cls: 'places-error-panel-title', text: `⚠️ ${errors.length} overlay${errors.length > 1 ? 's' : ''} failed to load` });
-
-    const dismissButton = header.createEl('button', { cls: 'places-error-panel-dismiss', text: '✕' });
-    dismissButton.setAttribute('aria-label', 'Dismiss errors');
-    dismissButton.addEventListener('click', () => this.removeErrorPanel());
-
-    const list = panel.createEl('ul', { cls: 'places-error-panel-list' });
-    for (const err of errors) {
-      list.createEl('li', { text: `[${err.type}] ${err.path}: ${err.error}` });
-    }
-  }
-
-  private removeErrorPanel(): void {
-    const existing = this.containerEl.querySelector('.places-error-panel');
-    if (existing) existing.remove();
-  }
-
-  private removeMapLegends(): void {
-    for (const legend of this.containerEl.querySelectorAll('.places-color-legend')) {
-      legend.remove();
-    }
-  }
-
-  private addMapLegend(position: 'top' | 'bottom', colorBy: string | undefined, places: MapPlace[]): void {
-    const units = PlacesPlugin.settings.units;
-    let legend: HTMLElement | null = null;
-
-    if (colorBy === 'grade') {
-      legend = createGradeLegend(this.containerEl);
-    } else if (colorBy === 'elevation') {
-      const range = this.computeElevationRangeFromPlaces(places);
-      if (range) {
-        legend = createElevationLegend(this.containerEl, range.min, range.max, units);
-      }
-    }
-
-    if (legend && position === 'top') {
-      this.containerEl.insertBefore(legend, this.mapContainerEl);
-    }
-  }
-
-  private computeElevationRangeFromPlaces(places: MapPlace[]): { min: Meters; max: Meters } | null {
-    const allElevations: (Meters | undefined | null)[] = [];
-
-    for (const place of places) {
-      if (place.overlay?.track?.elevation) {
-        allElevations.push(...place.overlay.track.elevation);
-      }
-    }
-
-    return getElevationRange(allElevations);
   }
 
   private logDebug(message: string, details?: Record<string, unknown>): void {
@@ -957,155 +579,51 @@ export class PlacesBasesView extends BasesView {
     });
   }
 
-  private readonly handleSearchResultAction = (place: MapPlace, actionId: string): void => {
-    if (actionId !== CREATE_NOTE_ACTION_ID) return;
-    const searchResult = place.metadata?.geocodingSearchResult as Place | undefined;
-    if (searchResult) void this.saveGeocodedPlace(searchResult);
-  };
-
-  private async saveGeocodedPlace(place: Place): Promise<void> {
-    try {
-      const resolved = place.resolvePlace ? await place.resolvePlace() : place;
-      await PlacesPlugin.placeNoteHost.createNote({
-        kind: 'place',
-        name: resolved.name || 'New Place',
-        lat: resolved.latitude,
-        lng: resolved.longitude,
-        address: resolved.address,
-        website: resolved.website,
-        tags: resolved.tags,
-      });
-    } catch (error) {
-      // Only resolvePlace can reject - the host reports its own failures.
-      logger.error('Failed to resolve place for note creation:', error);
-      new Notice('Failed to create note');
-    }
-  }
-
-  private addFloatingButtons(): void {
-    const buttonContainer = createFloatingButtonContainer({ host: this.containerEl });
-
-    const controlHandle = this.currentMapProcessor?.getMapControlHandle?.(this.mapContainerEl) ?? null;
-    const searchToggle = controlHandle ? createMarkerSearchToggle(this.containerEl, controlHandle, this.currentPlaces) : undefined;
-    // The two panels are mutually exclusive, as in a places block.
-    let markerSearchButton: HTMLElement | null = null;
-    let geocoding: GeocodingSearchButtonHandle | null = null;
-
-    if (searchToggle) {
-      markerSearchButton = createMarkerSearchButton({
-        buttonContainer,
-        searchToggle,
-        ariaLabel: 'Search markers',
-        onBeforeToggle: () => geocoding?.hide(),
-      });
-    }
-
-    const getMapBounds = controlHandle?.getBounds;
-    const setGeocodingSearchMarkers = controlHandle?.setGeocodingSearchMarkers
-      ?? ((places: MapPlace[]) => this.currentMapProcessor?.setGeocodingSearchMarkers?.(places, this.mapContainerEl));
-    if (getMapBounds) {
-      geocoding = createGeocodingSearchButton({
-        buttonContainer,
-        container: this.containerEl,
-        mapContainer: this.mapContainerEl,
-        getMapBounds,
-        setGeocodingSearchMarkers,
-        searchPlaces: (query, bounds, onPartialResults) => PlacesPlugin.placesService.lookupPlaceInBounds(query, bounds, onPartialResults),
-        onCreateNote: (place) => void this.saveGeocodedPlace(place),
-        centerOnPlace: controlHandle?.centerOnPlace,
-        resolveResultIcon: (place) => PlacesPlugin.placeNoteHost.resolveIcon({
-          kind: 'place',
-          name: place.name || 'New Place',
-          lat: place.latitude,
-          lng: place.longitude,
-          address: place.address,
-          website: place.website,
-          tags: place.tags,
-        }),
-        onBeforeOpen: () => {
-          if (!searchToggle?.isVisible()) return;
-          searchToggle.toggle();
-          markerSearchButton?.removeClass('is-active');
-        },
-      });
-    }
-
-    createFloatingRefreshButton({
-      buttonContainer,
-      ariaLabel: 'Refresh map',
-      onRefresh: async () => {
-        await this.updateMapNow('manual refresh');
-      },
-      onError: error => logger.error('Refresh failed', error)
-    });
-  }
-
   private showNoPlacesMessage(): void {
     const messageDiv = this.mapContainerEl.createDiv({ cls: 'places-instructions' });
 
-    messageDiv.createEl('h3', { text: 'No Places found to display' });
-     
+    messageDiv.createEl('h3', { text: 'No places found to display' });
+
     messageDiv.createEl('p', { text: 'The Bases query returned no notes with location data.' });
 
     const methodsDiv = messageDiv.createDiv({ cls: 'places-method' });
+
     methodsDiv.createEl('h4', { text: 'Add location information to notes:' });
     const pre = methodsDiv.createEl('pre');
+
     pre.createEl('code', {
       text: '---\nLocation: 40.748333, -73.985556\nicon: 🏢\n---'
     });
 
     const { locationId, iconId, titleId } = this.propertyMappings;
+
     if (locationId || iconId || titleId) {
       const mappingsDiv = messageDiv.createDiv({ cls: 'places-method' });
+
       mappingsDiv.createEl('h4', { text: 'Current property mappings:' });
       const mappingsList = mappingsDiv.createEl('ul');
+
       if (locationId) mappingsList.createEl('li', { text: `Location property: ${this.config.getDisplayName(locationId)}` });
       if (iconId) mappingsList.createEl('li', { text: `Icon property: ${this.config.getDisplayName(iconId)}` });
       if (titleId) mappingsList.createEl('li', { text: `Title property: ${this.config.getDisplayName(titleId)}` });
     }
   }
 
-  private showMapProviderError(): void {
-    renderMapSurfaceError(this.mapContainerEl, missingMapProviderError(this.mapProvider));
-
-    // Help content appears below the error, not inside it
-    const allProviders = PlacesPlugin.getAllMapProviders();
-    if (allProviders.length > 0) {
-      const providersDiv = this.mapContainerEl.createDiv({ cls: 'places-help-section' });
-      providersDiv.createEl('h4', { text: 'Available map providers' });
-      const providerList = providersDiv.createEl('ul');
-      allProviders.forEach(provider => {
-        providerList.createEl('li', { text: provider });
-      });
-
-      providersDiv.createEl('p', { text: 'Update the map provider setting to use an available provider.' });
-    } else {
-      this.mapContainerEl.createEl('p', { text: 'No map providers are currently installed and enabled. Install a map provider plugin (e.g., places-leaflet) to display maps.' });
-    }
-  }
-
   private cleanupMap(): void {
-    disposeMapSurfaceController(this.mapContainerEl);
-    this.cleanupMapInstance();
-    clearMapRecoveryState(this.mapContainerEl);
+    cleanupMapContainer(this.mapContainerEl);
     this.currentMapProcessor = null;
-    this.removeErrorPanel();
-    this.removeMapLegends();
-    this.containerEl.querySelector('.places-floating-buttons')?.remove();
-    this.mapContainerEl.empty();
-  }
 
-  private cleanupMapInstance(): void {
-    suppressMapContextLossDuring(this.mapContainerEl, () => {
-      cleanupMapProviderStates(this.mapContainerEl, error => {
-        logger.error('Error during map cleanup:', error);
-      });
-    });
+    for (const className of [CONFIG_ERRORS_CLASS, OVERLAY_ERRORS_CLASS]) {
+      renderMapContentErrors(this.containerEl, [], className);
+    }
+
+    this.mapContainerEl.empty();
   }
 
   private getViewportStateSourcePath(): string {
     const basesPath = this.getBasesFilePath();
     const viewName = this.config?.name || 'places-map';
+
     return ['bases', basesPath ?? this.getDataSignatureFallback(), viewName].join(':');
   }
 
@@ -1128,6 +646,7 @@ export class PlacesBasesView extends BasesView {
     if (value && typeof value === 'object' && 'path' in value) {
       return this.readString((value as { path?: unknown }).path);
     }
+
     return null;
   }
 
@@ -1143,14 +662,6 @@ export class PlacesBasesView extends BasesView {
       .join('|');
 
     return paths ? ['query', paths].join(':') : 'unknown';
-  }
-
-  static refreshViewsWaitingForProviders(): void {
-    for (const view of PlacesBasesView.activeViews) {
-      if (view.needsProviderRetry) {
-        view.scheduleMapUpdate({ force: true, reason: 'provider available' });
-      }
-    }
   }
 
   private showContextMenu(evt: MouseEvent): void {
@@ -1210,6 +721,12 @@ export class PlacesBasesView extends BasesView {
             default: true,
           },
           {
+            displayName: 'Show current device position',
+            type: 'toggle',
+            key: 'showCurrentDevicePosition',
+            default: PlacesPlugin.settings.showCurrentDevicePosition,
+          },
+          {
             displayName: 'Marker renderer',
             type: 'text',
             key: 'markerRenderer',
@@ -1225,6 +742,12 @@ export class PlacesBasesView extends BasesView {
             displayName: 'Cluster GeoJSON overlays',
             type: 'toggle',
             key: 'clusterGeoJsonOverlays',
+          },
+          {
+            displayName: 'Cluster appearance',
+            type: 'text',
+            key: 'clusterStyle',
+            placeholder: 'circles or heatmap',
           },
           {
             displayName: 'POI discovery',
@@ -1254,7 +777,7 @@ export class PlacesBasesView extends BasesView {
             displayName: 'Heatmap color scheme',
             type: 'text',
             key: 'heatmapColorScheme',
-            placeholder: 'heat, traffic, or #ffffcc,#fd8d3c,#e31a1c',
+            placeholder: 'plasma, pastel, viridis, inferno, magma, or #ffffcc,#e31a1c',
           },
         ]
       },
@@ -1294,8 +817,9 @@ export class PlacesBasesView extends BasesView {
           },
           {
             displayName: 'Direction arrows',
-            type: 'toggle',
+            type: 'text',
             key: 'track.directionArrows',
+            placeholder: '1, 0, 0.5, 2',
           },
           {
             displayName: 'Default track visibility',
@@ -1308,7 +832,7 @@ export class PlacesBasesView extends BasesView {
             type: 'text',
             key: 'track.gradeWindow',
             default: '100ft',
-            placeholder: '100ft, 50m, 10min',
+            placeholder: '100ft, 50m, 0.1mi',
           },
           {
             displayName: 'Track outline',
@@ -1324,25 +848,25 @@ export class PlacesBasesView extends BasesView {
             placeholder: 'hidden, top, bottom',
           },
           {
-            displayName: 'Path labels',
+            displayName: 'Track labels',
             type: 'text',
             key: 'track.labels.visibility',
-            placeholder: 'all, none, start, mid, end',
+            placeholder: 'all, none, start, midpoint, end',
           },
           {
-            displayName: 'Path start label',
+            displayName: 'Track start label',
             type: 'text',
             key: 'track.labels.start',
             placeholder: '{this.title}',
           },
           {
-            displayName: 'Path midpoint label',
+            displayName: 'Track midpoint label',
             type: 'text',
             key: 'track.labels.midpoint',
             placeholder: "{h.round(this.Distance)}",
           },
           {
-            displayName: 'Path end label',
+            displayName: 'Track end label',
             type: 'text',
             key: 'track.labels.end',
             placeholder: 'Finish',
@@ -1426,4 +950,12 @@ export class PlacesBasesView extends BasesView {
       },
     ];
   }
+}
+
+export function coerceViewOptionValue(path: string, value: unknown): unknown {
+  if (path === 'height' && typeof value === 'number') return `${value}px`;
+  if (path === 'track.directionArrows' && typeof value === 'boolean') return value ? 1 : 0;
+  if (path === 'initialCenter' && Array.isArray(value) && value.length >= 2) return `${String(value[0])},${String(value[1])}`;
+
+  return value;
 }

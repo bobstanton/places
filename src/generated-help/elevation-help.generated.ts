@@ -63,7 +63,7 @@ export function render(container: HTMLElement, ctx: RenderContext): void {
   td1.appendText(", 400px");
   const row4 = tbody.createEl('tr');
   row4.createEl('td', { text: "width" });
-  row4.createEl('td', { text: "Preview chart width" });
+  row4.createEl('td', { text: "Width of everything the block renders, its legend and info included. A percentage measures the note's width, vw the window's" });
   const td2 = row4.createEl('td');
   td2.createEl('strong', { cls: 'places-help-bold', text: "100%" });
   td2.appendText(", 800px");
@@ -101,4 +101,17 @@ export function render(container: HTMLElement, ctx: RenderContext): void {
   const td7 = row10.createEl('td');
   td7.createEl('strong', { cls: 'places-help-bold', text: "true" });
   td7.appendText(", false");
+  const row11 = tbody.createEl('tr');
+  row11.createEl('td', { text: "queryParameters" });
+  const td8 = row11.createEl('td');
+  td8.appendText("UI controls that adjust the block without editing it; ");
+  td8.createEl('code', { cls: 'places-help-code', text: "queryParametersPosition" });
+  td8.appendText(", ");
+  td8.createEl('code', { cls: 'places-help-code', text: "queryParametersLayout" });
+  td8.appendText(", and ");
+  td8.createEl('code', { cls: 'places-help-code', text: "queryParametersCollapsed" });
+  td8.appendText(" place them. See ");
+  td8.createEl('code', { cls: 'places-help-code', text: "places-queryparameters-help" });
+  const td9 = row11.createEl('td');
+  td9.createEl('code', { cls: 'places-help-code', text: "- name: limit" });
 }

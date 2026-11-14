@@ -1,12 +1,11 @@
 import { type IPlacesPluginSettings } from "places-shared/settings";
-import { getErrorMessage, logger } from "places-shared/utils";
-import { App, Notice, TFile, normalizePath } from "obsidian";
-import { OverlayImportService } from "./services/OverlayImportService";
-import { OverlayImportResult } from "./services/OverlayImportResult";
+import { bytesToBase64, getErrorMessage, logger } from "places-shared/utils";
+import { App, Notice, Platform, TFile, normalizePath } from "obsidian";
+import { OverlayImportService } from 'places/core';
+import { OverlayImportResult } from 'places/core';
 import { ImportErrorHandler } from "./services/ImportErrorHandler";
-import { Waypoint } from "places-shared/place";
-import { ensureVaultFolder, getAvailableVaultPath, resolveNewNoteFolder } from "places-shared/utils";
-import { GpxParser } from "./services/GpxParser";
+import { ensureVaultFolder, getAvailableVaultPath, resolveNewNoteFolder } from "places-shared/obsidian/utils";
+import { serializeTrackDocumentToGpx, type TrackDocumentModel } from 'places/core';
 import { assignFrontmatter } from "places-shared/services";
 
 interface FileWithPath {
@@ -19,6 +18,7 @@ export class DragDropHandler {
   private app: App;
   private overlayImportService: OverlayImportService;
   private getSettings: () => IPlacesPluginSettings;
+  private dragLeaveCleanupTimeout?: number;
 
   constructor(app: App, overlayImportService: OverlayImportService, getSettings: () => IPlacesPluginSettings) {
     this.app = app;
@@ -34,6 +34,7 @@ export class DragDropHandler {
     const targetFile = this.getSettings().importDropOnNote === 'update' ? activeFile ?? undefined : undefined;
 
     this.processDropDataTransfer(evt.dataTransfer, targetFolder, targetFile);
+
     return true;
   }
 
@@ -45,6 +46,7 @@ export class DragDropHandler {
     const target = evt.target as HTMLElement;
 
     const navFile = this.getNavFileFromTarget(target);
+
     if (navFile) {
       targetFolder = navFile.parent?.path;
     }
@@ -54,6 +56,7 @@ export class DragDropHandler {
       // and handleEditorDrop() never fires for track files. Detect editor area here.
       if (!targetFile && (target.closest('.cm-editor') || target.closest('.markdown-source-view'))) {
         const activeFile = this.app.workspace.getActiveFile();
+
         if (activeFile) {
           targetFile = activeFile;
           targetFolder = activeFile.parent?.path;
@@ -63,10 +66,13 @@ export class DragDropHandler {
 
     if (!targetFolder) {
       const folderEl = target.closest('.nav-folder');
+
       if (folderEl) {
         const folderTitle = folderEl.querySelector('.nav-folder-title');
+
         if (folderTitle) {
           const folderPath = (folderTitle as HTMLElement).dataset?.path || folderTitle.getAttribute('data-path');
+
           if (folderPath) {
             targetFolder = folderPath;
           }
@@ -80,12 +86,25 @@ export class DragDropHandler {
   }
 
   private claimTrackDrop(evt: DragEvent): boolean {
+    if (this.bypassImportForCopy(evt)) return false;
     if (!this.hasTrackFiles(evt.dataTransfer)) return false;
     evt.preventDefault();
     evt.stopPropagation();
     evt.stopImmediatePropagation();
     this.cleanupDragOverClasses();
+
     return true;
+  }
+
+  private bypassImportForCopy(evt: DragEvent): boolean {
+    const copy = Platform.isMacOS ? evt.altKey : evt.ctrlKey;
+
+    if (copy && this.dragLeaveCleanupTimeout !== undefined) {
+      window.clearTimeout(this.dragLeaveCleanupTimeout);
+      this.dragLeaveCleanupTimeout = undefined;
+    }
+
+    return copy;
   }
 
   private processDropDataTransfer(dataTransfer: DataTransfer | null, targetFolder: string | undefined, targetFile: TFile | undefined): void {
@@ -93,8 +112,10 @@ export class DragDropHandler {
       .then(trackFiles => {
         if (trackFiles.length === 0) {
           new Notice("No track files found in the dropped items");
+
           return;
         }
+
         return this.processDroppedTrackFiles(trackFiles, targetFolder, targetFile);
       })
       .catch(error => {
@@ -108,16 +129,19 @@ export class DragDropHandler {
 
   private getNavFileFromTarget(target: HTMLElement): TFile | undefined {
     const fileEl = target.closest('.nav-file');
+
     if (!fileEl) {
       return undefined;
     }
 
     const fileTitle = fileEl.querySelector('.nav-file-title');
+
     if (!fileTitle) {
       return undefined;
     }
 
     const filePath = (fileTitle as HTMLElement).dataset?.path || fileTitle.getAttribute('data-path');
+
     if (!filePath?.endsWith('.md')) {
       return undefined;
     }
@@ -126,6 +150,8 @@ export class DragDropHandler {
   }
 
   handleDragOver(evt: DragEvent) {
+    if (this.bypassImportForCopy(evt)) return;
+
     if (this.hasTrackFiles(evt.dataTransfer)) {
       evt.preventDefault();
       evt.stopPropagation();
@@ -138,6 +164,8 @@ export class DragDropHandler {
   }
 
   handleDragEnter(evt: DragEvent) {
+    if (this.bypassImportForCopy(evt)) return;
+
     if (this.hasTrackFiles(evt.dataTransfer)) {
       evt.preventDefault();
       evt.stopPropagation();
@@ -146,24 +174,30 @@ export class DragDropHandler {
   }
 
   handleDragLeave(evt: DragEvent) {
+    if (this.bypassImportForCopy(evt)) return;
+
     if (this.hasTrackFiles(evt.dataTransfer)) {
       evt.preventDefault();
       evt.stopPropagation();
       evt.stopImmediatePropagation();
     }
 
-    window.setTimeout(() => {
+    if (this.dragLeaveCleanupTimeout !== undefined) window.clearTimeout(this.dragLeaveCleanupTimeout);
+    this.dragLeaveCleanupTimeout = window.setTimeout(() => {
+      this.dragLeaveCleanupTimeout = undefined;
       this.cleanupDragOverClasses();
     }, 100);
   }
 
   private cleanupDragOverClasses() {
     const draggedOverElements = activeDocument.querySelectorAll('.is-being-dragged-over');
+
     draggedOverElements.forEach(el => {
       el.removeClass('is-being-dragged-over');
     });
 
     const navFolders = activeDocument.querySelectorAll('.nav-folder.is-being-dragged-over');
+
     navFolders.forEach(el => {
       el.removeClass('is-being-dragged-over');
     });
@@ -177,11 +211,14 @@ export class DragDropHandler {
       for (const item of Array.from(dataTransfer.items)) {
         if (item.kind === 'file') {
           const entry = item.webkitGetAsEntry?.();
+
           if (entry?.isDirectory) {
             // Could contain track files - allow the drop
             return true;
           }
+
           const file = item.getAsFile();
+
           if (file && this.isTrackFile(file.name)) {
             return true;
           }
@@ -194,6 +231,7 @@ export class DragDropHandler {
         if (this.isTrackFile(file.name)) {
           return true;
         }
+
         if (file.type === '' && file.size === 0) {
           return true; // Could be a folder with track files
         }
@@ -205,7 +243,8 @@ export class DragDropHandler {
 
   private isTrackFile(name: string): boolean {
     const lower = name.toLowerCase();
-    return lower.endsWith('.gpx') || lower.endsWith('.geojson') || lower.endsWith('.csv');
+
+    return lower.endsWith('.gpx') || lower.endsWith('.fit') || lower.endsWith('.geojson') || lower.endsWith('.csv');
   }
 
   private async getTrackFilesAsync(dataTransfer: DataTransfer | null): Promise<FileWithPath[]> {
@@ -220,6 +259,7 @@ export class DragDropHandler {
       for (const item of Array.from(dataTransfer.items)) {
         if (item.kind === 'file') {
           const entry = item.webkitGetAsEntry?.();
+
           if (entry) {
             entries.push(entry);
           }
@@ -228,6 +268,7 @@ export class DragDropHandler {
 
       for (const entry of entries) {
         const files = await this.readEntry(entry, '');
+
         trackFiles.push(...files);
       }
     }
@@ -238,6 +279,7 @@ export class DragDropHandler {
         if (file.type === '' && file.size === 0) {
           continue;
         }
+
         if (this.isTrackFile(file.name)) {
           trackFiles.push({ file, relativePath: file.name });
         }
@@ -251,11 +293,13 @@ export class DragDropHandler {
   private async readEntry(entry: FileSystemEntry, basePath: string): Promise<FileWithPath[]> {
     if (entry.isFile) {
       const fileEntry = entry as FileSystemFileEntry;
+
       return new Promise((resolve) => {
         fileEntry.file(
           (file) => {
             if (this.isTrackFile(file.name)) {
               const relativePath = basePath ? `${basePath}/${file.name}` : file.name;
+
               resolve([{ file, relativePath }]);
             } else {
               resolve([]);
@@ -281,8 +325,10 @@ export class DragDropHandler {
                 void (async () => {
                   for (const subEntry of entries) {
                     const files = await this.readEntry(subEntry, newBasePath);
+
                     allFiles.push(...files);
                   }
+
                   // Continue reading (readEntries may not return all entries at once)
                   readEntries();
                 })();
@@ -306,13 +352,16 @@ export class DragDropHandler {
 
     const settings = this.getSettings();
     const gpxImportMode = settings.gpxImportMode;
+    const fitImportMode = settings.fitImportMode;
     const geoJsonImportMode = settings.geoJsonImportMode;
     const csvImportMode = settings.csvImportMode;
 
     for (const { file, relativePath } of filesWithPaths) {
       try {
-        const content = await file.text();
         const fileName = file.name.toLowerCase();
+        const content = fileName.endsWith('.fit')
+          ? bytesToBase64(new Uint8Array(await file.arrayBuffer()))
+          : await file.text();
         let results: OverlayImportResult[] = [];
         let errorMessage = "";
 
@@ -327,11 +376,12 @@ export class DragDropHandler {
 
             if (results && results.length > 0) {
               const allWaypoints = results.flatMap(r => r.waypoints ?? []);
-              if (allWaypoints.length > 0) {
-                await this.createWaypointsNote(allWaypoints, file.name, targetFolder, content, relativeFolder);
+              const parsedDocument = results[0].parsedDocument;
+
+              if (allWaypoints.length > 0 && parsedDocument) {
+                await this.createWaypointsNote(file.name, targetFolder, parsedDocument, relativeFolder);
                 successCount++;
 
-                // The waypoints now live in the dedicated waypoints note.
                 results.forEach(result => {
                   result.waypoints = [];
                 });
@@ -343,6 +393,13 @@ export class DragDropHandler {
             results = this.overlayImportService.parseGpxForImport(content);
             errorMessage = "No tracks or routes found";
           }
+        } else if (fileName.endsWith(".fit")) {
+          if (fitImportMode === "disabled") {
+            continue;
+          }
+
+          results = this.overlayImportService.parseFitForImport(content);
+          errorMessage = "No position records found";
         } else if (fileName.endsWith(".geojson")) {
           if (geoJsonImportMode === "disabled") {
             continue;
@@ -368,11 +425,13 @@ export class DragDropHandler {
               await this.updateExistingNote(targetFile, results[i]);
             } else {
               const folder = targetFile ? targetFile.parent?.path : targetFolder;
+
               await this.createNoteFromImport(results[i], file.name, folder, relativeFolder);
             }
+
             successCount++;
           }
-          // Only use targetFile for the first dropped file
+
           targetFile = undefined;
         } else {
           failCount++;
@@ -388,9 +447,18 @@ export class DragDropHandler {
   }
 
   private async updateExistingNote(targetFile: TFile, result: OverlayImportResult): Promise<void> {
-    const generatedFrontmatter = this.overlayImportService.buildImportFrontmatter(result);
+    const generatedFrontmatter = this.overlayImportService.buildImportFrontmatter(result, {
+      name: targetFile.basename,
+      path: targetFile.path,
+    });
+
     await this.app.fileManager.processFrontMatter(targetFile, (frontmatter: Record<string, unknown>) => {
+      const existingIcon = typeof frontmatter.icon === 'string' && frontmatter.icon.trim() !== ''
+        ? frontmatter.icon
+        : undefined;
+
       assignFrontmatter(frontmatter, generatedFrontmatter);
+      if (existingIcon !== undefined) frontmatter.icon = existingIcon;
     });
   }
 
@@ -403,24 +471,27 @@ export class DragDropHandler {
     const notePath = folderPath ? `${folderPath}/${noteName}.md` : `${noteName}.md`;
     const finalPath = await this.getUniqueNotePath(notePath);
 
-    // Create note with empty body - description is in frontmatter
     const noteContent = "";
 
     try {
       const newFile = await this.app.vault.create(normalizePath(finalPath), noteContent);
 
-      const generatedFrontmatter = this.overlayImportService.buildImportFrontmatter(result);
+      const generatedFrontmatter = this.overlayImportService.buildImportFrontmatter(result, {
+        name: noteName,
+        path: finalPath,
+      });
+
       await this.app.fileManager.processFrontMatter(newFile, (frontmatter: Record<string, unknown>) => {
         assignFrontmatter(frontmatter, generatedFrontmatter);
       });
-
     } catch (error) {
       logger.error(error);
+
       throw error;
     }
   }
 
-  private async createWaypointsNote(_waypoints: Waypoint[], filename: string, targetFolder: string | undefined, originalGpxContent: string, relativeFolder?: string): Promise<void> {
+  private async createWaypointsNote(filename: string, targetFolder: string | undefined, parsedDocument: TrackDocumentModel, relativeFolder?: string): Promise<void> {
     const baseName = filename.replace(/\.gpx$/i, '');
     const waypointsNoteName = `${baseName} - Waypoints`;
     const baseFolder = this.resolveTargetFolder(targetFolder);
@@ -433,23 +504,20 @@ export class DragDropHandler {
     try {
       const newFile = await this.app.vault.create(normalizePath(finalPath), "");
 
-      const waypointsOnlyGpx = this.removeTracksFromGpx(originalGpxContent);
+      const waypointsOnly: TrackDocumentModel = { ...parsedDocument, tracks: [], routes: [] };
+      const waypointsOnlyGpx = serializeTrackDocumentToGpx(waypointsOnly);
 
       const precomputeCache = this.getSettings().precomputeOverlayCache;
-      const overlayFields = OverlayImportService.buildOverlayFields(waypointsOnlyGpx, 'gpx', precomputeCache);
+      const overlayFields = OverlayImportService.buildOverlayFields(waypointsOnlyGpx, 'gpx', precomputeCache, waypointsOnly);
 
       await this.app.fileManager.processFrontMatter(newFile, (frontmatter: Record<string, unknown>) => {
         assignFrontmatter(frontmatter, overlayFields);
       });
-
     } catch (error) {
       logger.error(error);
+
       throw error;
     }
-  }
-
-  private removeTracksFromGpx(gpxContent: string): string {
-    return GpxParser.serializeWaypoints(GpxParser.parseModel(gpxContent));
   }
 
   // An explicit drop target wins; otherwise the shared new-note folder policy.
@@ -459,6 +527,7 @@ export class DragDropHandler {
 
   private async getUniqueNotePath(notePath: string): Promise<string> {
     await ensureVaultFolder(this.app, notePath);
+
     return getAvailableVaultPath(this.app, notePath);
   }
 }

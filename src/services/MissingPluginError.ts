@@ -1,4 +1,5 @@
-import type { ErrorWithHelpOptions } from "places-shared/utils";
+import { renderMapSurfaceError, type ErrorWithHelpOptions } from "places-shared/utils";
+import PlacesPlugin from "../main";
 
 // Describes a query plugin that is not installed; callers render it through whichever error surface they own (refreshable, plain, inline).
 export function missingQueryPluginError(plugin: 'dataview' | 'vaultquery'): ErrorWithHelpOptions {
@@ -25,4 +26,29 @@ export function missingMapProviderError(providerName: string): ErrorWithHelpOpti
     message: `The requested map provider "${providerName}" could not be found.`,
     className: "provider-error",
   };
+}
+
+export function renderMissingMapProvider(mapContainer: HTMLElement, providerName: string): void {
+  renderMapSurfaceError(mapContainer, missingMapProviderError(providerName));
+
+  const providers = PlacesPlugin.getAllMapProviders();
+  const section = mapContainer.createDiv({ cls: "places-help-section" });
+
+  if (providers.length > 0) {
+    section.createEl("h3", { text: "Available map providers" });
+    const list = section.createEl("ul");
+
+    for (const provider of providers) list.createEl("li", { text: provider });
+    section.createEl("p", { text: "Update the map provider setting to use an available provider." });
+  } else {
+    const heading = section.createEl("h3");
+
+    heading.appendText("No map providers installed. ");
+    heading.createEl("a", { text: "Browse plugins", href: "https://obsidian.md/plugins?search=places" });
+  }
+
+  const help = mapContainer.createDiv({ cls: "places-help-reference" }).createEl("p");
+
+  help.appendText("For complete documentation, use: ");
+  help.createEl("code", { text: "```places-help```" });
 }

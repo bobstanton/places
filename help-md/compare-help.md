@@ -16,20 +16,20 @@ track2: [[Fun Run Training Route]]
 
 ## Settings
 
-| Setting         | Description                                                                             | Examples                                  |
-| --------------- | --------------------------------------------------------------------------------------- | ----------------------------------------- |
-| track1          | Wiki-link to first track file (required)                                                | `[[Lake Scranton Weekend Run]]`           |
-| track2          | Wiki-link to second track file (required)                                               | `[[Lake Scranton Weekend Run]]`           |
-| tolerance       | Maximum distance to consider points as matching. Uses configured units (meters/feet)    | **50**, 25, 100, 200                      |
-| height          | Height of the mini-map                                                                  | **300px**, 400px, 500px                   |
-| width           | Width of the mini-map                                                                   | **100%**, 50%, 800px                      |
-| mapProvider     | Which map provider to use                                                               | **default**, {{dynamic:mapProviderNames}} |
-| showMiniMap     | Show the comparison map                                                                 | **true**, false                           |
-| showMetrics     | Show the metrics tables                                                                 | **true**, false                           |
-| poiDiscovery    | Enable clicking base-map POIs on the mini-map. Defaults off for this utility map        | true, **false**                           |
-| autorefresh     | Re-render when the vault index changes          | **true**, false                               |
-| queryParameters | UI controls that adjust the block without editing it. See `places-queryparameters-help` | `- name: limit`<br>`  type: int`<br>`  min: 1`<br>`  max: 40`             |
-| style           | Map style (provider-specific)                                                           | varies by provider                        |
+| Setting         | Description                                                                                                                                                                            | Examples                                                      |
+| --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------- |
+| track1          | Wiki-link to first track file (required)                                                                                                                                               | `[[Lake Scranton Weekend Run]]`                               |
+| track2          | Wiki-link to second track file (required)                                                                                                                                              | `[[Lake Scranton Weekend Run]]`                               |
+| tolerance       | Maximum distance to consider points as matching. Uses configured units (meters/feet)                                                                                                   | **50**, 25, 100, 200                                          |
+| height          | Height of the mini-map                                                                                                                                                                 | **300px**, 400px, 500px                                       |
+| width           | Width of everything the block renders, its legend and info included. A percentage measures the note's width, vw the window's                                                           | **100%**, 50%, 800px                                          |
+| mapProvider     | Which map provider to use                                                                                                                                                              | **default**, {{dynamic:mapProviderNames}}                     |
+| showMiniMap     | Show the comparison map                                                                                                                                                                | **true**, false                                               |
+| showMetrics     | Show the metrics tables                                                                                                                                                                | **true**, false                                               |
+| poiDiscovery    | Enable clicking base-map POIs on the mini-map. Defaults off for this utility map                                                                                                       | true, **false**                                               |
+| autorefresh     | Re-render when the vault index changes                                                                                                                                                 | **true**, false                                               |
+| queryParameters | UI controls that adjust the block without editing it; `queryParametersPosition`, `queryParametersLayout`, and `queryParametersCollapsed` place them. See `places-queryparameters-help` | `- name: limit`<br>`  type: int`<br>`  min: 1`<br>`  max: 40` |
+| style           | Map style (provider-specific)                                                                                                                                                          | varies by provider                                            |
 
 ## Output Sections
 

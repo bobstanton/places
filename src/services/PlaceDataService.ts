@@ -1,19 +1,20 @@
-import { isRecord, logger, type PerformanceMonitor } from "places-shared/utils";
+import { normalizeFrontmatterTags } from "places-shared/map";
+import { getErrorMessage, isRecord, logger, sleep, type PerformanceMonitor } from "places-shared/utils";
 import { App, MarkdownPostProcessorContext, TFile, normalizePath } from "obsidian";
 import { km, miles, feet, milesToKm, metersToKm, feetToMeters, Kilometers } from "places-shared/units";
 import { DistanceCalculator, Coordinate, parseNamedCoordinate } from "places-shared/geo";
 import { MapPlace } from "places-shared/overlay";
-import { resolveMarkerIcon } from "places-shared/map";
-import { extractFrontmatterTagsFromFile, normalizeFrontmatterTags } from "./PlaceTagExtractor";
+import { DEFAULT_MARKER_ICON, resolveWaypointIcon } from "places-shared/map";
+import { extractFrontmatterTagsFromFile } from "./PlaceTagExtractor";
 import { Utilities, getError, getFileNameWithoutExtension, readNormalizedProperty, scalarToString } from "places-shared/utils";
-import { TrackStyleParser } from "./TrackStyleParser";
-import { createMapPlaceFromProperties } from "./MapPlaceFactory";
-import { MapBlockSettings, type MapPrepareSourceTiming } from "places-shared/settings";
+import { compactOverlayBlobs, createMapPlaceFromProperties } from "./MapPlaceFactory";
+import { MapBlockSettings, type PlaceSource, type MapPrepareSourceTiming } from "places-shared/settings";
 import { TrackDataService } from "./TrackDataService";
-import { VaultQueryService } from "./VaultQueryService";
+import { QueryPreparationCanceled, VaultQueryService, type VaultQueryPlaceResult, type QueryConversionProgress } from "./VaultQueryService";
 import PlacesPlugin from "../main";
-import { parseLinkedPlaceReferences } from "./LinkedPlaces";
-import { parseEmbeddedPlaceProperties } from "./CodeBlockParser";
+import { overlayFormatFromPath } from 'places/core';
+import { readTrackFileContent } from './TrackFileReader';
+import { resolveCurrentSourcePath } from './SourcePathRenames';
 
 interface DataviewTableData {
   headers: string[];
@@ -47,12 +48,20 @@ type DataviewWorkspaceEvents = {
 
 type RadiusUnit = 'miles' | 'km' | 'meters' | 'feet';
 
-type PlaceSourceId = 'vault-query' | 'dataview' | 'current-note' | 'linked-places' | 'embedded';
+type PlaceSourceId = 'vault-query' | 'dataview' | 'current-note' | 'places';
 
 interface PlaceSourceResult {
   id: PlaceSourceId;
   places: MapPlace[];
   error?: Error;
+  queryErrors?: VaultQueryPlaceResult['errors'];
+  unreadable?: boolean;
+}
+
+export interface CollectedPlaces {
+  places: MapPlace[];
+  sourcesUnreadable: boolean;
+  queryErrors: VaultQueryPlaceResult['errors'];
 }
 
 const UNIT_ALIASES: Record<string, RadiusUnit> = {
@@ -76,20 +85,6 @@ const UNIT_CONVERSIONS: Record<RadiusUnit, { toKm: (distance: number) => Kilomet
   feet: { toKm: (distance) => metersToKm(feetToMeters(feet(distance))), label: 'feet' },
 };
 
-// The compressed overlay blobs are tens of KB per track and would otherwise
-// ride into marker data attributes, render signatures, and the refresh
-// fingerprint. Style conditions only need presence, and the value collapses to
-// the string 'true' (matching the SQL string-boolean contract for conditions).
-const OVERLAY_BLOB_KEYS = ['Overlay Source', 'Overlay Cache'] as const;
-function compactOverlayMetadata(metadata: Record<string, unknown>): Record<string, unknown> {
-  for (const key of OVERLAY_BLOB_KEYS) {
-    if (metadata[key] !== undefined) {
-      metadata[key] = 'true';
-    }
-  }
-  return metadata;
-}
-
 export class PlaceDataService {
   private dataviewReady: Promise<void> | null = null;
   private vaultQueryService: VaultQueryService;
@@ -102,102 +97,74 @@ export class PlaceDataService {
     this.vaultQueryService.invalidateCache();
   }
 
-  extractFromFrontmatter(ctx: MarkdownPostProcessorContext): Promise<MapPlace[]> {
+  extractFromFrontmatter(ctx: MarkdownPostProcessorContext): Promise<{ places: MapPlace[]; unreadable: boolean }> {
     try {
-      const file = this.app.vault.getFileByPath(normalizePath(ctx.sourcePath));
-      if (!file) return Promise.resolve([]);
-
-      const fileCache = this.app.metadataCache.getFileCache(file);
+      const path = normalizePath(ctx.sourcePath);
+      const file = this.app.vault.getFileByPath(path);
+      const fileCache = file ? this.app.metadataCache.getFileCache(file) : this.app.metadataCache.getCache(path);
       const frontmatter = fileCache?.frontmatter;
 
-      if (frontmatter && !frontmatter["Location"] && frontmatter["Overlay Source"]) {
-        // A waypoints-only file.
-        return Promise.resolve(this.extractWaypointsFromFile(file, ctx.sourcePath));
+      if (!fileCache) {
+        logger.debug('The current note is not indexed yet; its places are unknown', { path, inVaultIndex: file !== null });
+
+        return Promise.resolve({ places: [], unreadable: true });
       }
 
-      const place = this.extractPlaceFromFile(file);
-      if (!place) return Promise.resolve([]);
+      if (frontmatter && !frontmatter["Location"] && frontmatter["Overlay Source"]) {
+        if (!file) return Promise.resolve({ places: [], unreadable: false });
 
-      place.tags = extractFrontmatterTagsFromFile(this.app, ctx.sourcePath);
+        return Promise.resolve({ places: this.extractWaypointsFromFile(file, ctx.sourcePath), unreadable: false });
+      }
+
+      if (!frontmatter) return Promise.resolve({ places: [], unreadable: false });
+
+      const place = this.extractPlaceFromFrontmatter(frontmatter, path);
+
+      if (!place) return Promise.resolve({ places: [], unreadable: false });
+
+      place.tags = normalizeFrontmatterTags(frontmatter.tags);
       if (!place.metadata) place.metadata = {};
       place.metadata.sourceFile = ctx.sourcePath;
 
-      return Promise.resolve([place]);
+      return Promise.resolve({ places: [place], unreadable: false });
     } catch (error) {
       logger.error('Error extracting from frontmatter:', error);
-      return Promise.resolve([]);
+
+      return Promise.resolve({ places: [], unreadable: false });
     }
   }
 
   loadTrackPlaceFromPath(pathSetting: string, sourcePath: string): MapPlace | null {
     const file = this.trackDataService.resolveMarkdownTrackFile(pathSetting, sourcePath);
+
     if (!file) return null;
     const place = this.extractPlaceFromFile(file);
+
     if (!place) return null;
     place.tags = extractFrontmatterTagsFromFile(this.app, file.path);
     place.metadata ??= {};
     place.metadata.sourceFile = file.path;
+
     return place;
   }
 
-  // Properties can be in any order and are case-insensitive, a trailing `---`
-  // is optional, and the supported properties are Location, Name, icon and
-  // trackStyle.
-  // ```
-  // ---
-  // Location: 41.408, -75.662
-  // icon: 🏢
-  // Name: Dunder Mifflin Scranton
-  // ---
-  // Location: 41.573, -75.501
-  // icon: 🍕
-  // Name: Alfredos Pizza Cafe
-  // ```
-  extractFromEmbedded(source: string): MapPlace[] {
-    if (!source) return [];
-
-    const places: MapPlace[] = [];
-    for (const properties of parseEmbeddedPlaceProperties(source)) {
-      const locationValue = properties['location'];
-      if (!locationValue) continue;
-
-      const coord = parseNamedCoordinate(locationValue);
-      if (!coord) continue;
-
-      const { latitude, longitude } = coord;
-
-      const place: MapPlace = {
-        latitude,
-        longitude,
-        name: properties['name'] ?? coord.name ?? "",
-        icon: resolveMarkerIcon(properties['icon'])
-      };
-
-      const embeddedTrackStyle = scalarToString(readNormalizedProperty(properties, 'trackStyle'));
-      if (embeddedTrackStyle) {
-        const parsed = TrackStyleParser.parseTrackStyle(embeddedTrackStyle);
-        if (parsed) {
-          TrackStyleParser.applyToMapPlace(place, parsed);
-        }
-      }
-
-      places.push(place);
-    }
-
-    return places;
-  }
-
-  // Query sources are mutually exclusive: VaultQuery wins over Dataview. The
-  // current note, explicit wikilinks, and embedded places are additive.
-  async collectAllPlaces(blockSettings: MapBlockSettings, ctx: MarkdownPostProcessorContext, perf?: PerformanceMonitor, sourceTimings?: MapPrepareSourceTiming[]): Promise<MapPlace[]> {
-    const sourceResults = await Promise.all(this.createPlaceSourceCollectors(blockSettings, ctx).map(async collector => {
+  async collectAllPlaces(blockSettings: MapBlockSettings, ctx: MarkdownPostProcessorContext, perf?: PerformanceMonitor, sourceTimings?: MapPrepareSourceTiming[], progress?: QueryConversionProgress): Promise<CollectedPlaces> {
+    const queryProgress = progress ? {
+      ...progress,
+      isPriorityPlace: progress.isPriorityPlace ? (place: MapPlace) => progress.isPriorityPlace!(place)
+        && this.filterCollectedPlaces([place], blockSettings, ctx).length > 0 : undefined,
+      onBatch: progress.onBatch ? async (result: VaultQueryPlaceResult) => progress.onBatch!({
+        ...result, places: this.filterCollectedPlaces(result.places, blockSettings, ctx),
+      }) : undefined,
+    } : undefined;
+    const sourceResults = await Promise.all(this.createPlaceSourceCollectors(blockSettings, ctx, queryProgress).map(async collector => {
       const started = Date.now();
       const result = await collector();
       const durationMs = Date.now() - started;
+
       perf?.mark('source-collected', { source: result.id, durationMs, places: result.places.length });
-      // Unlike perf marks, this survives with developerMode off: the debug overlay
-      // shows per-source attribution whenever a block sets `debug: true`.
       sourceTimings?.push({ id: result.id, durationMs, places: result.places.length });
+
       return result;
     }));
     const queryError = sourceResults.find(result =>
@@ -211,98 +178,145 @@ export class PlaceDataService {
       throw queryError;
     }
 
-    let places = perf
-      ? perf.measure('dedupe-places', () => this.dedupePlacesByIdentity(sourceResults.flatMap(result => result.places)))
-      : this.dedupePlacesByIdentity(sourceResults.flatMap(result => result.places));
+    const places = this.filterCollectedPlaces(sourceResults.flatMap(result => result.places), blockSettings, ctx);
+
+    return { places, sourcesUnreadable: sourceResults.some(result => result.unreadable === true), queryErrors: sourceResults.flatMap(result => result.queryErrors ?? []) };
+  }
+
+  private filterCollectedPlaces(collected: MapPlace[], blockSettings: MapBlockSettings, ctx: MarkdownPostProcessorContext): MapPlace[] {
+    let places = this.dedupePlacesByIdentity(collected);
 
     if (blockSettings.radius) {
-      // Priority: location block setting > note's frontmatter Location.
       let fallbackCenter: Coordinate | undefined;
+
       if (!blockSettings.radius.toLowerCase().includes(' from ')) {
         if (blockSettings.location) {
           fallbackCenter = parseNamedCoordinate(blockSettings.location) ?? undefined;
         }
+
         if (!fallbackCenter && ctx.sourcePath) {
           fallbackCenter = this.extractFrontmatterLocation(ctx.sourcePath);
         }
       }
+
       places = this.filterPlacesByRadius(places, blockSettings, fallbackCenter);
     }
 
     return places;
   }
 
-  private createPlaceSourceCollectors(blockSettings: MapBlockSettings, ctx: MarkdownPostProcessorContext): Array<() => Promise<PlaceSourceResult>> {
+  private createPlaceSourceCollectors(blockSettings: MapBlockSettings, ctx: MarkdownPostProcessorContext, progress?: QueryConversionProgress): Array<() => Promise<PlaceSourceResult>> {
     const collectors: Array<() => Promise<PlaceSourceResult>> = [];
 
     if (blockSettings.query) {
-      collectors.push(() => this.collectQuerySource('vault-query', () => this.extractFromVaultQuery(blockSettings.query!, ctx.sourcePath)));
+      collectors.push(() => this.collectQuerySource('vault-query', async () => {
+        const { places, errors } = await this.vaultQueryService.extractFromQuery(blockSettings.query!, ctx.sourcePath, progress);
+
+        return { places, queryErrors: errors };
+      }));
     } else if (blockSettings.dataview) {
-      collectors.push(() => this.collectQuerySource('dataview', () => this.extractFromDataviewQuery(blockSettings.dataview!, ctx.sourcePath)));
+      collectors.push(() => this.collectQuerySource('dataview', async () => ({ places: await this.extractFromDataviewQuery(blockSettings.dataview!, ctx.sourcePath) })));
     }
 
-    // The current note's own Location is a fallback source, included only when
-    // no explicit place source (query, dataview, linkedPlaces, embeddedPlaces)
-    // is specified. Any explicit source suppresses it, even one that yields no
-    // results.
-    if (!blockSettings.query && !blockSettings.dataview && !blockSettings.linkedPlaces && !blockSettings.embeddedPlaces) {
-      collectors.push(async () => ({
-        id: 'current-note',
-        places: await this.extractFromFrontmatter(ctx),
-      }));
+    if (!blockSettings.query && !blockSettings.dataview && blockSettings.places === undefined) {
+      collectors.push(async () => {
+        const { places, unreadable } = await this.extractFromFrontmatter(ctx);
+
+        return { id: 'current-note', places, unreadable };
+      });
     }
 
-    if (blockSettings.linkedPlaces) {
-      collectors.push(async () => ({
-        id: 'linked-places',
-        places: this.extractFromLinkedPlaces(blockSettings.linkedPlaces, ctx.sourcePath),
-      }));
-    }
+    if (blockSettings.places !== undefined) {
+      collectors.push(async () => {
+        const { places, errors } = await this.extractFromPlaces(blockSettings.places!, ctx.sourcePath, {
+          isCanceled: progress?.isCanceled,
+          onBatch: !blockSettings.query && !blockSettings.dataview ? progress?.onBatch : undefined,
+        });
 
-    if (blockSettings.embeddedPlaces) {
-      collectors.push(async () => ({
-        id: 'embedded',
-        places: this.extractFromEmbedded(blockSettings.embeddedPlaces!),
-      }));
+        return { id: 'places', places, queryErrors: errors };
+      });
     }
 
     return collectors;
   }
 
-  private async collectQuerySource(id: 'vault-query' | 'dataview', collect: () => Promise<MapPlace[]>): Promise<PlaceSourceResult> {
+  private async collectQuerySource(id: 'vault-query' | 'dataview', collect: () => Promise<Pick<PlaceSourceResult, 'places' | 'queryErrors'>>): Promise<PlaceSourceResult> {
     try {
-      return { id, places: await collect() };
+      return { id, ...await collect() };
     } catch (error) {
       if (Utilities.isDataviewUnavailableError(error) || Utilities.isVaultQueryUnavailableError(error)) {
         return { id, places: [], error: error as Error };
       }
+
       throw error;
     }
   }
 
-  extractFromLinkedPlaces(linkedPlaces: unknown, sourcePath: string): MapPlace[] {
+  async extractFromPlaces(sources: readonly PlaceSource[], sourcePath: string, progress?: QueryConversionProgress): Promise<VaultQueryPlaceResult> {
     const places: MapPlace[] = [];
+    const errors: VaultQueryPlaceResult['errors'] = [];
+    const seen = new Set<string>();
+    let yieldedAt = performance.now(), publishedAt = yieldedAt, publicationDelay = 50;
 
-    for (const reference of parseLinkedPlaceReferences(linkedPlaces)) {
-      const file = this.app.metadataCache.getFirstLinkpathDest(reference.linkpath, sourcePath);
-      if (!file) {
-        logger.warn('Could not resolve linked place:', reference.raw);
-        continue;
+    for (const [index, entry] of sources.entries()) {
+      if (progress?.isCanceled?.()) throw new QueryPreparationCanceled();
+      let errorPath = `places[${index}]`;
+
+      try {
+        let place: MapPlace | null;
+
+        if (typeof entry === 'string') {
+          errorPath = entry;
+          const file = this.app.metadataCache.getFirstLinkpathDest(resolveCurrentSourcePath(entry), resolveCurrentSourcePath(sourcePath));
+
+          if (!file) throw new Error('Linked file was not found.');
+          if (seen.has(file.path)) continue;
+          seen.add(file.path);
+          errorPath = file.path;
+          const format = overlayFormatFromPath(file.path);
+
+          if (format === 'md') {
+            place = this.extractPlaceFromFile(file);
+          } else if (format === 'gpx' || format === 'fit' || format === 'geojson' || format === 'csv') {
+            const content = await readTrackFileContent(this.app, file);
+
+            if (progress?.isCanceled?.()) throw new QueryPreparationCanceled();
+            place = createMapPlaceFromProperties({ properties: { overlay_source: content }, name: file.basename, filePath: file.path });
+          } else {
+            throw new Error('Linked file must be a place note, GPX, FIT, GeoJSON or coordinate CSV.');
+          }
+
+          if (!place) throw new Error('Linked file has no valid Location or overlay contents.');
+          place.metadata ??= {};
+          place.metadata.sourceFile = file.path;
+        } else {
+          const coordinate = parseNamedCoordinate(readNormalizedProperty(entry, 'location'));
+
+          if (!coordinate) continue;
+          place = createMapPlaceFromProperties({
+            properties: entry,
+            name: scalarToString(readNormalizedProperty(entry, 'name')) || coordinate.name || '',
+          });
+        }
+
+        if (place) places.push(place);
+      } catch (error) {
+        if (error instanceof QueryPreparationCanceled) throw error;
+        errors.push({ path: errorPath, error: getErrorMessage(error) });
       }
 
-      const place = this.extractPlaceFromFile(file);
-      if (!place) {
-        logger.warn('Linked place has no Location frontmatter:', file.path);
-        continue;
+      if (progress?.onBatch && places.length && performance.now() - publishedAt >= publicationDelay) {
+        await progress.onBatch({ places: [...places], errors: [...errors] });
+        publishedAt = performance.now();
+        publicationDelay = Math.min(1000, publicationDelay * 2);
       }
 
-      place.tags = extractFrontmatterTagsFromFile(this.app, file.path);
-      if (!place.metadata) place.metadata = {};
-      place.metadata.sourceFile = file.path;
-      places.push(place);
+      if (performance.now() - yieldedAt >= 8) { await sleep(0); yieldedAt = performance.now(); }
     }
 
-    return places;
+    if (progress?.isCanceled?.()) throw new QueryPreparationCanceled();
+
+    return { places, errors };
   }
 
   private dedupePlacesByIdentity(places: MapPlace[]): MapPlace[] {
@@ -316,16 +330,21 @@ export class PlaceDataService {
   }
 
   private getPlaceIdentity(place: MapPlace): string {
-    return place.filePath
-      ? ['file', place.filePath].join(':')
-      : ['coord', String(place.latitude), String(place.longitude)].join(':');
+    return place.id
+      ? ['id', place.id].join(':')
+      : place.filePath
+        ? ['file', place.filePath].join(':')
+        : ['coord', String(place.latitude), String(place.longitude)].join(':');
   }
 
   private extractFrontmatterLocation(filePath: string): Coordinate | undefined {
     const file = this.app.vault.getFileByPath(normalizePath(filePath));
+
     if (!file) return undefined;
     const location: unknown = this.app.metadataCache.getFileCache(file)?.frontmatter?.['Location'];
+
     if (typeof location !== 'string') return undefined;
+
     return parseNamedCoordinate(location) ?? undefined;
   }
 
@@ -347,8 +366,10 @@ export class PlaceDataService {
       : radiusStr.trim();
 
     const { radiusKm } = this.parseDistanceWithUnit(distanceStr);
+
     if (radiusKm === null) {
       logger.warn('Invalid radius distance:', distanceStr);
+
       return places;
     }
 
@@ -357,19 +378,25 @@ export class PlaceDataService {
     if (fromIndex !== -1) {
       const coordsStr = blockSettings.radius.substring(fromIndex + 6).trim(); // preserve case for parsing
       const coordParts = coordsStr.split(/\s+or\s+/i);
+
       centers = [];
+
       for (const coordPart of coordParts) {
         const center = parseNamedCoordinate(coordPart.trim());
+
         if (!center) {
           logger.warn('Invalid radius coordinate:', coordPart.trim());
+
           return places;
         }
+
         centers.push(center);
       }
     } else if (fallbackCenter) {
       centers = [fallbackCenter];
     } else {
       logger.warn('radius has no "from" clause and no location was found in the code block settings or note frontmatter. Use: radius: 50 from lat, lng');
+
       return places;
     }
 
@@ -379,6 +406,7 @@ export class PlaceDataService {
           center.latitude, center.longitude,
           place.latitude, place.longitude
         );
+
         return (distanceKm as number) <= (radiusKm as number);
       })
     );
@@ -386,11 +414,13 @@ export class PlaceDataService {
 
   private parseDistanceWithUnit(distanceStr: string): { distance: number; unitLabel: string; radiusKm: Kilometers | null } {
     const match = distanceStr.match(/^([\d.]+)\s*(mi|miles?|km|kilometers?|m|meters?|ft|feet)?$/i);
+
     if (!match) {
       return { distance: 0, unitLabel: '', radiusKm: null };
     }
 
     const distance = parseFloat(match[1]);
+
     if (isNaN(distance) || distance <= 0) {
       return { distance: 0, unitLabel: '', radiusKm: null };
     }
@@ -405,26 +435,26 @@ export class PlaceDataService {
 
     const units = PlacesPlugin.settings.units;
     const defaultConversion = UNIT_CONVERSIONS[units === 'imperial' ? 'miles' : 'km'];
-    return { distance, unitLabel: defaultConversion.label, radiusKm: defaultConversion.toKm(distance) };
-  }
 
-  // `sourcePath` resolves placeholders like {this.outgoingLinks} against that note.
-  async extractFromVaultQuery(query: string, sourcePath?: string): Promise<MapPlace[]> {
-    return await this.vaultQueryService.extractFromQuery(query, sourcePath);
+    return { distance, unitLabel: defaultConversion.label, radiusKm: defaultConversion.toKm(distance) };
   }
 
   async extractFromDataviewQuery(query: string, sourcePath: string): Promise<MapPlace[]> {
     try {
       const results = await this.executePlacesQuery(query, sourcePath);
+
       if (!results) return [];
 
       const places = this.convertQueryResultsToPlaces(results);
+
       return places;
     } catch (error) {
       if (Utilities.isDataviewUnavailableError(error)) {
         throw error;
       }
+
       logger.warn('Dataview query error:', error);
+
       return [];
     }
   }
@@ -448,9 +478,11 @@ export class PlaceDataService {
     await new Promise(resolve => window.requestAnimationFrame(resolve));
 
     const result = await dataview.tryQuery(tableQuery, sourcePath);
+
     if (result.type !== 'table') {
       throw new Error(`Expected a Dataview table result, received ${result.type}.`);
     }
+
     if (result.values.length === 0) {
       return undefined;
     }
@@ -470,6 +502,7 @@ export class PlaceDataService {
 
     if (upperQuery.startsWith('LIST')) {
       const afterList = trimmed.substring(4).trim();
+
       return `TABLE ${fields}\n${afterList}`;
     }
 
@@ -493,6 +526,7 @@ export class PlaceDataService {
     }
 
     const allFields = existingFields ? `${existingFields}, ${requiredFields}` : requiredFields;
+
     return `TABLE ${allFields}\n${afterFrom}`;
   }
 
@@ -501,12 +535,14 @@ export class PlaceDataService {
     const rows = queryResults.values;
 
     const colIndex: Record<string, number> = {};
+
     headers.forEach((header, idx) => {
       colIndex[header.toLowerCase()] = idx;
     });
 
     const getCol = (row: Array<unknown>, name: string): unknown => {
       const idx = colIndex[name.toLowerCase()];
+
       return idx !== undefined ? row[idx] : undefined;
     };
 
@@ -514,30 +550,29 @@ export class PlaceDataService {
 
     for (const row of rows) {
       try {
-        // First column is always the file link in Dataview TABLE results
         const fileLink = row[0];
         const filePath = isRecord(fileLink) && typeof fileLink.path === 'string' ? fileLink.path : undefined;
+
         if (!filePath) continue;
 
         const rawFrontmatter = getCol(row, 'file.frontmatter');
+
         if (!isRecord(rawFrontmatter)) continue;
         const frontmatter = rawFrontmatter;
 
-        // Place-category tags come from the frontmatter `tags:` property only; inline body
-        // #hashtags (which Dataview's file.tags would fold in) are not consumed.
         const place = createMapPlaceFromProperties({
-          app: this.app,
           properties: frontmatter,
           name: getFileNameWithoutExtension(filePath, 'Unknown', /\.md$/i),
           filePath,
           tags: normalizeFrontmatterTags(frontmatter['tags']),
-          metadata: compactOverlayMetadata({ ...frontmatter, sourceFile: filePath }),
+          metadata: compactOverlayBlobs({ ...frontmatter, sourceFile: filePath }),
         });
+
         if (!place) continue;
 
         places.push(place);
       } catch {
-        // Silently skip invalid rows
+        continue;
       }
     }
 
@@ -545,19 +580,19 @@ export class PlaceDataService {
   }
 
   private extractWaypointsFromFile(file: TFile, filePath: string): MapPlace[] {
-
     try {
       const trackData = this.trackDataService.extractTrackFromNote(file);
       const { waypoints } = trackData;
 
       if (!waypoints || waypoints.length === 0) return [];
 
-      return waypoints.map(waypoint => {
+      return waypoints.map((waypoint, index) => {
         const place: MapPlace = {
+          id: `waypoint:${filePath}:${index}`,
           latitude: waypoint.lat,
           longitude: waypoint.lon,
           name: waypoint.name,
-          icon: waypoint.symbol || "📍",
+          icon: resolveWaypointIcon(waypoint) ?? DEFAULT_MARKER_ICON,
           filePath: filePath
         };
 
@@ -567,6 +602,7 @@ export class PlaceDataService {
 
         place.metadata.isWaypoint = true;
         place.metadata.waypointDescription = waypoint.description;
+        place.metadata.waypointSymbol = waypoint.symbol;
         place.metadata.waypointType = waypoint.type;
         place.metadata.waypointComment = waypoint.comment;
         place.metadata.waypointLink = waypoint.link;
@@ -582,15 +618,16 @@ export class PlaceDataService {
   private extractPlaceFromFrontmatter(frontmatter: Record<string, unknown>, filePath: string): MapPlace | null {
     try {
       const noteTitle = getFileNameWithoutExtension(filePath, 'Unknown', /\.md$/i);
+
       return createMapPlaceFromProperties({
-        app: this.app,
         properties: frontmatter,
         name: noteTitle,
         filePath,
-        metadata: compactOverlayMetadata({ ...frontmatter }),
+        metadata: compactOverlayBlobs({ ...frontmatter }),
       });
     } catch (error) {
       logger.error('Error extracting place from frontmatter:', error);
+
       return null;
     }
   }
@@ -599,11 +636,13 @@ export class PlaceDataService {
     try {
       const fileCache = this.app.metadataCache.getFileCache(file);
       const frontmatter = fileCache?.frontmatter;
+
       if (!frontmatter) return null;
 
       return this.extractPlaceFromFrontmatter(frontmatter, file.path);
     } catch (error) {
       logger.error('Error extracting place from file:', error);
+
       return null;
     }
   }
@@ -614,6 +653,7 @@ export class PlaceDataService {
     } else if (settings.dataview) {
       return await this.getFilesFromDataviewQuery(settings.dataview, sourcePath);
     }
+
     return [];
   }
 
@@ -631,11 +671,13 @@ export class PlaceDataService {
     }
 
     let dqlQuery = query;
+
     if (!dqlQuery.startsWith("LIST")) {
       dqlQuery = "LIST \n" + query;
     }
 
     const result = await dataview.tryQuery(dqlQuery, sourcePath);
+
     if (result.type !== 'list') {
       throw new Error(`Expected a Dataview list result, received ${result.type}.`);
     }
@@ -645,10 +687,13 @@ export class PlaceDataService {
     }
 
     const files: TFile[] = [];
+
     for (const value of result.values) {
       const filePath = isRecord(value) && typeof value.path === 'string' ? value.path : undefined;
+
       if (!filePath) continue;
       const file = this.app.vault.getFileByPath(normalizePath(filePath));
+
       if (file) {
         files.push(file);
       }
@@ -667,6 +712,7 @@ export class PlaceDataService {
       }
 
       const files: TFile[] = [];
+
       for (const row of results as Array<{ path?: string }>) {
         if (!row.path) {
           vaultQueryLogger.warn('Skipping row: missing required "path" column');
@@ -674,6 +720,7 @@ export class PlaceDataService {
         }
 
         const file = this.app.vault.getFileByPath(normalizePath(row.path));
+
         if (file) {
           files.push(file);
         }
@@ -688,17 +735,20 @@ export class PlaceDataService {
   private async ensureDataviewReady(dataview: DataviewApiAdapter): Promise<void> {
     if (dataview.index?.initialized) return;
     if (!this.dataviewReady) this.dataviewReady = this.waitForDataviewIndex(dataview);
+
     await this.dataviewReady;
   }
 
   private waitForDataviewIndex(dataview: DataviewApiAdapter): Promise<void> {
     const startTime = Date.now();
+
     dataviewLogger.info('Waiting for Dataview index initialization');
 
     return new Promise(resolve => {
       if (dataview.index?.initialized) {
         dataviewLogger.debug('Dataview index already initialized');
         resolve();
+
         return;
       }
 
@@ -710,19 +760,21 @@ export class PlaceDataService {
         window.clearTimeout(timeout);
         if (refreshRef) this.app.workspace.offref(refreshRef);
         const duration = Date.now() - startTime;
+
         if (ready) {
           dataviewLogger.info(`Index ready after ${duration}ms (${reason})`);
         } else {
           dataviewLogger.warn(`Index not ready after ${duration}ms (${reason}); proceeding with current Dataview state`);
         }
+
         resolve();
       };
 
       const timeout = window.setTimeout(() => resolveOnce(Boolean(dataview.index?.initialized), 'timeout'), DATAVIEW_INDEX_WAIT_MS);
+
       refreshRef = (this.app.workspace as unknown as DataviewWorkspaceEvents).on('dataview:refresh-views', () => {
         if (dataview.index?.initialized) resolveOnce(true, 'dataview:refresh-views');
       });
     });
   }
-
 }

@@ -26,23 +26,27 @@ queryParameters:
 
 ## Parameter settings
 
-| Setting          | Description                                                                                                                                                                              | Examples                                                                   |
-| ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
-| name             | Required. Referenced as `{parameter.name}` in the query or any other block setting                                                                                                       | limit, kind                                                                |
-| type             | Value type                                                                                                                                                                               | **string**, int, float, date, datetime, time, boolean, enum, list, location |
-| control          | Control kind. Inferred from the type when omitted: numeric types with `min`/`max` get a slider, enums a dropdown, lists a multiselect, booleans a toggle, strings with `options` a combobox | slider, range, number, text, combobox, dropdown, segmented, toggle, date, datetime, time, multiselect, location, stops, custom |
-| default          | Initial value. A range control takes `20, 60` or `[20, 60]`; a `list` parameter takes a list, or `all` to start with every option selected                                                | 10, `[20, 60]`, all                                                        |
-| min / max / step | Numeric bounds and step; `range: 0, 100` is shorthand for min and max                                                                                                                    | 0, 100, 5                                                                  |
-| width            | Fixed lengths size the input; a percentage sizes the complete parameter relative to the control strip. Percentages apply to every control; fixed lengths have no effect on `toggle`, `segmented`, and `multiselect` | 240px, 18rem, 30ch, 50%                                                    |
-| options          | Allowed values for `enum`/`list`; suggestions for a `combobox`                                                                                                                           | `- 🍕`<br>`- 🍝`                                                            |
-| optionsQuery     | VaultQuery SQL whose first column supplies the options at render time, in query order; `{this.*}` is supported                                                                           | SELECT DISTINCT icon FROM places ORDER BY icon                             |
-| label            | Control caption. Defaults to the name                                                                                                                                                    | Places shown                                                               |
-| play             | Auto-advance interval: `true` is 1000 ms, a number is milliseconds; renders a play/pause button. Sliders step from min to max and wrap; `dropdown`, `segmented`, and `custom` controls cycle their options | true, 500                                                                  |
-| render / mount   | JavaScript for `control: custom`, described below                                                                                                                                        |                                                                            |
+| Setting          | Description                                                                                                                                                                                                         | Examples                                                                                                                       |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| name             | Required. Referenced as `{parameter.name}` in the query or any other block setting                                                                                                                                  | limit, kind                                                                                                                    |
+| type             | Value type                                                                                                                                                                                                          | **string**, int, float, date, datetime, time, boolean, enum, list, location                                                    |
+| control          | Control kind. Inferred from the type when omitted: numeric types with `min`/`max` get a slider, enums a dropdown, lists a multiselect, booleans a toggle, strings with `options` a combobox                         | slider, range, number, text, combobox, dropdown, segmented, toggle, date, datetime, time, multiselect, location, stops, custom |
+| default          | Initial value. A range control takes `20, 60` or `[20, 60]`; a `list` parameter takes a list, or `all` to start with every option selected                                                                          | 10, `[20, 60]`, all                                                                                                            |
+| min / max / step | Numeric bounds and step; `range: 0, 100` is shorthand for min and max                                                                                                                                               | 0, 100, 5                                                                                                                      |
+| scale            | Spacing of a range control's values along its slider. `log` spaces them by ratio, giving values near `min` most of the slider                                                                                       | **linear**, log                                                                                                                |
+| showValue        | Whether a `range` control shows its min-max readout beside the slider                                                                                                                                               | **true**, false                                                                                                                |
+| width            | Fixed lengths size the input; a percentage sizes the complete parameter relative to the control strip. Percentages apply to every control; fixed lengths have no effect on `toggle`, `segmented`, and `multiselect` | 240px, 18rem, 30ch, 50%                                                                                                        |
+| options          | Allowed values for `enum`/`list`; suggestions for a `combobox`                                                                                                                                                      | `- 🍕`<br>`- 🍝`                                                                                                                 |
+| optionsQuery     | VaultQuery SQL whose first column supplies the options at render time, in query order; `{this.*}` is supported. On a range control it supplies the limits instead: the column's smallest and largest number         | SELECT DISTINCT icon FROM places ORDER BY icon                                                                                 |
+| label            | Control caption. Defaults to the name                                                                                                                                                                               | Places shown                                                                                                                   |
+| play             | Auto-advance interval: `true` is 1000 ms, a number is milliseconds; renders a play/pause button. Sliders step from min to max and wrap; `dropdown`, `segmented`, and `custom` controls cycle their options          | true, 500                                                                                                                      |
+| showOnMap        | For `location` or `control: stops`, show the current value as one or more map markers                                                                                                                               | true, false                                                                                                                    |
+| icon / icons     | Marker glyph for every value, or a positional list for stops. Declaring either also enables `showOnMap`; a referenced note's icon is used when neither is supplied                                                  | 📍, `[1️⃣, 2️⃣, 🏁]`                                                                                                             |
+| render / mount   | JavaScript for `control: custom`, described below                                                                                                                                                                   |                                                                                                                                |
 
 ## Range controls
 
-`range` is a dual-ended slider exposing `{parameter.name.min}` and `{parameter.name.max}`:
+`range` is a dual-ended slider exposing `{parameter.name.min}` and `{parameter.name.max}`. The query runs as a handle moves, throttled, and again on release:
 
 ~~~places
 query:
@@ -55,6 +59,26 @@ queryParameters:
     min: 0
     max: 10000
 ~~~
+
+An `optionsQuery` on a range supplies its limits instead of declared `min` and `max`: the smallest and largest number in the first column. The default is the full span unless declared. `scale: log` spaces values by ratio: the first step above `min` takes as much of the slider as each further tenfold.
+
+~~~places
+query: |
+  SELECT * FROM places
+  WHERE convert_distance(distance, 'mi') BETWEEN {parameter.distance.min} AND {parameter.distance.max}
+queryParameters:
+  - name: distance
+    type: float
+    control: range
+    scale: log
+    step: 0.5
+    label: Distance (mi)
+    optionsQuery: SELECT convert_distance(distance, 'mi') FROM places
+~~~
+
+A limits query that references an earlier parameter rebuilds the control with the new limits when that parameter changes. A selection outside the new limits is clamped to them.
+
+The readout beside the slider shows both ends at the step's precision and keeps the width of its widest possible text, whatever the current values. `showValue: false` omits it.
 
 ## List parameters
 
@@ -78,6 +102,37 @@ queryParameters:
     optionsQuery: SELECT DISTINCT icon FROM places ORDER BY icon
     default: all
 ~~~
+
+## Map view placeholders
+
+`query` and `optionsQuery` accept these numeric placeholders without a `queryParameters` declaration.
+
+| Placeholder              | Value                                                      |
+| ------------------------ | ---------------------------------------------------------- |
+| `{map.zoom}`             | Current zoom, including fractional zoom levels             |
+| `{map.center.latitude}`  | Camera center latitude in degrees                          |
+| `{map.center.longitude}` | Camera center longitude in degrees, from -180 up to 180    |
+| `{map.bearing}`          | Rotation clockwise from north in degrees, from 0 up to 360 |
+| `{map.pitch}`            | Camera tilt in degrees; 0 looks straight down              |
+| `{map.width}`            | Viewport width in CSS pixels                               |
+| `{map.height}`           | Viewport height in CSS pixels                              |
+| `{map.south}`            | Southern viewport bound in degrees                         |
+| `{map.west}`             | Western viewport bound in degrees                          |
+| `{map.north}`            | Northern viewport bound in degrees                         |
+| `{map.east}`             | Eastern viewport bound in degrees                          |
+| `{map.ready}`            | 1 when viewport bounds are available; otherwise 0          |
+
+Queries refresh after the map settles when a referenced value changes. Refreshes preserve the camera.
+
+Before the map exists, the bounds cover the whole world, `{map.ready}` is `0`, and the other values resolve to SQL `NULL`. Use `COALESCE({map.zoom}, 7)` to supply an initial fallback, or `{map.ready} = 1` to wait for a live viewport. Use numeric placeholders without SQL quotes.
+
+Views crossing the antimeridian have west greater than east; match longitudes on either side of the date line in that case.
+
+A range whose limits query includes viewport conditions recalculates its limits as the map moves.
+
+For custom controls, persist clamped selections in `mount` with `param.setValue(..., { redraw: false })`.
+
+These placeholders are available through the MapLibre and Leaflet providers. Leaflet reports bearing and pitch as `0`. Bounds describe a geographic rectangle; filtering note locations tests marker positions, not track intersections.
 
 ## Note properties
 
@@ -112,11 +167,11 @@ mode: daily
 
 `{this.*}` already means two other things. Note properties get their own prefix:
 
-| Placeholder    | Resolved against                                                         |
-| -------------- | ------------------------------------------------------------------------ |
-| `{note.*}`     | the containing note's frontmatter, in settings                           |
-| `{this.*}` in `query:` / `optionsQuery:` | the current note, by VaultQuery                        |
-| `{this.*}` in `labelTemplate`, the other label templates, and per-place templates such as `iconRotation` | the place, feature, route, or waypoint |
+| Placeholder                                                                                              | Resolved against                               |
+| -------------------------------------------------------------------------------------------------------- | ---------------------------------------------- |
+| `{note.*}`                                                                                               | the containing note's frontmatter, in settings |
+| `{this.*}` in `query:` / `optionsQuery:`                                                                 | the current note, by VaultQuery                |
+| `{this.*}` in `labelTemplate`, the other label templates, and per-place templates such as `iconRotation` | the place, feature, route, or waypoint         |
 
 `{note.*}` is deliberately not substituted into `query:`, `optionsQuery:`, `dataview:`, or a nested `routes[].query`: those keep their existing `{this.*}` handling, which quotes and escapes values for SQL. Use `{this.*}` inside a query and `{note.*}` everywhere else.
 
@@ -212,9 +267,31 @@ queryParameters:
     label: Center
 ~~~
 
+`showOnMap: true` displays the parameter's current location as a marker. `icon` sets its glyph and enables `showOnMap`. Brace placeholders in settings and list items do not require quotes.
+
+~~~places
+height: 450px
+isochrones:
+  - mode: drive
+    provider: mapbox
+    centers:
+      - {parameter.center}
+    ranges:
+      - 30 min
+      - 60 min
+queryParameters:
+  - name: center
+    type: location
+    default: 41.408, -75.662
+    label: Center
+    icon: 🎯
+~~~
+
+For a `list` parameter using `control: stops`, `icon` applies to every stop and `icons` assigns glyphs positionally; missing entries fall back to the referenced note's icon and then 📍.
+
 ## Selection as a parameter
 
-`selection.itemParameter` names a parameter that a popup's Select action sets to the selected place or track path (its name for embedded places). `selection.pointParameter` stores the exact selected or playback coordinate. `selection.channel` optionally names the typed channel exposed to installed Places extensions. Both parameters are shared note parameters. A map, elevation chart, or control can drive the other consumers.
+`selection.itemParameter` names a parameter that a popup's Select action sets to the selected place or track path (its name for manual places). `selection.pointParameter` stores the exact selected or playback coordinate. `selection.channel` optionally names the typed channel exposed to installed Places extensions. Both parameters are shared note parameters. A map, elevation chart, or control can drive the other consumers.
 
 ~~~places
 height: 450px
@@ -233,6 +310,19 @@ queryParameters:
 ~~~
 
 Track-specific configuration may instead use `track.selection.trackParameter` and `track.selection.pointParameter`, keeping a track selection separate from a general place selection.
+
+### The map's viewport as parameters
+
+`selection.viewportParameter` names the note parameters a map publishes for what it is showing. A base name of `view` publishes `viewNorth`, `viewSouth`, `viewEast`, `viewWest` and `viewZoom`, and republishes them whenever the map settles after a pan or zoom. Any block in the note reads them as `{parameter.viewNorth}` and re-runs when they change - which is how a list or a gallery follows the map.
+
+~~~places
+query: SELECT path, basename AS title, location, '📷' AS icon FROM image_files WHERE location IS NOT NULL
+iconImage: "{this.path}"
+selection:
+  viewportParameter: view
+~~~
+
+They are values, not controls: nothing renders them in a parameter strip, and a `places-parameters` block declaring the same name earlier in the note keeps its own. Inside the map's own block, `{map.north}` and its fellows say the same thing without publishing anything.
 
 ## Note-scoped parameters
 
@@ -293,6 +383,8 @@ queryParameters:
 
 A floating strip overlays the map and always carries a collapse toggle. Collapsed, it shrinks to a single icon chip and gives the map back the space. `queryParametersCollapsed: true` starts it collapsed. Declaring `queryParametersCollapsed` on an `above` or `below` strip adds the toggle there too. Collapsing only hides the controls: values, playing sliders, and everything else keep running.
 
+The strip moves down only when its visible bounds would overlap the map's action buttons or edit button. Expanding, collapsing, and resizing recalculate that spacing; a collapsed chip keeps its usual position when it fits. Marker search and place search panels use the same behavior. The action buttons keep their position.
+
 ~~~places
 mapProvider: openfreemap
 height: 400px
@@ -308,6 +400,8 @@ queryParameters:
 ~~~
 
 Values are type-checked and clamped before substitution. In the query, single quotes are escaped and booleans substitute as `1`/`0`. Control values persist for the session per block and reset to defaults after a reload.
+
+Tap either a boolean toggle's label or its switch to change it. The switch shows the new value immediately while the map updates; an isochrone may take longer to appear while its request finishes. Toggles also support Enter and Space when focused.
 
 ## Custom controls
 
@@ -330,11 +424,11 @@ queryParameters:
 
 `render` receives four arguments:
 
-| Argument  | What it is                                                                              |
-| --------- | --------------------------------------------------------------------------------------- |
-| `value`   | The parameter's current value, already coerced to its type                              |
-| `options` | Resolved options, whether they came from `options` or from `optionsQuery`               |
-| `param`   | `name`, `type`, `label`, `min`, `max`, `step`, `defaultValue`, `value`, `options`, `setValue(raw, { redraw })`, `onDispose()` |
+| Argument  | What it is                                                                                                                            |
+| --------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `value`   | The parameter's current value, already coerced to its type                                                                            |
+| `options` | Resolved options, whether they came from `options` or from `optionsQuery`                                                             |
+| `param`   | `name`, `type`, `label`, `min`, `max`, `step`, `defaultValue`, `value`, `options`, `setValue(raw, { redraw })`, `onDispose()`         |
 | `h`       | Helpers: `escape` and `html` (see Escaping), `range(from, to)` for numeric option lists, `classNames(...)` joining truthy class names |
 
 ### Setting the value
@@ -393,11 +487,36 @@ A value change from anywhere else (the play button, a map click, another block) 
 
 The cleanup runs before the next render and when the block is torn down. Anything left in the element is discarded on teardown either way.
 
+### Rows, and paths as URLs
+
+`options` is the `optionsQuery`'s first column, which is what a dropdown needs. A custom control also receives `rows`: the whole rows, in query order, so markup can use a caption or a date beside the value. `h.resource(path)` turns a path from one of those rows - in the vault or anywhere on the device - into a URL the webview can load, which is what an `<img>` needs.
+
+Together they draw a gallery of whatever a query returns. With a map publishing its viewport (`selection.viewportParameter`), the gallery follows what is on screen:
+
+~~~places-parameters
+queryParametersPosition: below
+queryParameters:
+  - name: photo
+    control: custom
+    optionsQuery: |
+      SELECT path, basename AS title FROM image_files
+      WHERE latitude BETWEEN {parameter.viewSouth} AND {parameter.viewNorth}
+        AND longitude BETWEEN {parameter.viewWest} AND {parameter.viewEast}
+      ORDER BY captured DESC LIMIT 200
+    render: |
+      return rows.map(row =>
+        `<img class="photo-tile" src="${h.resource(row.path)}" title="${h.escape(row.title)}" ${h.valueAttribute}="${h.escape(row.path)}">`
+      ).join('');
+~~~
+
+Clicking a tile sets the parameter to that photograph's path, which the map can read back through `markerFilter` or a query of its own.
+
 ### Notes
 
 - A script error renders in place of the control, with the parameter name; the other controls stay interactive.
 - `render` is required for `control: custom`, and both keys are rejected on any other control.
 - Custom controls take part in `play`: with `options` they cycle, and with a numeric `min`/`max` they step like a slider.
+- `rows` is kept for custom controls only; every other control reads `options`.
 
 ## Styling
 
@@ -408,6 +527,31 @@ Style the controls with a CSS snippet or the block's `css:` setting. Each contro
   color: var(--text-accent);
 }
 ~~~
+
+## Filtering markers
+
+`markerFilter` hides every place its condition rejects, marker and label together. The grammar is the one `iconStyles` rules use, without the `=> css` part: comparisons (`==`, `!=`, `<`, `<=`, `>`, `>=`), a bare field for a truthy check, `!` to invert, `IN` and `NOT IN` against a comma list, and `AND` or `OR` inside one rule. The right side may be a `{parameter.*}` placeholder; a multiselect substitutes the comma list `IN` expects.
+
+~~~places
+query: SELECT * FROM places
+markerFilter: tag IN {parameter.show}
+queryParameters:
+  - name: show
+    type: list
+    control: multiselect
+    options: [hiking, cycling, paddling]
+    default: all
+~~~
+
+A YAML list of rules keeps a place that matches any one of them. Conditions that must all hold go in one rule joined with `AND`:
+
+~~~yaml
+markerFilter: icon_label IN {parameter.icon} AND distance_mi >= {parameter.distance.min} AND distance_mi <= {parameter.distance.max}
+~~~
+
+The left side is a field of the place as its data source supplies it: a query column, a frontmatter property, `tag:<name>`, or the marker's `name` and `icon`. A note without an icon draws the default marker but carries an empty `icon` field, so a filter that has to keep such notes selects on a query column instead, such as `COALESCE(NULLIF(TRIM(icon), ''), 'No icon') AS icon_label`. There is no substring operator; free-text search belongs in the query.
+
+Filtering does not re-run the query. With native symbol markers, a parameter that reaches only `markerFilter` toggles marker and track visibility on the live map; with HTML markers and Leaflet the block re-renders with the hidden places dropped. A parameter that also reaches the query or another setting prepares the block in full. `debug: parameters` lists each rule with its match count and the field names it can see.
 
 ## Debugging parameters and filters
 

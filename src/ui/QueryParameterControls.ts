@@ -1,8 +1,10 @@
-import { AbstractInputSuggest, App, DropdownComponent, SliderComponent, TextComponent, ToggleComponent, setIcon, setTooltip } from 'obsidian';
-import { QueryParameterDefinition, QueryParameterValue, coerceQueryParameterValue, isQueryParameterRange } from '../services/QueryParameters';
+import { AbstractInputSuggest, App, DropdownComponent, SliderComponent, TextComponent, setIcon, setTooltip } from 'obsidian';
+import { QueryParameterDefinition, QueryParameterRange, QueryParameterValue, coerceQueryParameterValue, createRangeScale, isQueryParameterRange } from 'places/core';
 import { QueryParameterPlayState, QueryParameterStripState } from '../services/QueryParameterState';
-import { scalarToString } from 'places-shared/utils';
+import { scalarToString } from "places-shared/utils";
+import { syncCodeBlockLayout } from "places-shared/obsidian/ui";
 import { renderCustomParameter } from './CustomParameterControl';
+import { positionFloatingPanel } from './FloatingPanelPosition';
 
 export type QueryParameterControlsPosition = 'above' | 'below' | 'floating';
 export type QueryParameterControlsLayout = 'horizontal' | 'vertical';
@@ -10,12 +12,14 @@ export type QueryParameterControlsLayout = 'horizontal' | 'vertical';
 // `queryParametersPosition` as written in a block; anything unrecognized renders below.
 export function normalizeQueryParameterPosition(raw: unknown): QueryParameterControlsPosition {
   const value = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
+
   return value === 'above' || value === 'floating' ? value : 'below';
 }
 
 // `queryParametersLayout` as written in a block; anything unrecognized flows horizontally.
 export function normalizeQueryParameterLayout(raw: unknown): QueryParameterControlsLayout {
   const value = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
+
   return value === 'vertical' ? value : 'horizontal';
 }
 
@@ -24,52 +28,49 @@ export interface QueryParameterControlsOptions {
   definitions: QueryParameterDefinition[];
   values: Record<string, QueryParameterValue>;
   position: QueryParameterControlsPosition;
-  // Controls flow along a row (default) or stack one per line.
   layout?: QueryParameterControlsLayout;
-  // Initial collapsed state. Declaring it makes a non-floating strip collapsible; floating strips always are.
   collapsed?: boolean;
-  // Session key for play-state persistence across strip re-renders.
   stateKey?: string | null;
-  // Called with the coerced value whenever a control changes; the caller owns debouncing.
-  onChange: (name: string, value: QueryParameterValue) => void;
+  onChange: (name: string, value: QueryParameterValue, context?: { continuous: true }) => void;
 }
 
 export interface RenderedQueryParameterControls {
   strip: HTMLElement;
-  // Updates a control's displayed value after an external state change (map click, selection action). No onChange fires.
+  refreshOptions: (values: Record<string, QueryParameterValue>) => void;
   setDisplayValue: (name: string, value: QueryParameterValue) => void;
-  // Stops timers owned by the controls; call before removing or replacing the strip.
   dispose: () => void;
 }
 
 // A control's programmatic display updater; undefined when the control cannot reflect external values.
 type DisplaySetter = (value: QueryParameterValue) => void;
 
-// Controls are built from Obsidian's own setting components (or
-// platform-native inputs where Obsidian has none), and follow the active
-// theme. Every element carries classes and data
-// attributes (`data-param-name`, `data-param-type`, `data-param-control`) for
-// restyling with CSS snippets or the block's `css:` setting.
 export function renderQueryParameterControls(host: HTMLElement, options: QueryParameterControlsOptions): RenderedQueryParameterControls {
   const strip = host.createDiv({ cls: `places-query-params places-query-params-${options.position} places-query-params-${options.layout ?? 'horizontal'}` });
+
+  syncCodeBlockLayout(host);
+  strip.dataset.ignoreSwipe = 'true';
   const cleanups: Array<() => void> = [];
   const setters = new Map<string, DisplaySetter>();
+  const items = new Map<string, { item: HTMLElement; cleanups: Array<() => void>; signature: string }>();
+  const optionSignature = (definition: QueryParameterDefinition): string => JSON.stringify([definition.options, definition.defaultValue, definition.min, definition.max]);
 
-  // A floating strip overlays the map and is always collapsible; the other
-  // positions only take up layout space and become collapsible when the block
-  // asks for it by declaring an initial state.
   if (options.position === 'floating' || options.collapsed !== undefined) {
     renderCollapseToggle(strip, options.layout ?? 'horizontal', options.stateKey ?? null, options.collapsed ?? false);
   }
 
-  for (const definition of options.definitions) {
-    const item = strip.createDiv({ cls: `places-query-param places-query-param-${definition.control}` });
+  const renderItem = (definition: QueryParameterDefinition, item: HTMLElement, values: Record<string, QueryParameterValue>): void => {
+    const cleanups: Array<() => void> = [];
+
+    items.set(definition.name, { item, cleanups, signature: optionSignature(definition) });
+    setters.delete(definition.name);
     item.setAttr('data-param-name', definition.name);
     item.setAttr('data-param-type', definition.type);
     item.setAttr('data-param-control', definition.control);
+
     if (definition.width) {
       item.addClass('places-query-param-custom-width');
       item.style.setProperty('--places-query-param-width', definition.width);
+
       if (/^(?:\d+(?:\.\d+)?|\.\d+)%$/.test(definition.width)) {
         item.addClass('places-query-param-percentage-width');
       }
@@ -77,13 +78,15 @@ export function renderQueryParameterControls(host: HTMLElement, options: QueryPa
 
     renderParameterLabel(item, definition.label);
 
-    let currentValue = options.values[definition.name] ?? definition.defaultValue;
-    // Returns the value that was accepted, or undefined when the input was unusable.
-    const report = (raw: unknown): QueryParameterValue | undefined => {
+    let currentValue = values[definition.name] ?? definition.defaultValue;
+    const report = (raw: unknown, continuous = false): QueryParameterValue | undefined => {
       const value = coerceQueryParameterValue(definition, raw);
+
       if (value === undefined) return undefined;
+      if (JSON.stringify(value) === JSON.stringify(currentValue)) return value;
       currentValue = value;
-      options.onChange(definition.name, value);
+      options.onChange(definition.name, value, continuous ? { continuous: true } : undefined);
+
       return value;
     };
 
@@ -92,10 +95,10 @@ export function renderQueryParameterControls(host: HTMLElement, options: QueryPa
 
     switch (definition.control) {
       case 'slider':
-        setter = renderSlider(item, definition, initial, report);
+        setter = renderSlider(item, definition, initial, report, cleanups);
         break;
       case 'range':
-        renderRange(item, definition, initial, report);
+        setter = renderRange(item, definition, initial, report);
         break;
       case 'number':
         setter = renderNumber(item, definition, initial, report);
@@ -114,10 +117,10 @@ export function renderQueryParameterControls(host: HTMLElement, options: QueryPa
         setter = renderSegmented(item, definition, initial, report);
         break;
       case 'toggle':
-        setter = renderToggle(item, initial, report);
+        setter = renderToggle(item, initial, report, cleanups);
         break;
       case 'multiselect':
-        renderMultiselect(item, definition, initial, report);
+        setter = renderMultiselect(item, definition, initial, report);
         break;
       case 'stops':
         setter = renderStops(options.app, item, definition, initial, report);
@@ -149,13 +152,31 @@ export function renderQueryParameterControls(host: HTMLElement, options: QueryPa
         report(value);
       }, cleanups);
     }
+  };
+
+  for (const definition of options.definitions) {
+    renderItem(definition, strip.createDiv({ cls: `places-query-param places-query-param-${definition.control}` }), options.values);
   }
+
+  if (options.position === 'floating') cleanups.push(positionFloatingPanel(host, strip));
 
   return {
     strip,
+    refreshOptions: values => {
+      for (const definition of options.definitions) {
+        const previous = items.get(definition.name)!;
+
+        if (previous.signature === optionSignature(definition)) continue;
+        previous.cleanups.forEach(cleanup => cleanup());
+        previous.item.replaceChildren();
+        renderItem(definition, previous.item, values);
+      }
+    },
     setDisplayValue: (name, value) => setters.get(name)?.(value),
     dispose: () => {
+      syncCodeBlockLayout(host, undefined, strip);
       for (const cleanup of cleanups) cleanup();
+      for (const record of items.values()) record.cleanups.forEach(cleanup => cleanup());
     },
   };
 }
@@ -163,7 +184,9 @@ export function renderQueryParameterControls(host: HTMLElement, options: QueryPa
 function renderParameterLabel(item: HTMLElement, label: string): void {
   const match = label.match(/^(.*?)\s+\(([^()]+)\)$/);
   const labelEl = item.createSpan({ cls: 'places-query-param-label' });
+
   labelEl.createSpan({ text: match?.[1] ?? label });
+
   if (match) {
     labelEl.createSpan({ cls: 'places-query-param-label-context', text: match[2] });
   }
@@ -183,6 +206,7 @@ function renderCollapseToggle(strip: HTMLElement, layout: QueryParameterControls
     setIcon(button, collapsed ? 'sliders-horizontal' : collapseIcon);
     button.setAttr('aria-expanded', String(!collapsed));
     const label = collapsed ? 'Show parameters' : 'Hide parameters';
+
     button.setAttr('aria-label', label);
     setTooltip(button, label, { placement: 'top' });
   };
@@ -190,6 +214,7 @@ function renderCollapseToggle(strip: HTMLElement, layout: QueryParameterControls
   apply(QueryParameterStripState.isCollapsed(stateKey, initialCollapsed));
   button.addEventListener('click', () => {
     const collapsed = !strip.hasClass('is-collapsed');
+
     QueryParameterStripState.setCollapsed(stateKey, collapsed);
     apply(collapsed);
   });
@@ -202,6 +227,7 @@ function renderCollapseToggle(strip: HTMLElement, layout: QueryParameterControls
 // away) holds its value and resumes on reattach.
 function renderPlayButton(item: HTMLElement, definition: QueryParameterDefinition, stateKey: string | null, getValue: () => QueryParameterValue, applyValue: (value: QueryParameterValue) => void, cleanups: Array<() => void>): void {
   const button = item.createEl('button', { cls: 'clickable-icon places-query-param-play', attr: { type: 'button', 'aria-label': `Play or pause ${definition.label}` } });
+
   setTooltip(button, `Play or pause ${definition.label}`, { placement: 'top' });
   let timer: number | null = null;
 
@@ -226,6 +252,7 @@ function renderPlayButton(item: HTMLElement, definition: QueryParameterDefinitio
   setIcon(button, 'play');
   button.addEventListener('click', () => {
     const playing = timer === null;
+
     QueryParameterPlayState.setPlaying(stateKey, definition.name, playing);
     if (playing) start();
     else stop();
@@ -234,6 +261,7 @@ function renderPlayButton(item: HTMLElement, definition: QueryParameterDefinitio
   if (QueryParameterPlayState.isPlaying(stateKey, definition.name)) {
     start();
   }
+
   cleanups.push(stop);
 }
 
@@ -242,36 +270,44 @@ function advancePlayValue(definition: QueryParameterDefinition, current: QueryPa
   // like a dropdown.
   const stepsNumerically = definition.control === 'slider'
     || (definition.control === 'custom' && (definition.options?.length ?? 0) === 0);
+
   if (stepsNumerically) {
     const min = definition.min ?? 0;
     const max = definition.max ?? 100;
     const step = definition.step ?? (definition.type === 'float' ? 0.1 : 1);
     const base = typeof current === 'number' ? current : min;
     const next = base + step;
+
     if (next > max + 1e-9) return min;
     const precision = Math.max(0, (String(step).split('.')[1] ?? '').length);
+
     return Number(next.toFixed(precision));
   }
 
   const cycle = definition.options ?? [];
+
   if (cycle.length === 0) return current;
   const index = cycle.indexOf(scalarToString(current));
+
   return cycle[(index + 1) % cycle.length];
 }
 
-function renderSlider(item: HTMLElement, definition: QueryParameterDefinition, initial: QueryParameterValue, report: (raw: unknown) => void): DisplaySetter {
+function renderSlider(item: HTMLElement, definition: QueryParameterDefinition, initial: QueryParameterValue, report: (raw: unknown, continuous?: boolean) => void, cleanups: Array<() => void>): DisplaySetter {
   const hitArea = item.createDiv({ cls: 'places-query-param-slider-hit-area' });
   const min = definition.min ?? 0;
   const max = definition.max ?? 100;
   const step = definition.step ?? (definition.type === 'float' ? 0.1 : 1);
   const slider = new SliderComponent(hitArea)
     .setLimits(min, max, step)
-    .setValue(Number(initial))
-    .onChange(report);
+    .setValue(Number(initial));
+
   slider.sliderEl.addClass('places-query-param-input');
 
-  // Keep the theme's normal range-input appearance while making the empty
-  // vertical space around it clickable as part of the control.
+  const reportInput = (): void => report(Number(slider.sliderEl.value), true);
+
+  slider.sliderEl.addEventListener('input', reportInput);
+  cleanups.push(() => slider.sliderEl.removeEventListener('input', reportInput));
+
   hitArea.addEventListener('click', event => {
     if (event.target === slider.sliderEl || max <= min) return;
     const bounds = hitArea.getBoundingClientRect();
@@ -279,6 +315,7 @@ function renderSlider(item: HTMLElement, definition: QueryParameterDefinition, i
     const stepped = min + Math.round(((min + ratio * (max - min)) - min) / step) * step;
     const precision = Math.max(0, (String(step).split('.')[1] ?? '').length);
     const value = Number(Math.max(min, Math.min(max, stepped)).toFixed(precision));
+
     slider.setValue(value);
     report(value);
   });
@@ -288,59 +325,84 @@ function renderSlider(item: HTMLElement, definition: QueryParameterDefinition, i
   };
 }
 
-// Dual-ended range: two overlapping native range inputs. The track comes from
-// the lower input; both thumbs stay interactive via pointer-events on the
-// thumb pseudo-elements (see styles.css). Thumbs cannot cross.
-function renderRange(item: HTMLElement, definition: QueryParameterDefinition, initial: QueryParameterValue, report: (raw: unknown) => void): void {
-  const start = isQueryParameterRange(initial) ? initial : { min: definition.min ?? 0, max: definition.max ?? 100 };
-  const valueLabel = item.createSpan({ cls: 'places-query-param-value', text: `${start.min}-${start.max}` });
+function renderRange(item: HTMLElement, definition: QueryParameterDefinition, initial: QueryParameterValue, report: (raw: unknown, continuous?: boolean) => void): DisplaySetter {
+  const scale = createRangeScale(definition);
+  const start = isQueryParameterRange(initial) ? initial : { min: scale.min, max: scale.max };
+  const formatRange = (value: QueryParameterRange): string => `${scale.format(value.min)}-${scale.format(value.max)}`;
+  let valueLabel: HTMLElement | undefined;
+
+  if (definition.showValue !== false) {
+    valueLabel = item.createSpan({ cls: 'places-query-param-value', text: formatRange(start) });
+    const widestEnd = Math.max(scale.format(scale.min).length, scale.format(scale.max).length);
+
+    valueLabel.style.minWidth = `${widestEnd * 2 + 1}ch`;
+  }
 
   const track = item.createDiv({ cls: 'places-query-param-range-track' });
-  const limitMin = definition.min ?? 0;
-  const limitMax = definition.max ?? 100;
-  const step = String(definition.step ?? (definition.type === 'float' ? 0.1 : 1));
-  const attrs = { type: 'range', min: String(limitMin), max: String(limitMax), step };
+  const attrs = { type: 'range', min: String(scale.input.min), max: String(scale.input.max), step: String(scale.input.step) };
 
   const lowInput = track.createEl('input', { cls: 'places-query-param-input places-query-param-range-low', attr: attrs });
   const highInput = track.createEl('input', { cls: 'places-query-param-input places-query-param-range-high', attr: attrs });
-  lowInput.value = String(start.min);
-  highInput.value = String(start.max);
+
+  lowInput.value = String(scale.toInput(start.min));
+  highInput.value = String(scale.toInput(start.max));
 
   const updateTrack = (low: number, high: number): void => {
-    const span = limitMax - limitMin;
-    const lowPercent = span > 0 ? ((low - limitMin) / span) * 100 : 0;
-    const highPercent = span > 0 ? ((high - limitMin) / span) * 100 : 100;
+    const span = scale.input.max - scale.input.min;
+    const lowPercent = span > 0 ? ((low - scale.input.min) / span) * 100 : 0;
+    const highPercent = span > 0 ? ((high - scale.input.min) / span) * 100 : 100;
+
     track.style.setProperty('--places-query-range-low', `${Math.max(0, Math.min(100, lowPercent))}%`);
     track.style.setProperty('--places-query-range-high', `${Math.max(0, Math.min(100, highPercent))}%`);
   };
 
-  const update = (): void => {
+  const current = (): QueryParameterRange => {
     let low = Number(lowInput.value);
     let high = Number(highInput.value);
+
     if (low > high) {
       [low, high] = [high, low];
       lowInput.value = String(low);
       highInput.value = String(high);
     }
-    valueLabel.setText(`${low}-${high}`);
-    updateTrack(low, high);
-    report({ min: low, max: high });
-  };
 
-  updateTrack(start.min, start.max);
-  lowInput.addEventListener('input', update);
-  highInput.addEventListener('input', update);
+    const value = { min: scale.fromInput(low), max: scale.fromInput(high) };
+
+    valueLabel?.setText(formatRange(value));
+    updateTrack(low, high);
+
+    return value;
+  };
+  const reportInput = (): void => { report(current(), true); };
+  const commit = (): void => { report(current()); };
+
+  updateTrack(Number(lowInput.value), Number(highInput.value));
+
+  for (const input of [lowInput, highInput]) {
+    input.addEventListener('input', reportInput);
+    input.addEventListener('change', commit);
+  }
+
+  return value => {
+    if (!isQueryParameterRange(value)) return;
+    lowInput.value = String(scale.toInput(value.min));
+    highInput.value = String(scale.toInput(value.max));
+    valueLabel?.setText(formatRange(value));
+    updateTrack(Number(lowInput.value), Number(highInput.value));
+  };
 }
 
 function renderNumber(item: HTMLElement, definition: QueryParameterDefinition, initial: QueryParameterValue, report: (raw: unknown) => void): DisplaySetter {
   const text = new TextComponent(item)
     .setValue(scalarToString(initial))
     .onChange(report);
+
   text.inputEl.type = 'number';
   text.inputEl.addClass('places-query-param-input');
   if (definition.min !== undefined) text.inputEl.min = String(definition.min);
   if (definition.max !== undefined) text.inputEl.max = String(definition.max);
   if (definition.step !== undefined) text.inputEl.step = String(definition.step);
+
   return value => { text.setValue(scalarToString(value)); };
 }
 
@@ -348,10 +410,13 @@ function renderText(item: HTMLElement, definition: QueryParameterDefinition, ini
   const text = new TextComponent(item)
     .setValue(scalarToString(initial))
     .onChange(report);
+
   text.inputEl.addClass('places-query-param-input');
+
   if (definition.control === 'location') {
     text.inputEl.placeholder = 'Name: latitude, longitude';
   }
+
   return value => { text.setValue(scalarToString(value)); };
 }
 
@@ -362,12 +427,15 @@ class QueryParameterSuggest extends AbstractInputSuggest<string> {
 
   protected getSuggestions(query: string): string[] {
     const needle = query.trim().toLocaleLowerCase();
+
     if (!needle) return [...this.options];
 
     const matches = this.options.filter(option => option.toLocaleLowerCase().includes(needle));
+
     return matches.sort((left, right) => {
       const leftStarts = left.toLocaleLowerCase().startsWith(needle);
       const rightStarts = right.toLocaleLowerCase().startsWith(needle);
+
       return Number(rightStarts) - Number(leftStarts);
     });
   }
@@ -382,25 +450,41 @@ function renderCombobox(app: App, item: HTMLElement, definition: QueryParameterD
   const text = new TextComponent(item)
     .setValue(scalarToString(initial))
     .onChange(report);
+
   text.inputEl.addClass('places-query-param-input');
 
   const suggest = new QueryParameterSuggest(app, text.inputEl, definition.options ?? []);
+
   suggest.onSelect(value => {
     text.setValue(value);
     report(value);
     suggest.close();
   });
+
   return value => { text.setValue(scalarToString(value)); };
 }
 
 function renderDropdown(item: HTMLElement, definition: QueryParameterDefinition, initial: QueryParameterValue, report: (raw: unknown) => void): DisplaySetter {
   const dropdown = new DropdownComponent(item);
+
   for (const option of definition.options ?? []) {
     dropdown.addOption(option, option);
   }
+
   dropdown.setValue(scalarToString(initial)).onChange(report);
   dropdown.selectEl.addClass('places-query-param-input');
+
   return value => { dropdown.setValue(scalarToString(value)); };
+}
+
+function createOptionButton(group: HTMLElement, option: string): HTMLButtonElement {
+  const button = group.createEl('button', { text: option, cls: 'places-query-param-segment', attr: { type: 'button' } });
+
+  if (/^(?:\p{Extended_Pictographic}[\uFE0E\uFE0F]?|\p{Emoji_Presentation}|\p{Emoji_Modifier}|\u200D|[0-9#*]\uFE0F?\u20E3|[\u{E0020}-\u{E007F}])+$/u.test(option.trim())) {
+    button.addClass('is-emoji');
+  }
+
+  return button;
 }
 
 function renderSegmented(item: HTMLElement, definition: QueryParameterDefinition, initial: QueryParameterValue, report: (raw: unknown) => void): DisplaySetter {
@@ -413,7 +497,8 @@ function renderSegmented(item: HTMLElement, definition: QueryParameterDefinition
   };
 
   for (const option of definition.options ?? []) {
-    const button = group.createEl('button', { text: option, cls: 'places-query-param-segment', attr: { type: 'button' } });
+    const button = createOptionButton(group, option);
+
     buttons.set(option, button);
     button.addEventListener('click', () => {
       activate(option);
@@ -422,15 +507,36 @@ function renderSegmented(item: HTMLElement, definition: QueryParameterDefinition
   }
 
   activate(scalarToString(initial));
+
   return value => activate(scalarToString(value));
 }
 
-function renderToggle(item: HTMLElement, initial: QueryParameterValue, report: (raw: unknown) => void): DisplaySetter {
+function renderToggle(item: HTMLElement, initial: QueryParameterValue, report: (raw: unknown) => void, cleanups: Array<() => void>): DisplaySetter {
   const holder = item.createDiv({ cls: 'places-query-param-toggle-holder' });
-  const toggle = new ToggleComponent(holder)
-    .setValue(Boolean(initial))
-    .onChange(report);
-  return value => { toggle.setValue(Boolean(value)); };
+  const button = holder.createEl('button', {
+    cls: 'clickable-icon places-query-param-toggle-button',
+    attr: { type: 'button', role: 'switch' },
+  });
+  const label = item.querySelector('.places-query-param-label');
+
+  if (label) button.appendChild(label);
+  const indicator = button.createSpan({ cls: 'checkbox-container', attr: { 'aria-hidden': 'true' } });
+  let checked = Boolean(initial);
+  const display = (value: QueryParameterValue): void => {
+    checked = Boolean(value);
+    button.setAttribute('aria-checked', String(checked));
+    indicator.toggleClass('is-enabled', checked);
+  };
+  const activate = (): void => {
+    display(!checked);
+    report(checked);
+  };
+
+  display(initial);
+  button.addEventListener('click', activate);
+  cleanups.push(() => button.removeEventListener('click', activate));
+
+  return display;
 }
 
 // Free-form ordered rows with add and remove buttons (multi-stop directions,
@@ -439,6 +545,7 @@ function renderToggle(item: HTMLElement, initial: QueryParameterValue, report: (
 function renderStops(app: App, item: HTMLElement, definition: QueryParameterDefinition, initial: QueryParameterValue, report: (raw: unknown) => void): DisplaySetter {
   item.querySelector('.places-query-param-label')?.remove();
   const fieldset = item.createEl('fieldset', { cls: 'places-query-param-stop-fieldset' });
+
   fieldset.createEl('legend', { cls: 'places-query-param-stop-legend', text: definition.label });
   const column = fieldset.createDiv({ cls: 'places-query-param-stop-rows' });
   const rows = column.createDiv({ cls: 'places-query-param-stop-list' });
@@ -448,22 +555,27 @@ function renderStops(app: App, item: HTMLElement, definition: QueryParameterDefi
 
   const updateRowSemantics = (): void => {
     const rowElements = Array.from(rows.querySelectorAll<HTMLElement>('.places-query-param-stop-row'));
+
     rowElements.forEach((row, index) => {
       const positionLabel = `Stop ${index + 1}`;
+
       row.querySelector<HTMLElement>('.places-query-param-stop-marker')?.setText(String(index + 1));
 
       const input = row.querySelector<HTMLInputElement>('input');
+
       input?.setAttribute('aria-label', positionLabel);
 
       const remove = row.querySelector<HTMLButtonElement>('.places-query-param-stop-button');
       const value = input?.value.trim();
       const removeLabel = `Remove ${positionLabel.toLowerCase()}${value ? `: ${value}` : ''}`;
+
       remove?.setAttribute('aria-label', removeLabel);
     });
   };
 
   const addRow = (value: string): void => {
     const row = rows.createDiv({ cls: 'places-query-param-stop-row' });
+
     row.createSpan({ cls: 'places-query-param-stop-marker', attr: { 'aria-hidden': 'true' } });
     const text = new TextComponent(row)
       .setValue(value)
@@ -471,16 +583,21 @@ function renderStops(app: App, item: HTMLElement, definition: QueryParameterDefi
         updateRowSemantics();
         report(collect());
       });
+
     text.inputEl.addClass('places-query-param-input');
+
     if (definition.options?.length) {
       const suggest = new QueryParameterSuggest(app, text.inputEl, definition.options);
+
       suggest.onSelect(selected => {
         text.setValue(selected);
         report(collect());
         suggest.close();
       });
     }
+
     const remove = row.createEl('button', { cls: 'clickable-icon places-query-param-stop-button', attr: { type: 'button' } });
+
     setIcon(remove, 'trash-2');
     setTooltip(remove, 'Remove stop', { placement: 'top' });
     remove.addEventListener('click', () => {
@@ -507,16 +624,19 @@ function renderStops(app: App, item: HTMLElement, definition: QueryParameterDefi
 
   const actions = column.createDiv({ cls: 'places-query-param-stop-actions' });
   const add = actions.createEl('button', { cls: 'places-query-param-stop-add', attr: { type: 'button', 'aria-label': 'Add stop' } });
+
   setIcon(add, 'plus');
   add.createSpan({ text: 'Add stop' });
   add.addEventListener('click', () => {
     addRow('');
     updateRowSemantics();
     const inputs = rows.querySelectorAll('input');
+
     inputs[inputs.length - 1]?.focus();
   });
 
   const reset = actions.createEl('button', { cls: 'places-query-param-stop-reset', attr: { type: 'button', 'aria-label': 'Reset stops to defaults' } });
+
   setIcon(reset, 'rotate-ccw');
   reset.createSpan({ text: 'Reset stops' });
   setTooltip(reset, 'Reset stops to defaults', { placement: 'top' });
@@ -528,13 +648,15 @@ function renderStops(app: App, item: HTMLElement, definition: QueryParameterDefi
   return value => render(Array.isArray(value) ? value.map(String) : []);
 }
 
-// Multi-select as toggleable chips; the value is the array of active options.
-function renderMultiselect(item: HTMLElement, definition: QueryParameterDefinition, initial: QueryParameterValue, report: (raw: unknown) => void): void {
+function renderMultiselect(item: HTMLElement, definition: QueryParameterDefinition, initial: QueryParameterValue, report: (raw: unknown) => void): DisplaySetter {
   const group = item.createDiv({ cls: 'places-query-param-segments places-query-param-chips' });
   const selected = new Set(Array.isArray(initial) ? initial.map(String) : []);
+  const buttons = new Map<string, HTMLButtonElement>();
 
   for (const option of definition.options ?? []) {
-    const button = group.createEl('button', { text: option, cls: 'places-query-param-segment', attr: { type: 'button' } });
+    const button = createOptionButton(group, option);
+
+    buttons.set(option, button);
     if (selected.has(option)) button.addClass('is-active');
     button.addEventListener('click', () => {
       if (selected.has(option)) {
@@ -544,10 +666,16 @@ function renderMultiselect(item: HTMLElement, definition: QueryParameterDefiniti
         selected.add(option);
         button.addClass('is-active');
       }
-      // Preserve declared option order in the reported value.
+
       report((definition.options ?? []).filter(candidate => selected.has(candidate)));
     });
   }
+
+  return value => {
+    selected.clear();
+    if (Array.isArray(value)) value.forEach(option => selected.add(String(option)));
+    for (const [option, button] of buttons) button.toggleClass('is-active', selected.has(option));
+  };
 }
 
 type TemporalInputType = 'date' | 'time';
@@ -566,22 +694,27 @@ function createTemporalSegment(holder: HTMLElement, type: TemporalInputType, val
     cls: 'places-query-param-temporal-icon',
     attr: { type: 'button', 'aria-label': `Open ${ariaLabel.toLowerCase()} picker` },
   });
+
   setIcon(icon, type === 'date' ? 'calendar-days' : 'clock-3');
   const input = segment.createEl('input', {
     type,
     cls: 'places-query-param-input places-query-param-temporal-input',
     attr: { 'aria-label': ariaLabel },
   });
+
   input.value = value;
   icon.addEventListener('click', () => openNativePicker(input));
+
   return input;
 }
 
 function renderTemporalInput(item: HTMLElement, type: TemporalInputType, initial: string, report: (raw: unknown) => void): DisplaySetter {
   const holder = item.createDiv({ cls: 'places-query-param-temporal' });
   const input = createTemporalSegment(holder, type, initial, item.dataset.paramName ?? type);
+
   input.value = initial;
   input.addEventListener('change', () => report(input.value));
+
   return value => { input.value = scalarToString(value); };
 }
 
@@ -594,10 +727,13 @@ function renderDateTimeInput(item: HTMLElement, initial: string, report: (raw: u
   const reportCombined = (): void => {
     if (dateInput.value && timeInput.value) report(`${dateInput.value}T${timeInput.value}`);
   };
+
   dateInput.addEventListener('change', reportCombined);
   timeInput.addEventListener('change', reportCombined);
+
   return value => {
     const [date = '', time = ''] = scalarToString(value).split('T');
+
     dateInput.value = date;
     timeInput.value = time;
   };

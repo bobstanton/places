@@ -4,15 +4,12 @@ import { IPlacesService } from "places-shared/services";
 import { ServiceCachingDecoratorBase, ICacheStorage } from "places-shared/utils";
 import type { PartialPlacesResultsCallback } from "places-shared/services";
 
-
-// Cache keys: the query string for `lookupPlace`, coordinates rounded to 5 decimal
-// places for `lookupPlaceByCoordinates`, query plus bounds for `lookupPlaceInBounds`.
 export class PlacesCachingDecorator
   extends ServiceCachingDecoratorBase
   implements IPlacesService
 {
-  constructor(private wrappedService: IPlacesService, private serviceName: string, cacheStorage: ICacheStorage) {
-    super(cacheStorage);
+  constructor(private wrappedService: IPlacesService, private serviceName: string, cacheStorage: ICacheStorage, onCacheHit?: () => void) {
+    super(cacheStorage, undefined, onCacheHit);
   }
 
   private normalizeQuery(query: string): string {
@@ -27,6 +24,7 @@ export class PlacesCachingDecorator
     // Round coordinates to 5 decimal places (~1m precision)
     const lat = coord.latitude.toFixed(5);
     const lng = coord.longitude.toFixed(5);
+
     return `${this.serviceName}:coord:${lat},${lng}`;
   }
 
@@ -34,6 +32,7 @@ export class PlacesCachingDecorator
     const normalizedQuery = this.normalizeQuery(query);
     // Round bounds to 3 decimal places (~100m precision)
     const boundsKey = `${bounds.minLat.toFixed(3)},${bounds.minLng.toFixed(3)},${bounds.maxLat.toFixed(3)},${bounds.maxLng.toFixed(3)}`;
+
     return `${this.serviceName}:bounds:${normalizedQuery}:${boundsKey}`;
   }
 
@@ -42,12 +41,15 @@ export class PlacesCachingDecorator
     const results = await this.executeWithCache(cacheKey, () =>
       this.wrappedService.lookupPlace(query, onPartialResults)
     );
+
     onPartialResults?.(results);
+
     return results;
   }
 
   async lookupPlaceByCoordinates(coordinate: Coordinate): Promise<Place[]> {
     const cacheKey = this.generateCoordCacheKey(coordinate);
+
     return this.executeWithCache(cacheKey, () =>
       this.wrappedService.lookupPlaceByCoordinates(coordinate)
     );
@@ -62,7 +64,9 @@ export class PlacesCachingDecorator
     const results = await this.executeWithCache(cacheKey, () =>
       this.wrappedService.lookupPlaceInBounds!(query, bounds, onPartialResults)
     );
+
     onPartialResults?.(results);
+
     return results;
   }
 

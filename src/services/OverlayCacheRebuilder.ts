@@ -1,7 +1,7 @@
 import { App, Notice, TFile } from 'obsidian';
-import { StringCompressor, logger as rootLogger, scalarToString } from 'places-shared/utils';
-import { compactGeoJson } from './GeoJsonCompactor';
-import { convertOverlaySourceToGeoJson } from './OverlaySourceConverter';
+import { StringCompressor, logger as rootLogger, scalarToString } from "places-shared/utils";
+import { compactGeoJson } from 'places/core';
+import { convertOverlaySourceToGeoJson } from 'places/core';
 
 const logger = rootLogger.scope('Overlays');
 
@@ -14,12 +14,13 @@ export type OverlayCacheRebuildOutcome =
 // The cache is precomputed GeoJSON and takes precedence over the source when a
 // map renders: anything missing from the cache is invisible even when the
 // source still has it. A track cached before Places carried per-point
-// timestamps cannot colour by speed or pace until its cache is regenerated.
+// timestamps cannot color by speed or pace until its cache is regenerated.
 // The source is never touched.
 export async function rebuildOverlayCache(app: App, file: TFile): Promise<OverlayCacheRebuildOutcome> {
   const frontmatter = app.metadataCache.getFileCache(file)?.frontmatter;
   const source = scalarToString(frontmatter?.['Overlay Source']);
   const existingCache = scalarToString(frontmatter?.['Overlay Cache']);
+
   if (!source || !existingCache) return { kind: 'skipped' };
 
   try {
@@ -32,9 +33,11 @@ export async function rebuildOverlayCache(app: App, file: TFile): Promise<Overla
     await app.fileManager.processFrontMatter(file, (matter: Record<string, unknown>) => {
       matter['Overlay Cache'] = rebuilt;
     });
+
     return { kind: 'updated', hasTimestamps };
   } catch (error) {
     logger.error(`Failed to rebuild Overlay Cache for ${file.path}`, error);
+
     return { kind: 'failed', error };
   }
 }
@@ -58,7 +61,9 @@ export class OverlayCacheRebuilder {
     try {
       for (let index = 0; index < files.length; index++) {
         const outcome = await rebuildOverlayCache(this.app, files[index]);
+
         recordOutcome(tally, outcome);
+
         if (index % 25 === 0) {
           progress.setMessage(`Rebuilding overlay caches... ${index + 1}/${files.length}`);
         }
@@ -74,8 +79,10 @@ export class OverlayCacheRebuilder {
 
 function recordOutcome(tally: RebuildTally, outcome: OverlayCacheRebuildOutcome): void {
   if (outcome.kind === 'skipped') return;
+
   if (outcome.kind === 'failed') {
     tally.failed++;
+
     return;
   }
 
@@ -88,15 +95,11 @@ function recordOutcome(tally: RebuildTally, outcome: OverlayCacheRebuildOutcome)
 
 function summarize(tally: RebuildTally): string {
   const lines = [`Overlay caches: ${tally.updated} rebuilt, ${tally.unchanged} already current.`];
-  if (tally.withTimestamps > 0) {
-    lines.push(`${tally.withTimestamps} carry per-point timestamps and can colour by speed or pace.`);
-  }
-  if (tally.withoutTimestamps > 0) {
-    lines.push(`${tally.withoutTimestamps} have no timestamps in their source, so speed and pace stay unavailable for them.`);
-  }
+
   if (tally.failed > 0) {
     lines.push(`${tally.failed} failed - see the console for details.`);
   }
+
   return lines.join('\n');
 }
 
@@ -105,14 +108,18 @@ export async function rebuildOverlayCacheForFile(app: App, file: TFile): Promise
 
   switch (outcome.kind) {
     case 'skipped':
-      new Notice('This note has no precomputed Overlay Cache to rebuild.');
+      new Notice('No overlay cache to rebuild.');
+
       return;
     case 'failed':
       new Notice('Failed to rebuild the overlay cache - see the console for details.');
+
       return;
-    default:
-      new Notice(outcome.hasTimestamps
-        ? 'Overlay cache rebuilt; this track can colour by speed and pace.'
-        : 'Overlay cache rebuilt. Its source has no timestamps, so speed and pace stay unavailable.');
+    case 'unchanged':
+      new Notice('Overlay cache is already current.');
+
+      return;
+    case 'updated':
+      new Notice('Overlay cache rebuilt.');
   }
 }

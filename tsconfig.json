@@ -17,7 +17,18 @@
       "DOM.Iterable",
       "ES2020"
     ],
-    "skipLibCheck": true
+    "skipLibCheck": true,
+    "paths": {
+      "places/core": [
+        "./src/core/index.ts"
+      ],
+      "places/core/charts": [
+        "./src/core/charts/index.ts"
+      ],
+      "places/core/strategies": [
+        "./src/core/strategies/index.ts"
+      ]
+    }
   },
   "include": [
     "src/**/*.ts",

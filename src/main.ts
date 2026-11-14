@@ -1,27 +1,46 @@
-import { logger as rootLogger, clamp, installPlacesGlobalErrorCapture } from "places-shared/utils";
-import { DEFAULT_SPEED_WINDOW, parseMetricWindow } from "places-shared/settings";
-import { setSpeedWindow } from "./services/TrackPointProcessor";
+import { Component, MarkdownRenderer, loadPrism } from 'obsidian';
+import { formatMetersInSystem, meters } from "places-shared/units";
+import { trackPreparation } from './services/TrackPreparationWorker';
+import { logger as rootLogger, clamp } from "places-shared/utils";
+import { installPlacesGlobalErrorCapture } from "./services/GlobalErrorCapture";
+import { CodeBlockReader, DEFAULT_SPEED_WINDOW, parseMetricWindow } from "places-shared/settings";
+import { applyBlockWidth } from "places-shared/obsidian/ui";
+import { setSpeedWindow } from 'places/core';
 import { normalizeConsoleLogLevel } from 'obsidian-debug-logger';
-import { App, Editor, Events, MarkdownPostProcessorContext, Notice, Plugin, addIcon, Platform, stringifyYaml } from "obsidian";
+import { App, DataAdapter, Editor, Events, MarkdownPostProcessorContext, Notice, Plugin, addIcon, Platform, requestUrl, setIcon, stringifyYaml } from "obsidian";
 import { createPlacesCompletionExtension } from "./editor/PlacesCompletionExtension";
 import { placesHighlightPlugin } from "./editor/PlacesHighlightExtension";
+import { getVaultQueryAPI, VAULTQUERY_API_READY_EVENT, type SqlSyntax } from 'vaultquery/api';
 import { placesIndentExtension } from "./editor/PlacesIndentExtension";
 import { AggregatorApiService } from "./places-services/AggregatorApiService";
-import { TileCache, configureMarkerIconRules, resolveTerrainDemSpec, type TerrainDemResolution, type TerrainDemSpec } from "places-shared/map";
-import { IPlacesPluginSettings, DEFAULT_SETTINGS, type IPlacesExtensionHostSettings } from "places-shared/settings";
-import { IPlacesService, IMapBlockProcessor, IElevationService, ITrackMatchService, type IPlacesHostServices, PLACES_EXTENSION_READY_EVENT, PLACES_EXTENSION_UNLOADED_EVENT, PLACES_EXTENSION_API_VERSION, type IPlacePluginExtension, type IPlacePluginExtensionExports, type ImageAlignmentProcessor, type RouteOverlayService, type ISnapService, type ITerrainDemProvider, type PlaceProviderExport, type PlaceExtensionReadyEvent, type PlaceExtensionUnloadedEvent, type ExtensionSettingsGroup } from "places-shared/services";
+import { configureOverlayDecodeCache } from "./services/OverlayDecodeCache";
+import { CURRENT_MARKER_ICON_RULES_REVISION, CURRENT_WAYPOINT_ICON_MAPPINGS_REVISION, configureMarkerIconRules, configureWaypointIconMappings, resolveTerrainDemSpec, resolveTerrainRuntime, upgradeMarkerIconRules, upgradeWaypointIconMappings, type PopupRenderer, type TerrainDemResolution, type TerrainRuntime } from "places-shared/map";
+import { TileCache } from "places-shared/obsidian/map";
+import { IPlacesPluginSettings, DEFAULT_SETTINGS, DEFAULT_TILE_CACHE_DURATION_HOURS, isPopupRendererId, type IPlacesExtensionHostSettings } from "places-shared/settings";
+import { API_USAGE_SERVICES, IPlacesService, IMapBlockProcessor, IElevationService, ITrackMatchService, type ApiUsageOrigin, type RouteOverlayService, type ISnapService, type ITerrainDemProvider } from "places-shared/services";
+import { type IPlacesHostServices, PLACES_EXTENSION_READY_EVENT, PLACES_EXTENSION_UNLOADED_EVENT, PLACES_EXTENSION_API_VERSION, type IPlacePluginExtension, type IPlacePluginExtensionExports, type ImageAlignmentProcessor, type PlaceProviderExport, type PlaceExtensionReadyEvent, type PlaceExtensionUnloadedEvent, type ExtensionSettingsGroup } from "places-shared/obsidian/services";
 import { ServiceRegistry } from "./services/ServiceRegistry";
 import { PluginDiscoveryService } from "./services/PluginDiscoveryService";
-import { renderError, SessionCacheStorage, getErrorMessage, configureRequestLogging, setOverlayCompressionLevel } from "places-shared/utils";
+import { renderError, SessionCacheStorage, getErrorMessage, configureRequestLogging, configureUrlRequester, setOverlayCompressionLevel } from "places-shared/utils";
+import { canOpenDevicePaths, configureResourceUrls } from "places-shared/obsidian/utils";
+import { setDevicePathsOpenable } from "places-shared/map";
+import { configureHostPrimitives } from "places-shared/services";
+import { DebugLogFile } from "./services/DebugLogFile";
+import { renderPopupContent } from "places-shared/obsidian/map";
 import { initOverlayCompression } from "places-shared/compression";
 import { PlacesSettingsTab } from "./PlacesSettingsTab";
+import { createImagePopupRenderer } from "./popup/ImagePopupRenderer";
+import { readKnapTemplateFile } from "places-shared/obsidian/services";
+import { createKnapPopupRenderer } from "./popups/KnapPopupRenderer";
+import type { VectorTileOverlayPreset } from "places-shared/overlay";
 import { PlaceDataService } from "./services/PlaceDataService";
 import { TrackDataService } from "./services/TrackDataService";
+import { OverlayService } from "./services/OverlayService";
 import { PlacesTrackingDecorator } from "./places-services/PlacesTrackingDecorator";
 import { PlacesCachingDecorator } from "./places-services/PlacesCachingDecorator";
 import { ElevationTrackingDecorator } from "./elevation-services/ElevationTrackingDecorator";
 import { ElevationCachingDecorator } from "./elevation-services/ElevationCachingDecorator";
-import { OverlayImportService } from "./services/OverlayImportService";
+import { OverlayImportService } from 'places/core';
 import { DragDropHandler } from "./DragDropHandler";
 import { PlacesChartBlockProcessor } from "./code-block-processor/PlacesChartBlockProcessor";
 import { SimilarTracksBlockProcessor } from "./code-block-processor/SimilarTracksBlockProcessor";
@@ -31,26 +50,37 @@ import { PlacesHelpCodeBlockProcessor } from "./code-block-processor/PlacesHelpC
 import { HeatmapBlockProcessor } from "./code-block-processor/HeatmapBlockProcessor";
 import { PlacesParametersBlockProcessor } from "./code-block-processor/PlacesParametersBlockProcessor";
 import { BlockParameterSupport } from "./services/BlockParameters";
+import { readNoteProperties } from './services/NoteProperties';
+import { recordSourcePathCreation } from './services/SourcePathRenames';
+import { CodeBlockStartup } from './services/CodeBlockStartup';
 import { PlacesReferenceCodeBlockProcessor } from "./code-block-processor/PlacesReferenceCodeBlockProcessor";
 import { CodeBlockRegistry, MAIN_PLUGIN_DEFINITIONS, MAIN_PLUGIN_HIGHLIGHT_CONFIGS } from "./services/CodeBlockRegistry";
 import { renderMapSurface, withHostCapabilities } from "./services/MapSurfaceRenderer";
-import { getMapSurfaceController } from "./services/MapSurfaceControllers";
+import { cleanupMapContainer } from "./services/MapSurfaceCleanup";
+import { getMapSurfaceController, retryMapSurfacesWaitingForProvider } from "./services/MapSurfaceControllers";
 import { buildHostSurfaceRenderOptions } from "./services/HostSurfacePlan";
 import { PlacesBasesView } from "./bases/PlacesBasesView";
+import { PlaceLabelCaches } from './services/LabelResultCache';
 import { VaultQueryService } from "./services/VaultQueryService";
-import { MapRefreshService } from "./services/MapRefreshService";
+import { MapRefreshService, type BlockFileChange } from "./services/MapRefreshService";
+import { ExtensionReloadScheduler } from "./services/ExtensionReloadScheduler";
 import type { Coordinate } from "places-shared/geo";
 import { resolveMapSettings } from "./services/MapSettingsResolver";
 import { TemplateNoteService } from "./services/TemplateNoteService";
 import { PlaceNoteCreationService } from "./services/PlaceNoteCreationService";
 import { TemplateRenameQueue } from "./services/TemplateReferenceRenamer";
 import { BlockRefreshRegistry } from "./services/BlockRefreshRegistry";
+import { splitExtensionBlockSource } from "./code-block-processor/ExtensionBlockSource";
 import { registerRefreshableCodeBlock, createOwnNoteEditRefreshGuard } from "./code-block-processor/RefreshableCodeBlock";
 import { RouteOverlayGenerator } from "./services/RouteOverlayGenerator";
-import { BlockSyntaxError, optionalStringSetting, parseCodeBlock } from "./services/CodeBlockParser";
+import { BlockSyntaxError } from "places-shared/settings";
+import { optionalStringSetting, parseCodeBlock } from 'places/core';
 import { CachedRouteOverlay, isCachedRouteOverlay, RouteOverlayCachingDecorator, ROUTE_OVERLAY_MAX_CACHE_ENTRIES, type RouteOverlayCacheStorage } from "./services/RouteOverlayCachingDecorator";
 import { RouteOverlayTrackingDecorator } from "./services/RouteOverlayTrackingDecorator";
 import { SnapTrackingDecorator } from "./services/SnapTrackingDecorator";
+import { TrackMatchTrackingDecorator } from "./services/TrackMatchTrackingDecorator";
+import { ApiUsageStore } from "./places-services/ApiUsageStore";
+import { OriginScopedServices } from "./services/OriginScopedServices";
 
 import { CliController } from "./controllers/CliController";
 import { CommandRegistrar } from "./controllers/CommandRegistrar";
@@ -59,10 +89,12 @@ import { PlaceNoteController } from "./controllers/PlaceNoteController";
 import { ProtocolController } from "./controllers/ProtocolController";
 import { SnapBlockProcessor } from "./code-block-processor/SnapBlockProcessor";
 import { NoteParameterRegistry, QueryParameterState, SharedSelectionService } from "./services/QueryParameterState";
+import { toProviderStyles, type ProviderStyle } from "./services/ProviderStyles";
 import { applyExternalParameterValue } from "./ui/ParameterStrip";
 import { ElevationBlockProcessor } from "./code-block-processor/ElevationBlockProcessor";
 
 import "./styles.css";
+import "places-shared/block-styles.css";
 import "places-shared/error-styles.css";
 import "places-shared/loading-styles.css";
 import "places-shared/settings-trace-styles.css";
@@ -71,6 +103,7 @@ import "places-shared/popup-styles.css";
 import "places-shared/search-styles.css";
 import "places-shared/waypoint-styles.css";
 import "places-shared/button-styles.css";
+import "places-shared/device-position-styles.css";
 import "./generated-help/styles.generated.css";
 
 const logger = {
@@ -87,6 +120,7 @@ const logger = {
 function isExtensionReadyEvent(value: unknown): value is PlaceExtensionReadyEvent {
   if (!value || typeof value !== 'object') return false;
   const event = value as Partial<PlaceExtensionReadyEvent>;
+
   return typeof event.pluginId === 'string'
     && event.pluginId.startsWith('places-')
     && typeof event.extension?.getPlaceExports === 'function';
@@ -115,32 +149,47 @@ interface ObsidianPluginWithBasesViewRegistration {
   }): void;
 }
 
+const ROUTE_OVERLAY_CACHE_FILE = 'route-overlay-cache.json';
 
-interface PlacesPluginData extends Partial<IPlacesPluginSettings> {
-  routeOverlayCache?: Record<string, unknown>;
-}
+class RouteOverlayCacheFile implements RouteOverlayCacheStorage {
+  private writing: Promise<void> = Promise.resolve();
 
-class DataJsonRouteOverlayCacheStorage implements RouteOverlayCacheStorage {
-  constructor(
-    private readonly cache: Record<string, CachedRouteOverlay>,
-    private readonly saveData: () => Promise<void>,
-  ) {}
+  constructor(private readonly cache: Record<string, CachedRouteOverlay>, private readonly adapter: DataAdapter, private readonly path: string) {}
+
+  static async read(adapter: DataAdapter, path: string): Promise<Record<string, CachedRouteOverlay>> {
+    try {
+      if (!(await adapter.exists(path))) return {};
+
+      return normalizeRouteOverlayCache(JSON.parse(await adapter.read(path)) as Record<string, unknown>);
+    } catch (error) {
+      logger.settings.warn('Route overlay cache could not be read', error);
+
+      return {};
+    }
+  }
+
+  private async saveData(): Promise<void> {
+    this.writing = this.writing
+      .then(() => this.adapter.write(this.path, JSON.stringify(this.cache)))
+      .catch((error: unknown) => { logger.settings.warn('Route overlay cache could not be written', error); });
+
+    await this.writing;
+  }
 
   get(key: string): CachedRouteOverlay | null {
     const entry = this.cache[key];
+
     if (isCachedRouteOverlay(entry)) return entry;
     if (entry !== undefined) delete this.cache[key];
+
     return null;
   }
 
   async set(key: string, entry: CachedRouteOverlay): Promise<void> {
     this.cache[key] = entry;
     this.prune();
-    await this.saveData();
-  }
 
-  toJSON(): Record<string, CachedRouteOverlay> {
-    return this.cache;
+    await this.saveData();
   }
 
   private prune(): void {
@@ -159,6 +208,7 @@ class DataJsonRouteOverlayCacheStorage implements RouteOverlayCacheStorage {
 
 function normalizeRouteOverlayCache(raw: Record<string, unknown> | undefined): Record<string, CachedRouteOverlay> {
   const cache: Record<string, CachedRouteOverlay> = {};
+
   if (!raw || typeof raw !== "object") return cache;
 
   for (const [key, entry] of Object.entries(raw)) {
@@ -171,49 +221,58 @@ function normalizeRouteOverlayCache(raw: Record<string, unknown> | undefined): R
 }
 
 export default class PlacesPlugin extends Plugin {
+  private readonly basesLabelCaches = new PlaceLabelCaches();
   private readonly sharedSelections = new SharedSelectionService();
+  private debugLogFile: DebugLogFile | null = null;
+  private settingsUnreadable = false;
+  private settingsTab: PlacesSettingsTab | null = null;
   private static _settings: IPlacesPluginSettings;
   private static _instance: PlacesPlugin;
   private static apiStatsSaveTimer: number | null = null;
   private static apiStatsDirty = false;
   private static readonly API_STATS_SAVE_DEBOUNCE_MS = 60000;
 
+  static getSqlSyntax(): SqlSyntax | undefined {
+    const app = PlacesPlugin._instance?.app;
+
+    return app ? getVaultQueryAPI(app)?.sqlSyntax : undefined;
+  }
+
   static get settings(): IPlacesPluginSettings {
     return PlacesPlugin._settings;
   }
 
-  static publishSelection(sourcePath: string, selection: import('places-shared/services').SharedSelection | undefined, channel?: string): void {
+  static publishSelection(sourcePath: string, selection: import('places-shared/obsidian/services').SharedSelection | undefined, channel?: string): void {
     PlacesPlugin._instance?.sharedSelections.publish(sourcePath, selection, channel);
   }
 
-  static subscribeSelection(sourcePath: string, handler: (selection: import('places-shared/services').SharedSelection | undefined) => void, channel?: string): () => void {
+  static subscribeSelection(sourcePath: string, handler: (selection: import('places-shared/obsidian/services').SharedSelection | undefined) => void, channel?: string): () => void {
     return PlacesPlugin._instance?.sharedSelections.subscribe(sourcePath, handler, channel) ?? (() => {});
   }
 
-  // This list must mirror the one in `onload` - a setting configured only at
-  // load takes effect on the next restart rather than on save. The reach is
-  // the main plugin's bundle only:
-  // provider bundles read `developerMode` once, in `getPlaceExports`, and a
-  // developer-mode change reaches their HTTP logging on reload.
   static async saveSettings(): Promise<void> {
     PlacesPlugin.configureTileCache();
+    PlacesPlugin.configureOverlayDecodeCache();
     configureMarkerIconRules(PlacesPlugin._settings.markerIconRules);
+    configureWaypointIconMappings(PlacesPlugin._settings.waypointIconMappings);
     rootLogger.configure(PlacesPlugin._settings.consoleLogLevel);
     configureRequestLogging(PlacesPlugin._settings.developerMode);
     setOverlayCompressionLevel(PlacesPlugin._settings.overlayCompressionLevel);
     PlacesPlugin.applyMetricWindowSettings();
+    await PlacesPlugin._instance?.applyDebugLogFileSetting();
+
     await PlacesPlugin.savePluginData();
   }
 
   static async savePluginData(): Promise<void> {
-    await PlacesPlugin._instance.saveData({
-      ...PlacesPlugin._settings,
-      routeOverlayCache: PlacesPlugin._instance.routeOverlayCacheStorage.toJSON(),
-    });
+    if (PlacesPlugin._instance.settingsUnreadable) return;
+
+    await PlacesPlugin._instance.saveData({ ...PlacesPlugin._settings });
   }
 
   static scheduleApiStatsSave(): void {
     PlacesPlugin.apiStatsDirty = true;
+
     if (PlacesPlugin.apiStatsSaveTimer !== null) {
       return;
     }
@@ -221,6 +280,12 @@ export default class PlacesPlugin extends Plugin {
     PlacesPlugin.apiStatsSaveTimer = window.setTimeout(() => {
       void PlacesPlugin.flushApiStatsSave();
     }, PlacesPlugin.API_STATS_SAVE_DEBOUNCE_MS);
+  }
+
+  async resetApiStats(): Promise<void> {
+    this.apiUsage.clear();
+
+    await PlacesPlugin.savePluginData();
   }
 
   static async flushApiStatsSave(rescheduleOnError = true): Promise<void> {
@@ -234,11 +299,13 @@ export default class PlacesPlugin extends Plugin {
     }
 
     PlacesPlugin.apiStatsDirty = false;
+
     try {
       await PlacesPlugin.saveSettings();
     } catch (error) {
       PlacesPlugin.apiStatsDirty = true;
       logger.settings.error('Failed to save API usage statistics', error);
+
       if (rescheduleOnError) {
         PlacesPlugin.scheduleApiStatsSave();
       }
@@ -256,6 +323,14 @@ export default class PlacesPlugin extends Plugin {
     }
   }
 
+  static configureOverlayDecodeCache(): void {
+    configureOverlayDecodeCache({
+      maxSizeMB: Platform.isMobile
+        ? PlacesPlugin._settings.overlayCacheMaxSizeMBMobile
+        : PlacesPlugin._settings.overlayCacheMaxSizeMBDesktop,
+    });
+  }
+
   static configureTileCache(): void {
     TileCache.configure({
       durationHours: Platform.isMobile
@@ -268,32 +343,52 @@ export default class PlacesPlugin extends Plugin {
     });
   }
 
+  private registerTileUsageTracking(): void {
+    TileCache.configureUsageSink(event => {
+      this.apiUsage.record({
+        provider: event.provider,
+        service: API_USAGE_SERVICES.tiles,
+        success: event.success,
+        durationMs: 0,
+        ...(event.network ? {} : { cached: true }),
+      });
+    });
+  }
+
   static getMapProvider(providerName: string): IMapBlockProcessor | undefined {
     return PlacesPlugin._instance?.mapBlockProcessors.get(providerName);
   }
 
-  static getMapProviderDefaults(providerName: string): import('places-shared/settings').MapConfigPatch {
+  static getMapProviderDefaults(providerName: string): import('places-shared/obsidian/settings').MapConfigPatch {
     return PlacesPlugin._instance?.mapProviderDefaults.get(providerName) ?? {};
   }
 
-  static getSnapService(providerName: string): ISnapService | undefined {
-    return PlacesPlugin._instance?.snapServices.get(providerName);
+  static getSnapService(providerName: string, origin?: ApiUsageOrigin): ISnapService | undefined {
+    if (!origin) return PlacesPlugin._instance?.snapServices.get(providerName);
+
+    return PlacesPlugin._instance?.originScopedSnap.get(providerName, origin);
   }
 
-  static getFirstSnapService(): ISnapService | undefined {
-    return PlacesPlugin._instance?.snapServices.getFirst();
+  static getFirstSnapService(origin?: ApiUsageOrigin): ISnapService | undefined {
+    const first = PlacesPlugin._instance?.snapServices.getNames()[0];
+
+    return first === undefined ? undefined : PlacesPlugin.getSnapService(first, origin);
   }
 
   static getSnapServiceNames(): string[] {
     return PlacesPlugin._instance?.snapServices.getNames() ?? [];
   }
 
-  static getElevationService(providerName: string): IElevationService | undefined {
-    return PlacesPlugin._instance?.elevationServices.get(providerName);
+  static getElevationService(providerName: string, origin?: ApiUsageOrigin): IElevationService | undefined {
+    if (!origin) return PlacesPlugin._instance?.elevationServices.get(providerName);
+
+    return PlacesPlugin._instance?.originScopedElevation.get(providerName, origin);
   }
 
-  static getFirstElevationService(): IElevationService | undefined {
-    return PlacesPlugin._instance?.elevationServices.getFirst();
+  static getFirstElevationService(origin?: ApiUsageOrigin): IElevationService | undefined {
+    const first = PlacesPlugin._instance?.elevationServices.getNames()[0];
+
+    return first === undefined ? undefined : PlacesPlugin.getElevationService(first, origin);
   }
 
   static getElevationServiceNames(): string[] {
@@ -308,8 +403,18 @@ export default class PlacesPlugin extends Plugin {
     return PlacesPlugin._instance?.getRegisteredMapTools() ?? [];
   }
 
-  static getTrackMatchService(providerName: string): ITrackMatchService | undefined {
-    return PlacesPlugin._instance?.trackMatchServices.get(providerName);
+  static getPopupRenderers(): readonly PopupRenderer[] {
+    return PlacesPlugin._instance?.getRegisteredPopupRenderers() ?? [];
+  }
+
+  static getOverlayPreset(id: string): VectorTileOverlayPreset | undefined {
+    return PlacesPlugin._instance?.registeredOverlayPresets.get(id);
+  }
+
+  static getTrackMatchService(providerName: string, origin?: ApiUsageOrigin): ITrackMatchService | undefined {
+    if (!origin) return PlacesPlugin._instance?.trackMatchServices.get(providerName);
+
+    return PlacesPlugin._instance?.originScopedTrackMatch.get(providerName, origin);
   }
 
   // Setting `terrainProvider` enables terrain; leaving it empty disables it.
@@ -328,35 +433,18 @@ export default class PlacesPlugin extends Plugin {
     return PlacesPlugin._instance?.terrainDemProviders.getNames() ?? [];
   }
 
-  // Without an explicit DEM, relief is on only where the chosen map provider
-  // supplies elevation (mapbox, maptiler, stadia), and silently absent otherwise.
-  // `reliefProvider` feeds the relief layers alone, leaving terrainDem unset so
-  // the map stays flat: only terrainDem raises the 3D mesh and pitch.
-  static resolveTerrainRuntime(config: import('places-shared/settings').ResolvedMapConfig): {
-    terrainDem?: TerrainDemSpec;
-    reliefDem?: TerrainDemSpec;
-    errors: Array<{ path: string; error: string }>;
-  } {
-    const terrain = PlacesPlugin.resolveTerrainDem(config.terrainProvider);
-    const errors: Array<{ path: string; error: string }> = [];
-    if (terrain.error) errors.push({ path: 'terrain.provider', error: terrain.error });
-
-    const relief = config.reliefProvider.trim() ? PlacesPlugin.resolveTerrainDem(config.reliefProvider) : undefined;
-    if (relief?.error) errors.push({ path: 'terrain.reliefProvider', error: relief.error });
-
-    const reliefWanted = config.hillshadeIntensity > 0 || config.colorReliefOpacity > 0;
-    const reliefDem = !reliefWanted
-      ? undefined
-      : relief
-        ? relief.dem
-        : config.terrainProvider.trim()
-          ? terrain.dem
-          : (PlacesPlugin._instance?.terrainDemProviders.get(config.mapProvider)?.getDemSource() ?? undefined);
-    return { terrainDem: terrain.dem, reliefDem, errors };
+  static resolveTerrainRuntime(config: import('places-shared/obsidian/settings').ResolvedMapConfig): TerrainRuntime {
+    return resolveTerrainRuntime(
+      config,
+      (name) => PlacesPlugin._instance?.terrainDemProviders.get(name)?.getDemSource(),
+      () => PlacesPlugin._instance?.terrainDemProviders.getNames() ?? [],
+    );
   }
 
-  static getFirstTrackMatchService(): ITrackMatchService | undefined {
-    return PlacesPlugin._instance?.trackMatchServices.getFirst();
+  static getFirstTrackMatchService(origin?: ApiUsageOrigin): ITrackMatchService | undefined {
+    const first = PlacesPlugin._instance?.trackMatchServices.getNames()[0];
+
+    return first === undefined ? undefined : PlacesPlugin.getTrackMatchService(first, origin);
   }
 
   static getTrackMatchServiceNames(): string[] {
@@ -390,31 +478,80 @@ export default class PlacesPlugin extends Plugin {
   private placesServices = new ServiceRegistry<IPlacesService>();
   private placesServiceAggregator = new AggregatorApiService(this.placesServices);
   private mapBlockProcessors = new ServiceRegistry<IMapBlockProcessor>();
-  private mapProviderDefaults = new ServiceRegistry<import('places-shared/settings').MapConfigPatch>();
+  private mapProviderDefaults = new ServiceRegistry<import('places-shared/obsidian/settings').MapConfigPatch>();
   private elevationServices = new ServiceRegistry<IElevationService>();
   private routeOverlayServices = new ServiceRegistry<RouteOverlayService>();
   private snapServices = new ServiceRegistry<ISnapService>();
   private trackMatchServices = new ServiceRegistry<ITrackMatchService>();
+  private readonly rawPlacesServices = new Map<string, IPlacesService>();
+  private readonly rawElevationServices = new Map<string, IElevationService>();
+  private readonly rawRouteOverlayServices = new Map<string, RouteOverlayService>();
+  private readonly rawSnapServices = new Map<string, ISnapService>();
+  private readonly rawTrackMatchServices = new Map<string, ITrackMatchService>();
+  private readonly originScopedPlaces = new OriginScopedServices<IPlacesService>((name, origin) => {
+    const raw = this.rawPlacesServices.get(name.toLowerCase());
+
+    return raw && this.wrapPlacesService(raw, name.toLowerCase(), origin);
+  });
+  private readonly originScopedElevation = new OriginScopedServices<IElevationService>((name, origin) => {
+    const raw = this.rawElevationServices.get(name.toLowerCase());
+
+    return raw && this.wrapElevationService(raw, name.toLowerCase(), origin);
+  });
+  private readonly originScopedRouteOverlay = new OriginScopedServices<RouteOverlayService>((name, origin) => {
+    const raw = this.rawRouteOverlayServices.get(name.toLowerCase());
+
+    return raw && this.wrapRouteOverlayService(raw, name.toLowerCase(), origin);
+  });
+  private readonly originScopedSnap = new OriginScopedServices<ISnapService>((name, origin) => {
+    const raw = this.rawSnapServices.get(name.toLowerCase());
+
+    return raw && new SnapTrackingDecorator(raw, name.toLowerCase(), this.apiUsage, origin);
+  });
+  private readonly originScopedTrackMatch = new OriginScopedServices<ITrackMatchService>((name, origin) => {
+    const raw = this.rawTrackMatchServices.get(name.toLowerCase());
+
+    return raw && new TrackMatchTrackingDecorator(raw, name.toLowerCase(), this.apiUsage, origin);
+  });
+  private readonly originScopedAggregators = new OriginScopedServices<AggregatorApiService>((_providerName, origin) => new AggregatorApiService({
+    getAll: () => this.placesServices.getNames()
+      .map(name => this.originScopedPlaces.get(name, origin))
+      .filter((service): service is IPlacesService => service !== undefined),
+  }));
+  private readonly apiUsage = new ApiUsageStore(
+    () => ({ stats: PlacesPlugin.settings.apiStats, origins: PlacesPlugin.settings.apiOrigins }),
+    () => PlacesPlugin.scheduleApiStatsSave(),
+  );
   private terrainDemProviders = new ServiceRegistry<ITerrainDemProvider>();
-  private providerStyles = new ServiceRegistry<string[]>();
+  private providerStyles = new ServiceRegistry<ProviderStyle[]>();
   private imageAlignmentProcessors = new ServiceRegistry<ImageAlignmentProcessor>();
+  private imageAlignmentOverlayService?: OverlayService;
   private extensionSettingsGroups: Record<string, ExtensionSettingsGroup> = {};
   // Session caches outlive extension re-initialization.
   private readonly apiCacheStorage = new SessionCacheStorage();
   private readonly elevationCacheStorage = new SessionCacheStorage();
-  private routeOverlayCacheStorage!: DataJsonRouteOverlayCacheStorage;
+  private routeOverlayCacheStorage!: RouteOverlayCacheFile;
   private readonly extensionCodeBlockHandlers = new Map<string, (source: string, el: HTMLElement, ctx: MarkdownPostProcessorContext) => void | Promise<void>>();
-  // Per-block-type `colonTextKeys`: the host's pre-parse accepts the same value syntax the processor does.
+  private readonly extensionSourceFormats = new Map<string, 'yaml' | 'yaml-template'>();
+  private readonly extensionIndexDependencies = new Map<string, 'notes'>();
   private readonly extensionColonTextKeys = new Map<string, readonly string[]>();
   private readonly registeredExtensionBlockTypes = new Set<string>();
   private extensionCommandIds = new Set<string>();
   private extensionCommandHelp: Array<{ name: string; description: string }> = [];
   private commandRegistrar!: CommandRegistrar;
   private registeredProviderExports: PlaceProviderExport[] = [];
+  private registeredPopupRenderers: PopupRenderer[] = [];
+  private registeredOverlayPresets = new Map<string, VectorTileOverlayPreset>();
+  private readonly extensionInstances = new Map<string, IPlacePluginExtension>();
   private readonly extensionExports = new Map<string, { name: string; exports: IPlacePluginExtensionExports }>();
   private readonly versionMismatchWarned = new Set<string>();
+  private readonly extensionReloads = new ExtensionReloadScheduler(
+    pluginIds => this.reloadExtensions(pluginIds),
+    500,
+    error => logger.extensions.error('Failed to apply extension settings', error),
+  );
   private blockRefreshTimer: number | null = null;
-  private pendingBlockRefreshPaths = new Set<string>();
+  private pendingBlockRefreshChanges = new Map<string, BlockFileChange>();
 
   private dragDropHandler!: DragDropHandler;
   private placesChartBlockProcessor!: PlacesChartBlockProcessor;
@@ -442,11 +579,15 @@ export default class PlacesPlugin extends Plugin {
     return PlacesPlugin._instance.placesServiceAggregator;
   }
 
-  // "Search for a place here", stamped onto every render plan.
-  static get reverseGeocodeHost(): (coordinate: Coordinate) => void {
-    return (coordinate) => PlacesPlugin._instance.protocolController.openReverseGeocode(coordinate);
+  static placesServiceFor(origin: ApiUsageOrigin): AggregatorApiService {
+    return PlacesPlugin._instance?.originScopedAggregators.get('all', origin) ?? PlacesPlugin._instance.placesServiceAggregator;
+  }
+
+  static get reverseGeocodeHost(): (coordinate: Coordinate, sourcePath?: string) => void {
+    return (coordinate, sourcePath) => PlacesPlugin._instance.protocolController.openReverseGeocode(coordinate, sourcePath);
   }
   private helpCodeBlockProcessor!: PlacesHelpCodeBlockProcessor;
+  private codeBlockStartup!: CodeBlockStartup;
   private vaultQueryService!: VaultQueryService;
   private routeOverlayGenerator!: RouteOverlayGenerator;
   private vaultQueryUnsubscribe: (() => void) | null = null;
@@ -456,23 +597,55 @@ export default class PlacesPlugin extends Plugin {
 
   async onload() {
     PlacesPlugin._instance = this;
+    this.codeBlockStartup = new CodeBlockStartup(this.app, (error, el) => {
+      rootLogger.error('Error rendering block after startup:', error);
+      renderError(el, { title: 'Error loading block', message: getErrorMessage(error) });
+    });
+    this.register(() => this.codeBlockStartup.cleanup());
+    configureHostPrimitives({
+      setIcon,
+      notify: (message: string) => new Notice(message),
+      isMobile: Platform.isMobile,
+      renderNoteContent: (place, container) => renderPopupContent(this.app, place, container),
+      renderMarkdown: (markdown, container, sourcePath, owner) => {
+        const component = new Component();
+
+        component.load();
+        owner.register(() => component.unload());
+
+        return MarkdownRenderer.render(this.app, markdown, container, sourcePath, component);
+      },
+      prepareCodeHighlighting: loadPrism,
+    });
+    configureUrlRequester(requestUrl);
+    configureResourceUrls(this.app);
+    setDevicePathsOpenable(canOpenDevicePaths(this.app));
     this.register(installPlacesGlobalErrorCapture(window));
-    const loadedData = await this.loadData() as PlacesPluginData | null;
-    this.routeOverlayCacheStorage = new DataJsonRouteOverlayCacheStorage(
-      normalizeRouteOverlayCache(loadedData?.routeOverlayCache),
-      () => PlacesPlugin.savePluginData(),
+    const loadedData = await this.loadData() as Partial<IPlacesPluginSettings> | null;
+
+    if (loadedData === null) await this.quarantineUnreadableSettings();
+    const cachePath = `${this.manifest.dir}/${ROUTE_OVERLAY_CACHE_FILE}`;
+
+    this.routeOverlayCacheStorage = new RouteOverlayCacheFile(
+      await RouteOverlayCacheFile.read(this.app.vault.adapter, cachePath),
+      this.app.vault.adapter,
+      cachePath,
     );
-    PlacesPlugin._settings = this.normalizeSettings({ ...DEFAULT_SETTINGS, ...(loadedData ?? {}) });
+    const loadedSettings: Partial<IPlacesPluginSettings> = { ...(loadedData ?? {}) };
+
+    delete (loadedSettings as { routeOverlayCache?: unknown }).routeOverlayCache;
+    PlacesPlugin._settings = this.normalizeSettings({ ...DEFAULT_SETTINGS, ...loadedSettings });
     PlacesPlugin._settings.consoleLogLevel = normalizeConsoleLogLevel(PlacesPlugin._settings.consoleLogLevel);
     PlacesPlugin.configureTileCache();
+    PlacesPlugin.configureOverlayDecodeCache();
+    this.registerTileUsageTracking();
     configureMarkerIconRules(PlacesPlugin._settings.markerIconRules);
+    configureWaypointIconMappings(PlacesPlugin._settings.waypointIconMappings);
     rootLogger.configure(PlacesPlugin._settings.consoleLogLevel);
     configureRequestLogging(PlacesPlugin._settings.developerMode);
+    void this.applyDebugLogFileSetting();
     setOverlayCompressionLevel(PlacesPlugin._settings.overlayCompressionLevel);
-    // Overlay Source / Overlay Cache decoding needs the Zstandard codec;
-    // awaited before any block renders. A failure disables overlay decode
-    // (StringCompressor throws where used) but must not take down the rest of
-    // the plugin.
+
     try {
       await initOverlayCompression();
     } catch (error) {
@@ -488,21 +661,23 @@ export default class PlacesPlugin extends Plugin {
     this.placeDataService = new PlaceDataService(this.app, this.trackDataService, this.vaultQueryService);
     this.routeOverlayGenerator = new RouteOverlayGenerator(
       this.app,
-      this.routeOverlayServices,
+      {
+        get: (name, origin) => origin ? this.originScopedRouteOverlay.get(name, origin) : this.routeOverlayServices.get(name),
+        getNames: () => this.routeOverlayServices.getNames(),
+      },
       this.vaultQueryService,
       () => PlacesPlugin.settings.defaultRouteLabelTemplate,
+      () => PlacesPlugin.settings.units,
     );
 
-    // Deliberately not awaited: it waits on another plugin's startup event and
-    // must never hold up this one.
-    this.vaultQueryService.initialize().catch(() => { /* VaultQuery not available */ });
+    this.vaultQueryService.initialize().catch(() => {   });
 
     new CliController(this.app, this.overlayImportService, this.trackImportController, () => PlacesPlugin.settings).register(this);
 
-    // Register before layout restore, letting Obsidian revive saved Bases map views.
     this.initializeBasesView();
 
     this.registerEditorExtension(placesHighlightPlugin);
+    this.registerEvent((this.app.workspace as Events).on(VAULTQUERY_API_READY_EVENT, () => this.app.workspace.updateOptions()));
     this.registerEditorExtension(placesIndentExtension);
     this.registerEditorExtension(createPlacesCompletionExtension({
       app: this.app,
@@ -517,70 +692,60 @@ export default class PlacesPlugin extends Plugin {
       resolveMapProvider: (explicitProvider) => PlacesPlugin.resolveMapProvider(explicitProvider),
     }));
 
-    // Register exports immediately: every registerMarkdownCodeBlockProcessor
-    // call after first paint re-renders each open preview.
     this.registerEvent((this.app.workspace as Events).on(PLACES_EXTENSION_READY_EVENT, (payload: unknown) => {
       if (!isExtensionReadyEvent(payload)) return;
       const event = payload;
+
       this.loadExtension(event.pluginId, event.extension);
       this.rebuildExtensionRegistries();
-      PlacesBasesView.refreshViewsWaitingForProviders();
+      this.settingsTab?.update();
     }));
 
-    // When the extension reloads, the ready event re-registers the new
-    // instance's exports.
     this.registerEvent((this.app.workspace as Events).on(PLACES_EXTENSION_UNLOADED_EVENT, (payload: unknown) => {
       if (!isExtensionUnloadedEvent(payload)) return;
       const event = payload;
-      this.disposeExtension(event.pluginId);
+
+      this.extensionInstances.delete(event.pluginId);
+      this.extensionReloads.cancel(event.pluginId);
+      void this.disposeExtension(event.pluginId);
       this.extensionExports.delete(event.pluginId);
       this.rebuildExtensionRegistries();
+      this.settingsTab?.update();
     }));
 
-    // Everything that registers a markdown processor runs here in onload, before
-    // the restored workspace renders, and every open note renders exactly once
-    // with all processors in place. Extensions that loaded before this plugin
-    // never fired a ready event this plugin could hear; the discovery scan picks
-    // them up.
     this.initializeExtensions();
     this.registerCodeBlockProcessors();
     this.commandRegistrar = new CommandRegistrar(
       this,
-      this.placesServiceAggregator,
+      sourcePath => PlacesPlugin.placesServiceFor({ sourcePath }),
       this.trackImportController,
       () => PlacesPlugin.settings,
       (file, place) => this.placeNoteController.sync(file, place),
     );
     this.commandRegistrar.register();
-    this.addSettingTab(new PlacesSettingsTab(this.app, this, this.extensionSettingsGroups));
+    this.settingsTab = new PlacesSettingsTab(this.app, this, this.extensionSettingsGroups);
+    this.addSettingTab(this.settingsTab);
     this.registerDragAndDrop();
     this.protocolController = new ProtocolController(
       this.app,
-      this.placesServiceAggregator,
+      sourcePath => PlacesPlugin.placesServiceFor({ sourcePath }),
       () => PlacesPlugin.settings,
-      (file, place) => this.placeNoteController.sync(file, place),
+      this.placeNoteCreationService,
     );
     this.protocolController.register(this);
     this.subscribeToVaultQueryEvents();
 
     this.app.workspace.onLayoutReady(() => {
-      // Insurance for load orders the event handler and onload scan cannot see;
-      // a no-op when every extension is already registered.
       this.initializeExtensions();
 
-      // A backstop for reattachment that raises no leaf change: reading view
-      // detaches offscreen sections and puts the same elements back. The
-      // active-leaf-change handler covers navigation, and a detached map is kept
-      // for a minute, so a sweep this side of that is soon enough.
       this.registerInterval(window.setInterval(() => {
         MapRefreshService.getInstance().checkAndRestoreMaps();
       }, 10000));
-
-      PlacesBasesView.refreshViewsWaitingForProviders();
     });
   }
 
   private normalizeSettings(settings: IPlacesPluginSettings): IPlacesPluginSettings {
+    delete (settings as unknown as Record<string, unknown>).defaultElevationService;
     settings.tileCacheDurationHoursDesktop = this.normalizeTileCacheDurationHours(settings.tileCacheDurationHoursDesktop);
     settings.tileCacheDurationHoursMobile = this.normalizeTileCacheDurationHours(settings.tileCacheDurationHoursMobile);
     settings.tileCacheMaxSizeMBDesktop = this.normalizeTileCacheMaxSizeMB(settings.tileCacheMaxSizeMBDesktop);
@@ -589,11 +754,16 @@ export default class PlacesPlugin extends Plugin {
     settings.newPlaceTagFilterPatterns = Array.isArray(settings.newPlaceTagFilterPatterns)
       ? settings.newPlaceTagFilterPatterns
       : DEFAULT_SETTINGS.newPlaceTagFilterPatterns;
+    settings.markerIconRules = upgradeMarkerIconRules(settings.markerIconRules, settings.markerIconRulesRevision);
+    settings.markerIconRulesRevision = CURRENT_MARKER_ICON_RULES_REVISION;
+    settings.waypointIconMappings = upgradeWaypointIconMappings(settings.waypointIconMappings, settings.waypointIconMappingsRevision);
+    settings.waypointIconMappingsRevision = CURRENT_WAYPOINT_ICON_MAPPINGS_REVISION;
+
     return settings;
   }
 
   private normalizeTileCacheDurationHours(value: number): number {
-    return Number.isFinite(value) ? clamp(Math.floor(value), 0, 999) : 0;
+    return Number.isFinite(value) ? clamp(Math.floor(value), 0, 999) : DEFAULT_TILE_CACHE_DURATION_HOURS;
   }
 
   private normalizeTileCacheMaxSizeMB(value: number | undefined): number {
@@ -604,42 +774,52 @@ export default class PlacesPlugin extends Plugin {
     if (!value || typeof value !== 'object') return {};
 
     const normalized: Record<string, boolean> = {};
+
     for (const [providerName, enabled] of Object.entries(value)) {
       const key = providerName.trim().toLowerCase();
+
       if (!key || typeof enabled !== 'boolean') continue;
       normalized[key] = enabled;
     }
+
     return normalized;
   }
 
-  // Extensions already loaded keep their instances: getPlaceExports constructs
-  // each provider's services. Unloads are handled by the unloaded event, not by
-  // this scan.
   private initializeExtensions() {
     let discovered = false;
+
     for (const { pluginId, extension } of new PluginDiscoveryService(this.app).discoverPlugins()) {
       if (this.extensionExports.has(pluginId)) continue;
       this.loadExtension(pluginId, extension);
       discovered = true;
     }
-    if (discovered) this.rebuildExtensionRegistries();
+
+    if (discovered) {
+      this.rebuildExtensionRegistries();
+      this.settingsTab?.update();
+    }
   }
 
   private loadExtension(pluginId: string, extension: IPlacePluginExtension): void {
     const apiVersion = extension.placesExtensionApiVersion;
+
     if (apiVersion !== PLACES_EXTENSION_API_VERSION) {
       if (!this.versionMismatchWarned.has(pluginId)) {
         this.versionMismatchWarned.add(pluginId);
         logger.extensions.error(`${pluginId} exposes Places extension API v${apiVersion ?? 'unknown'}; this plugin expects v${PLACES_EXTENSION_API_VERSION}.`);
         new Notice(`Places: ${pluginId} is incompatible with this version of Places and was skipped.`);
       }
+
       return;
     }
 
+    this.extensionInstances.set(pluginId, extension);
     const pluginName = pluginId.slice('places-'.length);
+
     PlacesPlugin.settings.extensionSettings[pluginName] ??= {};
-    this.disposeExtension(pluginId);
+    void this.disposeExtension(pluginId);
     this.extensionExports.delete(pluginId);
+
     try {
       const exports = extension.getPlaceExports(
         this.app,
@@ -647,9 +827,11 @@ export default class PlacesPlugin extends Plugin {
         extensionHostSettings(PlacesPlugin.settings),
         this.buildHostServices(),
       );
+
       if (exports.apiVersion !== PLACES_EXTENSION_API_VERSION) {
         throw new Error(`factory returned API v${exports.apiVersion ?? 'unknown'}`);
       }
+
       this.extensionExports.set(pluginId, { name: pluginName, exports });
     } catch (error) {
       this.extensionExports.delete(pluginId);
@@ -658,9 +840,36 @@ export default class PlacesPlugin extends Plugin {
     }
   }
 
-  private disposeExtension(pluginId: string): void {
+  scheduleExtensionReload(pluginName: string): void {
+    this.extensionReloads.schedule(`places-${pluginName}`);
+  }
+
+  scheduleAllExtensionReloads(): void {
+    this.extensionReloads.scheduleAll(this.extensionInstances.keys());
+  }
+
+  private async reloadExtensions(pluginIds: readonly string[]): Promise<void> {
+    if (pluginIds.length === 0) return;
+
+    for (const pluginId of pluginIds) {
+      const extension = this.extensionInstances.get(pluginId);
+
+      if (!extension) continue;
+      await this.disposeExtension(pluginId);
+      this.extensionExports.delete(pluginId);
+      this.loadExtension(pluginId, extension);
+    }
+
+    this.rebuildExtensionRegistries();
+
+    await MapRefreshService.getInstance().refreshAllBlocks({ force: true });
+  }
+
+  private async disposeExtension(pluginId: string): Promise<void> {
     const current = this.extensionExports.get(pluginId)?.exports;
+
     if (!current) return;
+
     for (const provider of current.providers ?? []) {
       try {
         provider.map?.cleanup();
@@ -668,9 +877,11 @@ export default class PlacesPlugin extends Plugin {
         logger.extensions.warn(`Failed to clean up ${pluginId} map provider`, error);
       }
     }
+
     try {
       const disposal = current.dispose?.();
-      if (disposal) void Promise.resolve(disposal).catch(error => logger.extensions.warn(`Failed to dispose ${pluginId}`, error));
+
+      if (disposal) await disposal;
     } catch (error) {
       logger.extensions.warn(`Failed to dispose ${pluginId}`, error);
     }
@@ -684,27 +895,76 @@ export default class PlacesPlugin extends Plugin {
     this.routeOverlayServices.clear();
     this.snapServices.clear();
     this.trackMatchServices.clear();
+    this.rawPlacesServices.clear();
+    this.rawElevationServices.clear();
+    this.rawRouteOverlayServices.clear();
+    this.rawSnapServices.clear();
+    this.rawTrackMatchServices.clear();
+    this.originScopedPlaces.clear();
+    this.originScopedElevation.clear();
+    this.originScopedRouteOverlay.clear();
+    this.originScopedSnap.clear();
+    this.originScopedTrackMatch.clear();
+    this.originScopedAggregators.clear();
     this.terrainDemProviders.clear();
     this.providerStyles.clear();
     this.imageAlignmentProcessors.clear();
     this.extensionCodeBlockHandlers.clear();
     this.extensionColonTextKeys.clear();
+    this.extensionIndexDependencies.clear();
     this.registeredProviderExports = [];
-    // Clear in place - PlacesSettingsTab holds a reference to this object across re-initialization.
+    this.registeredPopupRenderers = [];
+    this.registeredOverlayPresets = new Map();
+
     for (const key of Object.keys(this.extensionSettingsGroups)) {
       delete this.extensionSettingsGroups[key];
     }
 
     const registry = CodeBlockRegistry.instance;
+
     registry.clear();
     registry.registerDefinitions(MAIN_PLUGIN_DEFINITIONS);
     registry.registerHighlightConfigs(MAIN_PLUGIN_HIGHLIGHT_CONFIGS);
 
     const previousCommandIds = this.extensionCommandIds;
+
     this.extensionCommandIds = new Set<string>();
     this.extensionCommandHelp = [];
+    const popupRenderers = new Map<string, PopupRenderer>();
+    const overlayPresets = new Map<string, VectorTileOverlayPreset>();
+
+    for (const renderer of [createImagePopupRenderer(this.app), createKnapPopupRenderer((reference, sourcePath) => readKnapTemplateFile(this.app, reference, sourcePath))]) {
+      popupRenderers.set(renderer.id, renderer);
+    }
 
     for (const { name: pluginName, exports } of this.extensionExports.values()) {
+      for (const renderer of exports.popupRenderers ?? []) {
+        if (!isPopupRendererId(renderer.id) || (renderer.kind !== 'sections' && renderer.kind !== 'dom') || typeof renderer.render !== 'function') {
+          logger.extensions.warn(`Invalid popup renderer exported by places-${pluginName}; renderer ignored.`);
+          continue;
+        }
+
+        if (popupRenderers.has(renderer.id)) {
+          logger.extensions.warn(`Duplicate popup renderer id "${renderer.id}" ignored.`);
+          continue;
+        }
+
+        popupRenderers.set(renderer.id, renderer);
+      }
+
+      for (const preset of exports.overlayPresets ?? []) {
+        if (!isPopupRendererId(preset.id) || typeof preset.tiles !== 'function' || !Array.isArray(preset.layers)) {
+          logger.extensions.warn(`Invalid overlay preset exported by places-${pluginName}; preset ignored.`);
+          continue;
+        }
+
+        if (overlayPresets.has(preset.id)) {
+          logger.extensions.warn(`Duplicate overlay preset id "${preset.id}" ignored.`);
+          continue;
+        }
+
+        overlayPresets.set(preset.id, preset);
+      }
 
       if (exports.providers) {
         this.registeredProviderExports.push(...exports.providers);
@@ -713,8 +973,8 @@ export default class PlacesPlugin extends Plugin {
           const providerName = provider.name;
 
           if (provider.geocoding) {
-            const wrappedService = this.wrapPlacesService(provider.geocoding.service, providerName, this.apiCacheStorage);
-            this.placesServices.register(providerName, wrappedService);
+            this.rawPlacesServices.set(providerName.toLowerCase(), provider.geocoding.service);
+            this.placesServices.register(providerName, this.wrapPlacesService(provider.geocoding.service, providerName.toLowerCase()));
             addIcon(providerName, provider.geocoding.icon);
           }
 
@@ -725,16 +985,17 @@ export default class PlacesPlugin extends Plugin {
           this.mapProviderDefaults.register(providerName, provider.mapDefaults ?? {});
 
           if (provider.styles) {
-            this.providerStyles.register(providerName, [...provider.styles]);
+            this.providerStyles.register(providerName, toProviderStyles(provider));
           }
 
           if (provider.elevation) {
-            const wrappedService = this.wrapElevationService(provider.elevation, providerName, this.elevationCacheStorage);
-            this.elevationServices.register(providerName, wrappedService);
+            this.rawElevationServices.set(providerName.toLowerCase(), provider.elevation);
+            this.elevationServices.register(providerName, this.wrapElevationService(provider.elevation, providerName.toLowerCase()));
           }
 
           if (provider.trackMatch) {
-            this.trackMatchServices.register(providerName, provider.trackMatch);
+            this.rawTrackMatchServices.set(providerName.toLowerCase(), provider.trackMatch);
+            this.trackMatchServices.register(providerName, new TrackMatchTrackingDecorator(provider.trackMatch, providerName.toLowerCase(), this.apiUsage));
           }
 
           if (provider.terrain) {
@@ -742,13 +1003,13 @@ export default class PlacesPlugin extends Plugin {
           }
 
           if (provider.routeOverlay) {
-            const trackedService = new RouteOverlayTrackingDecorator(provider.routeOverlay, providerName, this.getApiStatsSettings(), () => PlacesPlugin.scheduleApiStatsSave());
-            this.routeOverlayServices.register(providerName, new RouteOverlayCachingDecorator(trackedService, providerName, this.routeOverlayCacheStorage));
+            this.rawRouteOverlayServices.set(providerName.toLowerCase(), provider.routeOverlay);
+            this.routeOverlayServices.register(providerName, this.wrapRouteOverlayService(provider.routeOverlay, providerName.toLowerCase()));
           }
 
           if (provider.snap) {
-            const trackedService = new SnapTrackingDecorator(provider.snap, providerName, this.getApiStatsSettings(), () => PlacesPlugin.scheduleApiStatsSave());
-            this.snapServices.register(providerName, trackedService);
+            this.rawSnapServices.set(providerName.toLowerCase(), provider.snap);
+            this.snapServices.register(providerName, new SnapTrackingDecorator(provider.snap, providerName.toLowerCase(), this.apiUsage));
           }
 
           if (provider.imageAlignment) {
@@ -767,7 +1028,7 @@ export default class PlacesPlugin extends Plugin {
 
       if (exports.codeBlockProcessors) {
         exports.codeBlockProcessors.forEach(processor => {
-          this.registerExtensionCodeBlockProcessor(processor.blockType, processor.processor, processor.colonTextKeys);
+          this.registerExtensionCodeBlockProcessor(processor.blockType, processor.processor, processor.colonTextKeys, processor.sourceFormat, processor.indexDependencies);
         });
       }
 
@@ -790,10 +1051,19 @@ export default class PlacesPlugin extends Plugin {
       }
     }
 
-    // Every provider's styles, so the highlighter accepts what completion offers.
-    // Set after the whole scan, not per provider, because the scan reruns on load
-    // and unload and this replaces the previous set rather than adding to it.
-    registry.setProvidedValues('style', this.providerStyles.getNames().flatMap(name => this.providerStyles.get(name) ?? []));
+    registry.setProvidedValues('style', this.providerStyles.getNames().flatMap(name => (this.providerStyles.get(name) ?? []).map(style => style.id)));
+    this.registeredPopupRenderers = [...popupRenderers.values()];
+    this.registeredOverlayPresets = overlayPresets;
+    registry.setProvidedValues('preset', [...overlayPresets.values()].map(preset => ({
+      value: preset.id,
+      description: preset.description,
+    })));
+    registry.setProvidedValues('renderer', [...popupRenderers.values()].map(renderer => ({
+      value: renderer.id,
+      description: renderer.description,
+    })));
+
+    retryMapSurfacesWaitingForProvider(name => this.mapBlockProcessors.get(name) !== undefined);
   }
 
   // Provider capability bundles registered by the last extension scan.
@@ -804,63 +1074,89 @@ export default class PlacesPlugin extends Plugin {
   getRegisteredMapTools() {
     const tools = [...this.extensionExports.values()].flatMap(entry => entry.exports.mapTools ?? []);
     const unique = new Map<string, typeof tools[number]>();
+
     for (const tool of tools) {
       if (unique.has(tool.id)) {
         logger.extensions.warn(`Duplicate map tool id "${tool.id}" ignored.`);
         continue;
       }
+
       unique.set(tool.id, tool);
     }
+
     return [...unique.values()];
   }
 
-  // Obsidian has no public way to unregister a code block processor, and
-  // registering the same block type twice throws. Block types are
-  // lowercase-only; Obsidian matches fence languages case-sensitively.
-  private registerExtensionCodeBlockProcessor(blockType: string, processor: (source: string, el: HTMLElement, ctx: MarkdownPostProcessorContext) => void | Promise<void>, colonTextKeys?: readonly string[]): void {
+  getRegisteredPopupRenderers(): readonly PopupRenderer[] {
+    return this.registeredPopupRenderers;
+  }
+
+  override registerMarkdownCodeBlockProcessor(language: string, handler: Parameters<Plugin['registerMarkdownCodeBlockProcessor']>[1], sortOrder?: number): ReturnType<Plugin['registerMarkdownCodeBlockProcessor']> {
+    return super.registerMarkdownCodeBlockProcessor(language, (source, el, ctx) =>
+      this.codeBlockStartup.process(source, el, ctx, handler), sortOrder);
+  }
+
+  private registerExtensionCodeBlockProcessor(blockType: string, processor: (source: string, el: HTMLElement, ctx: MarkdownPostProcessorContext) => void | Promise<void>, colonTextKeys?: readonly string[], sourceFormat: 'yaml' | 'yaml-template' = 'yaml', indexDependencies?: 'notes'): void {
     this.extensionCodeBlockHandlers.set(blockType, processor);
-    // Re-read on every render: the extension may have reloaded with a different list.
+    this.extensionSourceFormats.set(blockType, sourceFormat);
+
+    if (indexDependencies) this.extensionIndexDependencies.set(blockType, indexDependencies);
+    else this.extensionIndexDependencies.delete(blockType);
+
     if (colonTextKeys?.length) this.extensionColonTextKeys.set(blockType, colonTextKeys);
     else this.extensionColonTextKeys.delete(blockType);
 
     if (this.registeredExtensionBlockTypes.has(blockType)) {
       return;
     }
+
     this.registeredExtensionBlockTypes.add(blockType);
 
     const processExtensionBlock = async (source: string, el: HTMLElement, ctx: MarkdownPostProcessorContext): Promise<void> => {
       const handler = this.extensionCodeBlockHandlers.get(blockType);
+
       if (!handler) {
         renderError(el, {
           title: "Plugin unavailable",
           message: `The plugin that renders ${blockType} blocks is disabled.`
         });
+
         return;
       }
+
       try {
-        const parsed = parseCodeBlock(source, { colonTextKeys: this.extensionColonTextKeys.get(blockType) });
+        const blockSource = splitExtensionBlockSource(source, this.extensionSourceFormats.get(blockType));
+        const parsed = parseCodeBlock(blockSource.settings, { colonTextKeys: this.extensionColonTextKeys.get(blockType) });
+        const autoRefresh = parsed.settings.autorefresh;
         const parameterSupport = new BlockParameterSupport(this.app, this.vaultQueryService);
         const parameters = await parameterSupport.apply(parsed, el, ctx);
+
         registerRefreshableCodeBlock({
+          autoRefresh,
           source,
           el,
           ctx,
           process: processExtensionBlock,
-          shouldAutoRefresh: createOwnNoteEditRefreshGuard(source, ctx.sourcePath),
+          shouldAutoRefresh: createOwnNoteEditRefreshGuard(source, ctx.sourcePath, path => readNoteProperties(this.app, path)),
           ariaLabel: `Refresh ${blockType}`,
           onError: error => rootLogger.error(`Refresh ${blockType} failed:`, error),
           usesParameters: parameters !== null,
+          query: this.extensionIndexDependencies.get(blockType) === 'notes' && parameters === null ? null : undefined,
         });
+        applyBlockWidth(el, new CodeBlockReader(parsed.settings).text('width'));
         const resolvedSource = parameters
-          ? `${stringifyYaml(parsed.settings).trimEnd()}${parsed.embeddedPlaces !== undefined ? `\n---\n${parsed.embeddedPlaces}` : ''}`
+          ? blockSource.withSettings(stringifyYaml(parsed.settings).trimEnd())
           : source;
+
         await handler(resolvedSource, el, ctx);
+
         await parameters?.renderStrip();
       } catch (error) {
         rootLogger.error(`Error processing ${blockType} code block:`, error);
         this.renderCodeBlockError(el, blockType, error);
       }
     };
+
     this.registerMarkdownCodeBlockProcessor(blockType, processExtensionBlock);
   }
 
@@ -871,11 +1167,13 @@ export default class PlacesPlugin extends Plugin {
       const unknownKeyNote = error.key && validKeys && !validKeys.has(error.key)
         ? ` "${error.key}" is not a ${blockType} setting.`
         : '';
+
       renderError(el, {
         icon: "⚠️",
         title: "Block Syntax Error",
         message: `${error.message}${unknownKeyNote}`,
       });
+
       return;
     }
 
@@ -886,20 +1184,19 @@ export default class PlacesPlugin extends Plugin {
     });
   }
 
-  // Capabilities handed to extensions via getPlaceExports. Extension blocks
-  // (e.g., places-classify in places-utilities) consume main-plugin services
-  // exclusively through this facade - they never import the main plugin.
   private buildHostServices(): IPlacesHostServices {
     return {
+      get placeNotes() { return PlacesPlugin.placeNoteHost; },
       parameters: {
         getNoteValue: (sourcePath, name) => QueryParameterState.resolveNoteValue(sourcePath, name),
         setNoteValue: (sourcePath, name, value) => {
           const stateKey = NoteParameterRegistry.noteStateKey(sourcePath);
           const definition = NoteParameterRegistry.definitionsFor(sourcePath).find(entry => entry.name === name);
+
           if (!definition && PlacesPlugin.settings.developerMode) {
             logger.extensions.warn(`Host setNoteValue: no places-parameters block in "${sourcePath}" declares "${name}"; the value will not reach a query.`);
           }
-          // null clears to the declared default (a distinct value, not the empty string).
+
           applyExternalParameterValue(stateKey, name, value === null ? (definition?.defaultValue ?? '') : value);
           MapRefreshService.getInstance().refreshParameterConsumers(sourcePath);
         },
@@ -914,6 +1211,7 @@ export default class PlacesPlugin extends Plugin {
           const values = QueryParameterState.peek(NoteParameterRegistry.noteStateKey(sourcePath));
           const start = values?.[binding?.startParameter ?? 'startDate'];
           const end = values?.[binding?.endParameter ?? 'endDate'];
+
           return {
             start: typeof start === 'string' ? start : undefined,
             end: typeof end === 'string' ? end : undefined,
@@ -921,6 +1219,7 @@ export default class PlacesPlugin extends Plugin {
         },
         set: (sourcePath, range, binding) => {
           const stateKey = NoteParameterRegistry.noteStateKey(sourcePath);
+
           if (range.start !== undefined) applyExternalParameterValue(stateKey, binding?.startParameter ?? 'startDate', range.start);
           if (range.end !== undefined) applyExternalParameterValue(stateKey, binding?.endParameter ?? 'endDate', range.end);
           MapRefreshService.getInstance().refreshParameterConsumers(sourcePath);
@@ -936,6 +1235,7 @@ export default class PlacesPlugin extends Plugin {
               const values = QueryParameterState.peek(stateKey);
               const start = values?.[binding?.startParameter ?? 'startDate'];
               const end = values?.[binding?.endParameter ?? 'endDate'];
+
               handler({
                 start: typeof start === 'string' ? start : undefined,
                 end: typeof end === 'string' ? end : undefined,
@@ -944,6 +1244,7 @@ export default class PlacesPlugin extends Plugin {
           };
           const offStart = QueryParameterState.subscribe(stateKey, binding?.startParameter ?? 'startDate', emit);
           const offEnd = QueryParameterState.subscribe(stateKey, binding?.endParameter ?? 'endDate', emit);
+
           return () => { offStart(); offEnd(); };
         },
       },
@@ -959,9 +1260,6 @@ export default class PlacesPlugin extends Plugin {
       maps: {
         resolveMapProvider: (explicitProvider) => PlacesPlugin.resolveMapProvider(explicitProvider),
         getMapProviderDefaults: (providerName) => PlacesPlugin.getMapProviderDefaults(providerName),
-        // Provider-authored surfaces resolve config through the host, applying
-        // the global settings layer to them too; resolving it themselves
-        // would silently drop every global to its coded default.
         resolveMapConfig: (request) => {
           const resolved = resolveMapSettings({
             providerName: request.providerName,
@@ -969,63 +1267,73 @@ export default class PlacesPlugin extends Plugin {
             placeCount: request.placeCount,
             warnings: request.warnings,
           });
+
           return { config: resolved.config, clusteringEnabled: resolved.clusteringEnabled };
         },
-        renderMapSurface: async (request) => (await renderMapSurface(buildHostSurfaceRenderOptions(request))).rendered,
-        updateMapSurface: async (request) => {
-          // The camera defaults to 'preserve': streamed data never moves it.
-          const controller = getMapSurfaceController(request.mapContainer);
-          if (!controller) return false;
-          // Same capability fill as the initial render: streamed plans from
-          // provider bundles cannot carry the hosts themselves.
-          const plan = withHostCapabilities(request.renderPlan);
-          controller.setPlan(plan, { source: 'host-update' });
-          await controller.reconcile();
-          return controller.getState().appliedPlanSignature === plan.signature;
+        renderMapSurface: async (request) => {
+          const surface = await renderMapSurface(buildHostSurfaceRenderOptions(request));
+
+          if (!surface.rendered || !surface.controller) return null;
+          const mapContainer = surface.mapContainer;
+
+          return {
+            mapContainer,
+            update: async (renderPlan) => {
+              const controller = getMapSurfaceController(mapContainer);
+
+              if (!controller) return false;
+              const plan = withHostCapabilities(renderPlan);
+
+              controller.setPlan(plan, { source: 'host-update' });
+              await controller.reconcile();
+
+              return controller.getState().appliedPlanSignature === plan.signature;
+            },
+            dispose: () => cleanupMapContainer(mapContainer),
+          };
+        },
+        disposeMapSurfaces: (element) => {
+          for (const mapContainer of element.querySelectorAll<HTMLElement>('.places-map-container')) cleanupMapContainer(mapContainer);
         },
       },
       trackMatch: {
-        get: (providerName) => this.trackMatchServices.get(providerName),
-        getFirst: () => this.trackMatchServices.getFirst(),
+        get: (providerName, origin) => PlacesPlugin.getTrackMatchService(providerName, origin),
+        getFirst: (origin) => PlacesPlugin.getFirstTrackMatchService(origin),
         getNames: () => this.trackMatchServices.getNames(),
       },
+      apiUsage: this.apiUsage,
     };
   }
 
-  private wrapPlacesService(service: IPlacesService, serviceName: string, cacheStorage: SessionCacheStorage): IPlacesService {
-    const trackedService = new PlacesTrackingDecorator(
-      service,
-      serviceName,
-      this.getApiStatsSettings(),
-      () => PlacesPlugin.scheduleApiStatsSave(),
-      () => PlacesPlugin.settings.poiFilterPatterns,
-    );
-    return new PlacesCachingDecorator(trackedService, serviceName, cacheStorage);
+  private wrapPlacesService(service: IPlacesService, serviceName: string, origin?: ApiUsageOrigin): IPlacesService {
+    const trackedService = new PlacesTrackingDecorator(service, serviceName, this.apiUsage, () => PlacesPlugin.settings.poiFilterPatterns, origin);
+
+    return new PlacesCachingDecorator(trackedService, serviceName, this.apiCacheStorage, () => this.recordCacheHit(serviceName, API_USAGE_SERVICES.geocoding, origin));
   }
 
-  private wrapElevationService(service: IElevationService, serviceName: string, cacheStorage: SessionCacheStorage): IElevationService {
-    const trackedService = new ElevationTrackingDecorator(
-      service,
-      serviceName,
-      this.getApiStatsSettings(),
-      () => PlacesPlugin.scheduleApiStatsSave(),
-    );
-    return new ElevationCachingDecorator(trackedService, serviceName, cacheStorage);
+  private wrapElevationService(service: IElevationService, serviceName: string, origin?: ApiUsageOrigin): IElevationService {
+    const trackedService = new ElevationTrackingDecorator(service, serviceName, this.apiUsage, origin);
+
+    return new ElevationCachingDecorator(trackedService, serviceName, this.elevationCacheStorage, () => this.recordCacheHit(serviceName, API_USAGE_SERVICES.elevation, origin));
   }
 
-  private getApiStatsSettings(): Record<string, unknown> {
-    return PlacesPlugin.settings.apiStats;
+  private wrapRouteOverlayService(service: RouteOverlayService, serviceName: string, origin?: ApiUsageOrigin): RouteOverlayService {
+    const trackedService = new RouteOverlayTrackingDecorator(service, serviceName, this.apiUsage, origin);
+
+    return new RouteOverlayCachingDecorator(trackedService, serviceName, this.routeOverlayCacheStorage, () => this.recordCacheHit(serviceName, API_USAGE_SERVICES.routeOverlay, origin));
   }
 
-  // Block types are lowercase-only. Obsidian matches fence languages
-  // case-sensitively and every registration re-renders open previews, and no
-  // case aliases are registered.
+  private recordCacheHit(serviceName: string, service: string, origin?: ApiUsageOrigin): void {
+    this.apiUsage.record({ provider: serviceName, service, success: true, durationMs: 0, cached: true, ...(origin ? { origin } : {}) });
+  }
+
   private registerCodeBlockProcessors() {
     const blockParameters = new BlockParameterSupport(this.app, this.vaultQueryService);
+
     this.templateNoteService = new TemplateNoteService(this.app);
     this.placeNoteCreationService = new PlaceNoteCreationService(this.app, () => PlacesPlugin.settings);
     this.templateRenameQueue = new TemplateRenameQueue(this.app, () => void MapRefreshService.getInstance().refreshAllBlocks());
-    this.codeBlockProcessor = new PlacesCodeBlockProcessor(this.app, this, this.placeDataService, this.mapBlockProcessors, this.placesServiceAggregator, () => this.getRegisteredProviders(), this.vaultQueryService, this.trackDataService, this.routeOverlayGenerator, this.templateNoteService);
+    this.codeBlockProcessor = new PlacesCodeBlockProcessor(this.app, this, this.placeDataService, this.mapBlockProcessors, () => this.getRegisteredProviders(), this.vaultQueryService, this.trackDataService, this.routeOverlayGenerator, this.templateNoteService, () => PlacesPlugin.settings.defaultTemplate);
     this.registerMarkdownCodeBlockProcessor("places",
       (source, el, ctx) => this.codeBlockProcessor.processMarkdownCodeBlock(source, el, ctx)
     );
@@ -1036,38 +1344,47 @@ export default class PlacesPlugin extends Plugin {
     );
 
     const similarTracksProcessor = new SimilarTracksBlockProcessor(this.app, this.trackDataService, blockParameters);
+
     this.registerMarkdownCodeBlockProcessor("places-similar",
       (source, el, ctx) => similarTracksProcessor.processCodeBlock(source, el, ctx)
     );
 
     const compareTracksProcessor = new CompareTracksBlockProcessor(this.app, this.trackDataService, blockParameters);
+
     this.registerMarkdownCodeBlockProcessor("places-compare",
       (source, el, ctx) => compareTracksProcessor.processCodeBlock(source, el, ctx)
     );
 
     const parametersProcessor = new PlacesParametersBlockProcessor(this.app, this.vaultQueryService);
+
     this.registerMarkdownCodeBlockProcessor("places-parameters",
       (source, el, ctx) => parametersProcessor.processCodeBlock(source, el, ctx)
     );
 
     const snapProcessor = new SnapBlockProcessor(this.app, this.trackDataService, blockParameters);
+
     this.registerMarkdownCodeBlockProcessor("places-snap",
       (source, el, ctx) => snapProcessor.processCodeBlock(source, el, ctx)
     );
 
     const elevationProcessor = new ElevationBlockProcessor(this.app, this.trackDataService, blockParameters);
+
     this.registerMarkdownCodeBlockProcessor("places-elevation",
       (source, el, ctx) => elevationProcessor.processCodeBlock(source, el, ctx)
     );
 
     const heatmapProcessor = new HeatmapBlockProcessor(this.app, this.trackDataService, this.placeDataService, blockParameters);
+
     this.registerMarkdownCodeBlockProcessor("places-heatmap",
       (source, el, ctx) => heatmapProcessor.processCodeBlock(source, el, ctx)
     );
 
     this.helpCodeBlockProcessor = new PlacesHelpCodeBlockProcessor(this.app, this, this.mapBlockProcessors, () => this.getRegisteredProviders(),
       () => Array.from(this.extensionCodeBlockHandlers.keys()).filter((blockType) => blockType.endsWith('-help')),
-      () => [...this.commandRegistrar.getCommandHelp(), ...this.extensionCommandHelp]);
+      () => [...this.commandRegistrar.getCommandHelp(), ...this.extensionCommandHelp],
+      () => this.getRegisteredPopupRenderers(),
+      () => [...this.registeredOverlayPresets.values()]);
+
     for (const helpType of this.helpCodeBlockProcessor.getHelpTypes()) {
       this.registerMarkdownCodeBlockProcessor(helpType,
         (_source, el) => this.helpCodeBlockProcessor.processHelpCodeBlock(helpType, el)
@@ -1075,6 +1392,7 @@ export default class PlacesPlugin extends Plugin {
     }
 
     const referenceProcessor = new PlacesReferenceCodeBlockProcessor();
+
     this.registerMarkdownCodeBlockProcessor("places-reference",
       (_source, el) => referenceProcessor.processReferenceCodeBlock(el)
     );
@@ -1087,6 +1405,8 @@ export default class PlacesPlugin extends Plugin {
   private async processImageAlignCodeBlock(source: string, el: HTMLElement, ctx: MarkdownPostProcessorContext): Promise<void> {
     try {
       const settings = parseCodeBlock(source).settings;
+
+      applyBlockWidth(el, new CodeBlockReader(settings).text('width'));
       const requested = optionalStringSetting(settings, 'mapProvider')?.toLowerCase();
       const availableProviders = this.imageAlignmentProcessors.getNames();
 
@@ -1097,11 +1417,10 @@ export default class PlacesPlugin extends Plugin {
           message: "Enable a map provider plugin that supports image alignment (Mapbox, MapTiler, Geoapify, Stadia, Thunderforest, OpenFreeMap, or Radar).",
           className: "image-align-error"
         });
+
         return;
       }
 
-      // An explicitly requested provider must support alignment - no silent
-      // substitution.
       if (requested && !this.imageAlignmentProcessors.has(requested)) {
         renderError(el, {
           icon: "🖼️",
@@ -1110,7 +1429,9 @@ export default class PlacesPlugin extends Plugin {
           className: "image-align-error"
         });
         const helpDiv = el.createDiv({ cls: 'places-help-section' });
+
         helpDiv.createEl("p", { text: `Providers that do: ${availableProviders.join(", ")}` });
+
         return;
       }
 
@@ -1119,7 +1440,12 @@ export default class PlacesPlugin extends Plugin {
         ?? (this.imageAlignmentProcessors.has(defaultProvider) ? defaultProvider : availableProviders[0]);
 
       const processor = this.imageAlignmentProcessors.get(providerName)!;
-      await processor(source, el, ctx);
+      const overlayService = this.imageAlignmentOverlayService ??= new OverlayService(this.app);
+
+      await processor(source, el, ctx, {
+        loadOverlays: definitions => overlayService.loadOverlays(definitions),
+        formatDistance: value => formatMetersInSystem(meters(value), PlacesPlugin.settings.units, 1),
+      });
     } catch (error) {
       rootLogger.error('Error processing places-image-align code block:', error);
       this.renderCodeBlockError(el, 'places-image-align', error);
@@ -1133,10 +1459,13 @@ export default class PlacesPlugin extends Plugin {
       if (evt.defaultPrevented) {
         return;
       }
+
       const handled = this.dragDropHandler.handleEditorDrop(evt);
+
       if (!handled) {
         return;
       }
+
       evt.preventDefault();
     }));
 
@@ -1148,61 +1477,73 @@ export default class PlacesPlugin extends Plugin {
     this.registerDomEvent(activeDocument, "dragleave", (evt: DragEvent) => this.dragDropHandler.handleDragLeave(evt), { capture: true });
   }
 
-  // Same debounce as the map data refreshes.
-  private scheduleDataBlockRefresh(path: string): void {
-    this.pendingBlockRefreshPaths.add(path);
+  private scheduleDataBlockRefresh(path: string, source?: BlockFileChange['source']): void {
+    const previous = this.pendingBlockRefreshChanges.get(path);
+
+    if (!previous || source === undefined) this.pendingBlockRefreshChanges.set(path, { path, source });
+
     if (this.blockRefreshTimer !== null) {
       window.clearTimeout(this.blockRefreshTimer);
     }
+
     this.blockRefreshTimer = window.setTimeout(() => {
-      const changedPaths = Array.from(this.pendingBlockRefreshPaths);
-      this.pendingBlockRefreshPaths.clear();
+      const fileChanges = Array.from(this.pendingBlockRefreshChanges.values());
+
+      this.pendingBlockRefreshChanges.clear();
       this.blockRefreshTimer = null;
-      void BlockRefreshRegistry.refreshAll({ changedPaths });
+      void BlockRefreshRegistry.refreshAll({ fileChanges });
     }, 200);
   }
 
   private subscribeToVaultQueryEvents(): void {
-    // VaultQueryService invalidates its cache before notifying listeners.
-    this.vaultQueryUnsubscribe = this.vaultQueryService.onFileIndexed((path) => {
+    this.registerEvent(this.app.vault.on('create', file => recordSourcePathCreation(file.path)));
+    this.registerEvent(this.app.metadataCache.on('changed', file => {
+      this.vaultQueryService.invalidateCache(file.path);
+      MapRefreshService.getInstance().onSourceContextChanged(file.path);
+      this.scheduleDataBlockRefresh(file.path);
+    }));
+    MapRefreshService.getInstance().setQueryRelationResolver(query => this.vaultQueryService.resolveQueryRelations(query));
+    this.vaultQueryUnsubscribe = this.vaultQueryService.onFileIndexed((paths, source) => {
       try {
         const refreshService = MapRefreshService.getInstance();
-        refreshService.onFileIndexed(path);
+
+        refreshService.onFilesIndexed(paths, source);
       } catch (error) {
         logger.refresh.error('Error queueing map refresh on file indexed', error);
       }
-      this.scheduleDataBlockRefresh(path);
+
+      for (const path of paths) this.scheduleDataBlockRefresh(path, source);
     });
-    // Without this, a deleted note's marker stays until a manual refresh.
     this.vaultQueryRemovedUnsubscribe = this.vaultQueryService.onFileRemoved((path) => {
       try {
         const refreshService = MapRefreshService.getInstance();
+
         refreshService.onFileRemoved(path);
       } catch (error) {
         logger.refresh.error('Error queueing map refresh on file removed', error);
       }
+
       this.scheduleDataBlockRefresh(path);
     });
     this.vaultQueryIndexedUnsubscribe = this.vaultQueryService.onVaultIndexed(() => {
       try {
         const refreshService = MapRefreshService.getInstance();
+
         refreshService.onVaultIndexed();
       } catch (error) {
         logger.refresh.error('Error queueing map refresh on vault indexed', error);
       }
     });
-    this.vaultQueryProviderTablesChangedUnsubscribe = this.vaultQueryService.onProviderTablesChanged(() => {
+    this.vaultQueryProviderTablesChangedUnsubscribe = this.vaultQueryService.onProviderTablesChanged((tables) => {
       try {
         const refreshService = MapRefreshService.getInstance();
-        refreshService.onProviderTablesChanged();
+
+        refreshService.onProviderTablesChanged(tables);
       } catch (error) {
         logger.refresh.error('Error queueing map refresh on provider tables changed', error);
       }
     });
 
-    // Dataview signals index updates via the workspace 'dataview:refresh-views'
-    // event (the same signal ensureDataviewReady waits on), independent of
-    // whether VaultQuery is active.
     this.registerEvent((this.app.workspace as Events).on('dataview:refresh-views', () => {
       try {
         MapRefreshService.getInstance().onDataviewIndexChanged();
@@ -1211,32 +1552,27 @@ export default class PlacesPlugin extends Plugin {
       }
     }));
 
-    // VaultQuery's file-indexed event doesn't fire on renames (Obsidian limitation).
     this.registerEvent(this.app.vault.on('rename', (file, oldPath) => {
       try {
-        // ctx.sourcePath is stale (contains the old path) immediately after rename
-        this.vaultQueryService.registerRename(oldPath, file.path);
-        // Query results carry file paths.
-        this.vaultQueryService.invalidateCache();
+        this.vaultQueryService.invalidateCache(oldPath);
+        this.vaultQueryService.invalidateCache(file.path);
         const refreshService = MapRefreshService.getInstance();
+
         refreshService.onFileRenamed(oldPath, file.path);
+        this.scheduleDataBlockRefresh(file.path);
       } catch (error) {
         logger.refresh.error('Error queueing map refresh on file rename', error);
       }
     }));
 
-    // On mobile, containers can be detached from the DOM while off-screen.
-    // Flush any stale-marked maps when the user navigates back to a leaf.
     this.registerEvent(this.app.workspace.on('active-leaf-change', () => {
       MapRefreshService.getInstance().onLeafChange();
     }));
 
-    // Frontmatter-backed maps also refresh on file-indexed events, once
-    // metadataCache has caught up.
     this.registerEvent(this.app.vault.on('modify', (file) => {
       try {
-        this.vaultQueryService.invalidateCache();
         const refreshService = MapRefreshService.getInstance();
+
         refreshService.onSourceFileModified(file.path);
         this.onTemplateNoteMaybeChanged(file.path);
       } catch (error) {
@@ -1244,16 +1580,11 @@ export default class PlacesPlugin extends Plugin {
       }
     }));
 
-    // A template note is not the source note of the blocks that use it, and the
-    // path-matched refreshes above never reach them.
     this.registerEvent(this.app.vault.on('create', (file) => this.onTemplateNoteMaybeChanged(file.path)));
     this.registerEvent(this.app.vault.on('delete', (file) => this.onTemplateNoteMaybeChanged(file.path)));
     this.registerEvent(this.app.vault.on('rename', (file, oldPath) => {
       this.onTemplateNoteMaybeChanged(file.path);
       this.onTemplateNoteMaybeChanged(oldPath);
-      // Obsidian rewrites links it parses, and it does not parse links inside
-      // code fences; a renamed template note would silently break every block
-      // referencing it.
       void this.templateRenameQueue.queue(oldPath, file.path)
         .catch(error => logger.refresh.error('Error updating template references after rename', error));
     }));
@@ -1267,37 +1598,87 @@ export default class PlacesPlugin extends Plugin {
   }
 
   private initializeBasesView() {
-    // Bases view registration exists at runtime but is not in Obsidian's public types yet.
     (this as unknown as ObsidianPluginWithBasesViewRegistration).registerBasesView("places-map", {
         name: "Places Map",
         icon: "lucide-map",
-        factory: (controller: unknown, containerEl: HTMLElement) => new PlacesBasesView(controller as ConstructorParameters<typeof PlacesBasesView>[0], containerEl),
+        factory: (controller: unknown, containerEl: HTMLElement) => new PlacesBasesView(controller as ConstructorParameters<typeof PlacesBasesView>[0], containerEl, this.basesLabelCaches),
         options: () => PlacesBasesView.getViewOptions(),
     });
   }
 
+  // loadData answers null both for a vault with no settings yet and for a file
+  // it could not parse.
+  private async quarantineUnreadableSettings(): Promise<void> {
+    const path = `${this.manifest.dir}/data.json`;
+
+    try {
+      if (!(await this.app.vault.adapter.exists(path))) return;
+      const contents = await this.app.vault.adapter.read(path);
+
+      if (!contents.trim()) return;
+      this.settingsUnreadable = true;
+      const kept = `${this.manifest.dir}/data.corrupt-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+
+      await this.app.vault.adapter.write(kept, contents);
+      logger.settings.error('Settings file could not be read', { path, size: contents.length, kept });
+      new Notice(`Places settings could not be read. A copy was kept as ${kept.split('/').pop()}, and this session will not save over data.json. Restore the file, then restart Obsidian.`, 0);
+    } catch (error) {
+      logger.settings.error('Settings file could not be set aside', error);
+    }
+  }
+
+  private async applyDebugLogFileSetting(): Promise<void> {
+    const wanted = PlacesPlugin._settings.developerMode;
+
+    if (wanted === Boolean(this.debugLogFile)) return;
+
+    if (!wanted) {
+      const file = this.debugLogFile;
+
+      this.debugLogFile = null;
+      await file?.stop();
+
+      return;
+    }
+
+    this.debugLogFile = await DebugLogFile.start(this.app, this.manifest.id);
+  }
+
   onunload(): void {
+    void this.debugLogFile?.stop();
+    this.debugLogFile = null;
+    TileCache.configureUsageSink(null);
+    trackPreparation.dispose();
+    this.basesLabelCaches.clear();
+
     if (this.vaultQueryUnsubscribe) {
       this.vaultQueryUnsubscribe();
       this.vaultQueryUnsubscribe = null;
     }
+
     if (this.vaultQueryRemovedUnsubscribe) {
       this.vaultQueryRemovedUnsubscribe();
       this.vaultQueryRemovedUnsubscribe = null;
     }
+
     if (this.vaultQueryIndexedUnsubscribe) {
       this.vaultQueryIndexedUnsubscribe();
       this.vaultQueryIndexedUnsubscribe = null;
     }
+
     if (this.vaultQueryProviderTablesChangedUnsubscribe) {
       this.vaultQueryProviderTablesChangedUnsubscribe();
       this.vaultQueryProviderTablesChangedUnsubscribe = null;
     }
+
     if (this.blockRefreshTimer !== null) {
       window.clearTimeout(this.blockRefreshTimer);
       this.blockRefreshTimer = null;
     }
-    this.pendingBlockRefreshPaths.clear();
+
+    this.pendingBlockRefreshChanges.clear();
+    this.extensionReloads.dispose();
+    this.settingsTab = null;
 
     this.templateRenameQueue.dispose();
 
@@ -1308,6 +1689,4 @@ export default class PlacesPlugin extends Plugin {
     void TileCache.shutdown();
     void PlacesPlugin.flushApiStatsSave(false);
   }
-
-
 }

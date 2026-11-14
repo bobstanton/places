@@ -1,5 +1,4 @@
 import { logger as rootLogger } from "places-shared/utils";
-// Runs frequency analysis in a web worker, falling back to the main thread where workers are unavailable.
 
 import { Platform } from "obsidian";
 import { Meters } from "places-shared/units";
@@ -7,7 +6,7 @@ import { Meters } from "places-shared/units";
 // @ts-expect-error esbuild-plugin-inline-worker transforms this import into a Worker constructor.
 import FrequencyWorker from "../workers/frequency-analysis.worker";
 
-import { FrequencyTrackData, FrequencyAnalysisResult, StrategyOptions } from "./strategies/IFrequencyStrategy";
+import { FrequencyTrackData, FrequencyAnalysisResult, StrategyOptions } from 'places/core/strategies';
 
 const logger = rootLogger.scope('FrequencyWorkerManager');
 const FrequencyWorkerConstructor = FrequencyWorker as unknown as new () => Worker;
@@ -51,6 +50,7 @@ class FrequencyWorkerManager {
 
     if (!this.worker) {
       const worker = new FrequencyWorkerConstructor();
+
       this.worker = worker;
 
       worker.onmessage = (event: MessageEvent<WorkerResponse>) => {
@@ -59,6 +59,7 @@ class FrequencyWorkerManager {
 
       worker.onerror = (error) => {
         logger.error('Worker error', error);
+
         for (const [id, pending] of this.pendingRequests) {
           pending.reject(new Error(`Worker error: ${error.message}`));
           this.pendingRequests.delete(id);
@@ -74,6 +75,7 @@ class FrequencyWorkerManager {
 
     if (!pending) {
       logger.warn('Received response for unknown request', response.id);
+
       return;
     }
 
@@ -84,6 +86,7 @@ class FrequencyWorkerManager {
         } else {
           pending.reject(new Error('Worker returned no result'));
         }
+
         this.pendingRequests.delete(response.id);
         break;
 
@@ -91,6 +94,7 @@ class FrequencyWorkerManager {
         if (pending.onProgress && response.message) {
           pending.onProgress(response.message);
         }
+
         break;
 
       case 'error':
@@ -165,6 +169,7 @@ export function getFrequencyWorkerManager(): FrequencyWorkerManager {
   if (!workerManagerInstance) {
     workerManagerInstance = new FrequencyWorkerManager();
   }
+
   return workerManagerInstance;
 }
 

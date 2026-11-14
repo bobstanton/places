@@ -3,28 +3,32 @@ import { getIndentUnit, indentService, indentString, type IndentContext } from "
 import { EditorSelection, Prec, type Extension } from "@codemirror/state";
 import { keymap, type Command } from "@codemirror/view";
 import { CodeBlockRegistry } from "../services/CodeBlockRegistry";
-import { getPlacesFenceAtPos, getPreviousMeaningfulLine, getYamlEmptyKey, YAML_CHILD_BLOCK_KEYS } from "./PlacesEditorContext";
+import { getListParentKey, getPlacesFenceAtPos, getPlacesYamlLine, getPreviousMeaningfulLine, getYamlEmptyKey } from "./PlacesEditorContext";
+import { getYamlColumn, STYLE_RULE_KEYS } from "places-shared/settings";
 
-const YAML_LIST_ITEM = /^(\s*)-\s?(.*)$/u;
+const YAML_LIST_ITEM = /^(\s*)-(?:[ \t]+(.*)|$)/u;
 const YAML_BLOCK_SCALAR_VALUE = /^[A-Za-z][\w-]*\s*:\s*[|>](?:[1-9][+-]?|[+-][1-9]?)?\s*$/u;
 
 export function isYamlChildBlockKey(blockType: string, key: string): boolean {
-  return YAML_CHILD_BLOCK_KEYS.has(key) || CodeBlockRegistry.instance.hasChildBlockKeys(blockType, key);
+  return STYLE_RULE_KEYS.has(key) || CodeBlockRegistry.instance.hasChildBlockKeys(blockType, key);
 }
 
 function getPlacesIndent(context: IndentContext, pos: number): number | null | undefined {
   const fence = getPlacesFenceAtPos(context.state, pos);
+
   if (!fence) {
     return undefined;
   }
 
   const currentLine = context.lineAt(pos);
   const currentTrimmed = currentLine.text.trim();
+
   if (currentTrimmed) {
     return undefined;
   }
 
   const previous = getPreviousMeaningfulLine(context.state, fence, context.state.doc.lineAt(pos).number);
+
   if (!previous) {
     return undefined;
   }
@@ -32,13 +36,9 @@ function getPlacesIndent(context: IndentContext, pos: number): number | null | u
   const previousTrimmed = previous.text.trim();
   const previousIndent = context.lineIndent(previous.from);
   const previousKey = getYamlEmptyKey(previousTrimmed);
+
   if (previousKey && isYamlChildBlockKey(fence.language, previousKey)) {
     return previousIndent + context.unit;
-  }
-
-  const previousListItem = previous.text.match(YAML_LIST_ITEM);
-  if (previousListItem) {
-    return previousListItem[1].length;
   }
 
   return previousIndent;
@@ -46,7 +46,7 @@ function getPlacesIndent(context: IndentContext, pos: number): number | null | u
 
 export const continuePlacesYamlList: Command = (view) => {
   const { state } = view;
-  // Let CodeMirror's completion keymap consume Enter while its popup is open.
+
   if (completionStatus(state) !== null) {
     return false;
   }
@@ -57,6 +57,7 @@ export const continuePlacesYamlList: Command = (view) => {
     }
 
     const fence = getPlacesFenceAtPos(state, range.from);
+
     if (!fence) {
       return { range };
     }
@@ -64,16 +65,18 @@ export const continuePlacesYamlList: Command = (view) => {
     const line = state.doc.lineAt(range.from);
     const beforeCursor = line.text.slice(0, range.from - line.from);
     const listItem = beforeCursor.match(YAML_LIST_ITEM);
+
     if (!listItem) {
       return { range };
     }
 
     const indent = listItem[1];
-    const contentBeforeCursor = listItem[2].trim();
+    const contentBeforeCursor = (listItem[2] ?? "").trim();
     const afterCursor = line.text.slice(range.from - line.from);
 
     if (!afterCursor.trim() && YAML_BLOCK_SCALAR_VALUE.test(contentBeforeCursor)) {
       const insert = `\n${indent}${indentString(state, getIndentUnit(state))}`;
+
       return {
         changes: { from: range.from, to: range.to, insert },
         range: EditorSelection.cursor(range.from + insert.length),
@@ -87,7 +90,16 @@ export const continuePlacesYamlList: Command = (view) => {
       };
     }
 
+    if (/^[A-Za-z][\w. -]*:/u.test(contentBeforeCursor)
+      && getListParentKey(state, fence, line.number) === 'places') {
+      const keyColumn = getYamlColumn(line.text, getPlacesYamlLine(state, fence, line.number).keyOffset);
+      const insert = `\n${indent}${' '.repeat(keyColumn - getYamlColumn(indent))}`;
+
+      return { changes: { from: range.from, to: range.to, insert }, range: EditorSelection.cursor(range.from + insert.length) };
+    }
+
     const insert = `\n${indent}- `;
+
     return {
       changes: { from: range.from, to: range.to, insert },
       range: EditorSelection.cursor(range.from + insert.length),
@@ -99,6 +111,7 @@ export const continuePlacesYamlList: Command = (view) => {
   }
 
   view.dispatch(state.update(changes, { userEvent: "input" }));
+
   return true;
 };
 

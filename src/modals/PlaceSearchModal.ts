@@ -13,11 +13,13 @@ function calculateResultScore(place: Place, query: string): number {
   const fuzzySearch = prepareFuzzySearch(searchTerm);
 
   const nameMatch = place.name ? fuzzySearch(place.name) : null;
+
   if (nameMatch) {
     return 1000 + nameMatch.score;
   }
 
   const addressMatch = place.address ? fuzzySearch(place.address) : null;
+
   if (addressMatch) {
     return 500 + addressMatch.score;
   }
@@ -30,7 +32,7 @@ export class PlaceSearchModal extends SuggestModal<Place> {
   service: IPlacesService;
   private results: Place[] = [];
   private query: string = "";
-  private searchVersion: number = 0;  // Incremented per search; results from a superseded search are discarded
+  private searchVersion: number = 0;   
   private debouncedSearch: Debouncer<[query: string], void>;
 
   constructor(app: App, service: IPlacesService, initialQuery: string, callback: (place: Place) => void) {
@@ -40,6 +42,7 @@ export class PlaceSearchModal extends SuggestModal<Place> {
     this.service = service;
 
     this.setPlaceholder("Search for Places by name, address, or category...");
+
     if (this.service instanceof AggregatorApiService && !this.service.hasAvailableServices()) {
       this.emptyStateText = "No place lookup services are configured, install and enable at least one service.";
       refreshSuggestModal(this);
@@ -69,13 +72,18 @@ export class PlaceSearchModal extends SuggestModal<Place> {
       this.debouncedSearch(query);
     }
 
-    // Re-sort cached results while the debounced API call is pending.
     if (this.results.length > 0 && query.length > 0) {
+      if (this.service instanceof AggregatorApiService) {
+        return this.service.rankResults(this.results, query);
+      }
+
       const scored = this.results.map(place => ({
         place,
         score: calculateResultScore(place, query)
       }));
+
       scored.sort((a, b) => b.score - a.score);
+
       return scored.map(s => s.place);
     }
 
@@ -121,6 +129,7 @@ export class PlaceSearchModal extends SuggestModal<Place> {
     // Mapbox requires an extra call to get lat/lon.
     void (async () => {
       const resolvedPlace = place.resolvePlace ? await place.resolvePlace() : place;
+
       this.callback(resolvedPlace);
     })();
   }

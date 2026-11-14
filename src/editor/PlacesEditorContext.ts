@@ -1,3 +1,4 @@
+import { scanYamlStructure, type YamlLine, type YamlScope } from "places-shared/settings";
 import type { EditorState } from "@codemirror/state";
 
 export interface PlacesFence {
@@ -6,22 +7,12 @@ export interface PlacesFence {
   endLine: number;
 }
 
-// Structural parents whose children indent on Enter but that carry no
-// schema-declared sub-keys or list templates (string-rule lists). Keys with
-// nestedKeys/listItemTemplates in the CodeBlockRegistry indent through
-// isYamlChildBlockKey without appearing here.
-export const YAML_CHILD_BLOCK_KEYS = new Set(["iconStyles", "labelStyles"]);
-
 export function isPlacesCodeBlock(language: string): boolean {
   return language === "places" || language.startsWith("places-");
 }
 
-export function getLineIndent(line: string): number {
-  return line.match(/^\s*/u)?.[0].length ?? 0;
-}
-
 export function getYamlEmptyKey(trimmedLine: string): string | null {
-  return trimmedLine.match(/^([A-Za-z][\w-]*)\s*:\s*$/u)?.[1] ?? null;
+  return trimmedLine.match(/^([A-Za-z][\w.-]*)\s*:\s*(?:#.*)?$/u)?.[1] ?? null;
 }
 
 export function getPlacesFenceAtLine(state: EditorState, lineNumber: number): PlacesFence | null {
@@ -29,6 +20,7 @@ export function getPlacesFenceAtLine(state: EditorState, lineNumber: number): Pl
 
   for (let startLine = lineNumber; startLine >= 1; startLine--) {
     const line = doc.line(startLine).text.trim();
+
     if (!line.startsWith("```")) {
       continue;
     }
@@ -38,6 +30,7 @@ export function getPlacesFenceAtLine(state: EditorState, lineNumber: number): Pl
     }
 
     const language = line.slice(3).trim().split(/\s+/u)[0] ?? "";
+
     if (!isPlacesCodeBlock(language)) {
       return null;
     }
@@ -62,6 +55,7 @@ export function getPreviousMeaningfulLine(state: EditorState, fence: PlacesFence
   for (let currentLine = lineNumber - 1; currentLine > fence.startLine; currentLine--) {
     const line = state.doc.line(currentLine);
     const trimmed = line.text.trim();
+
     if (!trimmed || trimmed.startsWith("#")) {
       continue;
     }
@@ -70,4 +64,38 @@ export function getPreviousMeaningfulLine(state: EditorState, fence: PlacesFence
   }
 
   return null;
+}
+
+const structures = new WeakMap<EditorState["doc"], Map<number, YamlLine[]>>();
+
+export function getPlacesYamlLine(state: EditorState, fence: PlacesFence, lineNumber: number): YamlLine {
+  let blocks = structures.get(state.doc);
+
+  if (!blocks) structures.set(state.doc, blocks = new Map<number, YamlLine[]>());
+  let lines = blocks.get(fence.startLine);
+
+  if (!lines) {
+    const last = state.doc.line(fence.endLine).text.trim().startsWith("```") ? fence.endLine - 1 : fence.endLine;
+
+    lines = scanYamlStructure(Array.from({ length: last - fence.startLine }, (_, index) => state.doc.line(fence.startLine + index + 1).text));
+    blocks.set(fence.startLine, lines);
+  }
+
+  return lines[lineNumber - fence.startLine - 1];
+}
+
+export function getListParentKey(state: EditorState, fence: PlacesFence, lineNumber: number): string | null {
+  return getPlacesYamlLine(state, fence, lineNumber)?.scope.path.split('.').slice(-1)[0] || null;
+}
+
+export function yamlScopeValues(scope: YamlScope, inherit = false): Map<string, string> {
+  const values = inherit && scope.parent ? yamlScopeValues(scope.parent, true) : new Map<string, string>();
+
+  for (const [key, field] of scope.fields) {
+    const value = field.value.trim().replace(/\s+#.*$/u, '').replace(/^['"]|['"]$/gu, '');
+
+    if (value) values.set(key, value);
+  }
+
+  return values;
 }

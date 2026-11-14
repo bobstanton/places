@@ -1,14 +1,6 @@
 import { Platform } from 'obsidian';
-import {
-  CODED_MAP_DEFAULTS,
-  parseMapConfigPatch,
-  resolveMapConfiguration,
-  type ConfigWarning,
-  type MapConfigPatch,
-  type ResolvedMapConfig,
-  type SettingsTraceLayer,
-} from 'places-shared/settings';
-import { shouldClusterCount } from 'places-shared/map';
+import { CODED_MAP_DEFAULTS, DEFAULT_GRADE_WINDOW, DEFAULT_SPEED_WINDOW, parseMetricWindow, parseMapConfigPatch, resolveMapConfiguration, type ConfigWarning, type MapConfigPatch, type ResolvedMapConfig, type SettingsTraceLayer } from "places-shared/settings";
+import { shouldClusterCount } from "places-shared/map";
 import PlacesPlugin from '../main';
 
 export interface ResolveMapSettingsOptions {
@@ -28,7 +20,6 @@ export interface ResolvedMapSettings {
   readonly clusteringEnabled: boolean;
   readonly layers: readonly SettingsTraceLayer[];
   readonly traceNotes: Readonly<Record<string, string>>;
-  // Non-fatal warnings from parsing the block config (e.g. unknown keys in sub-nodes).
   readonly warnings: readonly ConfigWarning[];
 }
 
@@ -37,7 +28,10 @@ export function resolveMapSettings(options: ResolveMapSettingsOptions): Resolved
     ? PlacesPlugin.settings.clusterThresholdMobile
     : PlacesPlugin.settings.clusterThresholdDesktop;
   const globalPatch: MapConfigPatch = {
+    trackSpeedWindow: parseMetricWindow(PlacesPlugin.settings.speedWindow, DEFAULT_SPEED_WINDOW),
+    trackGradeWindow: parseMetricWindow(PlacesPlugin.settings.gradeWindow, DEFAULT_GRADE_WINDOW),
     poiDiscovery: PlacesPlugin.settings.poiDiscovery,
+    showCurrentDevicePosition: PlacesPlugin.settings.showCurrentDevicePosition,
     poiFilterPatterns: PlacesPlugin.settings.poiFilterPatterns,
     labelTemplate: PlacesPlugin.settings.defaultLabelTemplate || undefined,
     routeLabelTemplate: PlacesPlugin.settings.defaultRouteLabelTemplate || undefined,
@@ -49,15 +43,13 @@ export function resolveMapSettings(options: ResolveMapSettingsOptions): Resolved
     labelStyles: PlacesPlugin.settings.defaultLabelStyles || undefined,
     clusterThreshold: globalThreshold,
     clusterGeoJsonOverlays: PlacesPlugin.settings.clusterGeoJsonOverlays,
+    clusterStyle: PlacesPlugin.settings.clusterStyle,
   };
   const providerPatch = PlacesPlugin.getMapProviderDefaults(options.providerName);
-  // rawBlockSettings is already template-merged and parameter-substituted, and
-  // this block patch is the final per-block layer.
   const configWarnings: ConfigWarning[] = options.warnings ?? [];
-  const parsedBlock = options.blockPatch ?? parseMapConfigPatch(options.rawBlockSettings, configWarnings);
+  const parsedBlock = options.blockPatch ?? parseMapConfigPatch(options.rawBlockSettings);
   const blockPatch = { ...parsedBlock, ...(options.blockOverrides ?? {}) };
   const threshold = Math.max(0, Math.floor(blockPatch.clusterThreshold ?? globalThreshold));
-  // The clustering comparison (behavior contract #1).
   const clusteringEnabled = shouldClusterCount(options.placeCount, threshold);
   const effectiveBlockPatch: MapConfigPatch = { ...blockPatch, clusterThreshold: threshold, clusteringEnabled };
   const resolved = resolveMapConfiguration([
@@ -65,6 +57,7 @@ export function resolveMapSettings(options: ResolveMapSettingsOptions): Resolved
     { source: 'provider', values: providerPatch },
     { source: 'block', values: effectiveBlockPatch },
   ]);
+
   return {
     config: resolved.config,
     clusteringEnabled,

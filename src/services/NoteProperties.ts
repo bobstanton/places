@@ -1,6 +1,6 @@
 import { App, normalizePath } from 'obsidian';
 import { PlaceholderResolver, SimpleContextProvider } from 'placeholder-resolver';
-import { serializeUnknown } from 'places-shared/utils';
+import { serializeUnknown } from "places-shared/utils";
 
 // `{note.*}` - the containing note's frontmatter, substituted into a block's
 // settings.
@@ -47,20 +47,26 @@ export function settingsUseNoteProperties(settings: Record<string, unknown>): bo
     if (key !== undefined && QUERY_KEYS.has(key)) return false;
     if (typeof value === 'string') return containsNotePlaceholder(value);
     if (Array.isArray(value)) return value.some(item => scan(item, key));
+
     if (value && typeof value === 'object') {
       return Object.entries(value as Record<string, unknown>).some(([childKey, child]) => scan(child, childKey));
     }
+
     return false;
   };
+
   return scan(settings, undefined);
 }
 
 // The note's frontmatter, or an empty record when it has none.
 export function readNoteProperties(app: App, sourcePath: string | undefined): Record<string, unknown> {
   if (!sourcePath) return {};
+
   try {
     const file = app.vault.getFileByPath(normalizePath(sourcePath));
+
     if (!file) return {};
+
     return app.metadataCache.getFileCache(file)?.frontmatter ?? {};
   } catch {
     return {};
@@ -75,9 +81,12 @@ function formatNoteValue(value: unknown): string {
     const pad = (part: number) => String(part).padStart(2, '0');
     const date = `${value.getFullYear()}-${pad(value.getMonth() + 1)}-${pad(value.getDate())}`;
     const hasTime = value.getHours() || value.getMinutes() || value.getSeconds();
+
     return hasTime ? `${date}T${pad(value.getHours())}:${pad(value.getMinutes())}` : date;
   }
+
   if (Array.isArray(value)) return value.map(item => formatNoteValue(item)).join(', ');
+
   // A nested YAML map serializes as JSON rather than the "[object Object]" a
   // bare String() would produce - unhelpful in a substituted setting either way,
   // but the JSON at least shows which property was misused.
@@ -95,8 +104,10 @@ const NOTE_PLACEHOLDER_PATTERN = new RegExp(`\\{${NOTE_PREFIX}[.[][^{}]*\\}`, 'g
 // uses them blind to a change in the property it consumed.
 function referencesProperty(value: string, name: string): boolean {
   const references = value.match(NOTE_PLACEHOLDER_PATTERN);
+
   if (!references) return false;
   const nameInPlaceholder = new RegExp(`(^|[^\\w])${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}($|[^\\w])`);
+
   return references.some(reference => nameInPlaceholder.test(reference));
 }
 
@@ -105,6 +116,7 @@ function referencesProperty(value: string, name: string): boolean {
 // undeclared `{parameter.*}` is handled.
 export async function resolveSettingsNoteProperties(settings: Record<string, unknown>, properties: Record<string, unknown>): Promise<ResolvedNoteProperties> {
   const context: Record<string, unknown> = {};
+
   for (const [name, value] of Object.entries(properties)) {
     context[name] = formatNoteValue(value);
   }
@@ -121,32 +133,43 @@ export async function resolveSettingsNoteProperties(settings: Record<string, unk
     if (typeof value === 'string') {
       if (!containsNotePlaceholder(value)) return value;
       const result = await resolver.resolveWithDetails(value);
+
       for (const diagnostic of result.diagnostics) {
         errors.push(diagnostic.kind === 'unresolved-placeholder'
           ? `The ${path} setting references ${diagnostic.placeholder} but this note has no such property.`
           : `Failed to resolve ${diagnostic.placeholder} in ${path}: ${diagnostic.message ?? 'unknown error'}`);
       }
+
       for (const name of Object.keys(context)) {
         if (referencesProperty(value, name)) used[name] = String(context[name]);
       }
+
       return result.result;
     }
+
     if (Array.isArray(value)) {
       const items: unknown[] = [];
+
       for (const item of value) items.push(await resolveValue(item, path));
+
       return items;
     }
+
     if (value && typeof value === 'object') {
       const resolvedEntries: Record<string, unknown> = {};
+
       for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
         resolvedEntries[key] = QUERY_KEYS.has(key) ? child : await resolveValue(child, key);
       }
+
       return resolvedEntries;
     }
+
     return value;
   };
 
   const resolved: Record<string, unknown> = {};
+
   for (const [key, value] of Object.entries(settings)) {
     resolved[key] = QUERY_KEYS.has(key) ? value : await resolveValue(value, key);
   }
@@ -157,5 +180,6 @@ export async function resolveSettingsNoteProperties(settings: Record<string, unk
 // Signature of the note values a block consumed, for render fingerprinting.
 export function buildNoteSignature(used: Record<string, string>): string {
   const names = Object.keys(used).sort();
+
   return names.length === 0 ? '' : names.map(name => `${name}=${used[name]}`).join('');
 }

@@ -1,16 +1,25 @@
+import { TRACK_COLOR_BY_MODES, HEATMAP_COLOR_PRESETS, DEFAULT_DENSITY_COLOR_SCHEME } from "places-shared/track";
 import { CACHE_PARAMETER_DESCRIPTION, CACHE_PARAMETER_VALUES, COMMON_SIZE_PARAMS, COMMON_SIZE_KEYS, QUERY_PARAMETER_NESTED_KEYS } from "places-shared/settings";
 
 // Nested `cache:` under a directions/isochrones group - same grammar as every block-level `cache:`.
 const NESTED_CACHE_DESCRIPTION = `Route overlay cache for this group. ${CACHE_PARAMETER_DESCRIPTION}`;
-import { CodeBlockDefinition, CodeBlockHighlightConfig, ParameterDefinition, NestedKeyDefinition, ListItemTemplate } from "places-shared/services";
 
-// Aggregates definitions from the main plugin and all subplugins.
+import { CodeBlockDefinition, CodeBlockHighlightConfig, ListItemTemplate } from "places-shared/obsidian/services";
+import { ParameterDefinition, NestedKeyDefinition } from "places-shared/services";
+import { isRecord, normalizePropertyName } from "places-shared/utils";
+
+export interface ProvidedCodeBlockValue {
+  value: string;
+  description?: string;
+}
+
 export class CodeBlockRegistry {
   private static _instance: CodeBlockRegistry;
   private definitions: CodeBlockDefinition[] = [];
   private highlightConfigs: Map<string, CodeBlockHighlightConfig> = new Map();
   private knownValues: Map<string, Set<string>> = new Map();
   private providedValues: Map<string, Set<string>> = new Map();
+  private providedValueDescriptions: Map<string, Map<string, string>> = new Map();
   // validKeys unioned with every nested sub-key, derived once per registration.
   // The highlighter validates keys lexically and calls this for every key-bearing
   // line on every re-highlight, and must not rebuild a Set per call.
@@ -20,6 +29,7 @@ export class CodeBlockRegistry {
     if (!CodeBlockRegistry._instance) {
       CodeBlockRegistry._instance = new CodeBlockRegistry();
     }
+
     return CodeBlockRegistry._instance;
   }
 
@@ -36,16 +46,23 @@ export class CodeBlockRegistry {
       const inheritedConfig = inherited
         ? { ...mergeHighlightConfig(inherited, incoming), blockType: incoming.blockType }
         : incoming;
-      const config = existing ? mergeHighlightConfig(existing, inheritedConfig) : inheritedConfig;
+      const declaredChoices = Object.fromEntries((this.getDefinition(incoming.blockType)?.parameters ?? [])
+        .flatMap(parameter => typeof parameter.values !== 'string' && 'choices' in parameter.values
+          ? [[parameter.name, parameter.values.choices.map(value => value.toLowerCase())]] : []));
+      const withChoices = { ...inheritedConfig, knownValues: { ...declaredChoices, ...inheritedConfig.knownValues } };
+      const config = existing ? mergeHighlightConfig(existing, withChoices) : withChoices;
+
       this.highlightConfigs.set(config.blockType, config);
       this.highlightConfigs.set(`${config.blockType}-help`, config);
 
       const validKeys = new Set(config.validKeys);
+
       for (const definitions of Object.values(config.nestedKeys ?? {})) {
         for (const definition of definitions) {
           validKeys.add(definition.name);
         }
       }
+
       this.validKeysByBlockType.set(config.blockType, validKeys);
       this.validKeysByBlockType.set(`${config.blockType}-help`, validKeys);
 
@@ -54,6 +71,7 @@ export class CodeBlockRegistry {
           if (!this.knownValues.has(key)) {
             this.knownValues.set(key, new Set());
           }
+
           values.forEach(v => this.knownValues.get(key)!.add(v));
         }
       }
@@ -66,12 +84,14 @@ export class CodeBlockRegistry {
 
   getDefinition(blockType: string): CodeBlockDefinition | undefined {
     const directMatch = this.definitions.find((definition) => definition.type === blockType);
+
     if (directMatch) {
       return directMatch;
     }
 
     if (blockType.endsWith("-help")) {
       const baseBlockType = blockType.slice(0, -"-help".length);
+
       return this.definitions.find((definition) => definition.type === baseBlockType);
     }
 
@@ -89,7 +109,9 @@ export class CodeBlockRegistry {
   // Top-level keys for root completion; falls back to the full validKeys union when a block declares no rootKeys.
   getRootKeys(blockType: string): Set<string> | undefined {
     const config = this.highlightConfigs.get(blockType);
+
     if (!config) return undefined;
+
     return new Set(config.rootKeys ?? config.validKeys);
   }
 
@@ -97,17 +119,29 @@ export class CodeBlockRegistry {
     return Array.from(this.highlightConfigs.keys());
   }
 
-  // Values a provider supplies at run time. Map styles cannot be listed here:
-  // each provider owns its own set, and a new provider must not require an edit
-  // to the host. Replaces the previous set for the key, so a provider that
-  // unloads takes its values with it.
-  setProvidedValues(key: string, values: Iterable<string>): void {
-    this.providedValues.set(key, new Set([...values].map(value => value.toLowerCase())));
+  setProvidedValues(key: string, values: Iterable<string | ProvidedCodeBlockValue>): void {
+    const normalized = [...values].map(value => typeof value === 'string'
+      ? { value: value.toLowerCase() }
+      : { value: value.value.toLowerCase(), description: value.description });
+
+    this.providedValues.set(key, new Set(normalized.map(value => value.value)));
+    this.providedValueDescriptions.set(key, new Map(normalized.flatMap(value =>
+      value.description ? [[value.value, value.description] as const] : [])));
+  }
+
+  getProvidedValueDescription(key: string, value: string): string | undefined {
+    return this.providedValueDescriptions.get(key)?.get(value.toLowerCase());
+  }
+
+  getValueDetailForBlock(blockType: string, key: string, value: string): string | undefined {
+    return this.highlightConfigs.get(blockType)?.valueDetails?.[key]?.[value];
   }
 
   private mergeProvided(key: string, declared: string[] | undefined): Set<string> | undefined {
     const provided = this.providedValues.get(key);
+
     if (!declared && !provided) return undefined;
+
     return new Set([...(declared ?? []), ...(provided ?? [])]);
   }
 
@@ -117,11 +151,13 @@ export class CodeBlockRegistry {
 
   getKnownValuesForBlock(blockType: string, key: string): Set<string> | undefined {
     const config = this.highlightConfigs.get(blockType);
+
     return this.mergeProvided(key, config?.knownValues?.[key]);
   }
 
   getMultiValueKeysForBlock(blockType: string): Set<string> {
     const config = this.highlightConfigs.get(blockType);
+
     return new Set(config?.multiValueKeys ?? []);
   }
 
@@ -131,6 +167,7 @@ export class CodeBlockRegistry {
       entry.key === key && entry.dependsOn === contextKey,
     );
     const values = contextual?.valuesByContext[contextValue];
+
     return values ? new Set(values) : undefined;
   }
 
@@ -142,17 +179,56 @@ export class CodeBlockRegistry {
     return Boolean(this.getNestedKeys(blockType, parentKey)?.length);
   }
 
+  getIgnoredSettings(blockType: string, settings: Readonly<Record<string, unknown>>): Record<string, unknown> {
+    const config = this.highlightConfigs.get(blockType);
+
+    if (!config) return {};
+    const ignored: Record<string, unknown> = {};
+    const walk = (value: unknown, keys: readonly string[], path: string, schemaPath: string): void => {
+      if (Array.isArray(value)) {
+        value.forEach((entry, index) => walk(entry, keys, `${path}[${index}]`, schemaPath));
+
+        return;
+      }
+
+      if (!isRecord(value)) return;
+      const known = new Map(keys.map(key => [normalizePropertyName(key), key]));
+
+      for (const [key, entry] of Object.entries(value)) {
+        const entryPath = path ? `${path}.${key}` : key;
+        const canonical = known.get(normalizePropertyName(key));
+
+        if (!canonical) {
+          ignored[entryPath] = entry;
+          continue;
+        }
+
+        const childPath = schemaPath ? `${schemaPath}.${canonical}` : canonical;
+        const nested = config.nestedKeys?.[childPath] ?? config.nestedKeys?.[canonical];
+
+        if (nested) walk(entry, nested.map(definition => definition.name), entryPath, childPath);
+      }
+    };
+
+    walk(settings, config.rootKeys ?? config.validKeys, '', '');
+
+    return ignored;
+  }
+
   // The description of a sub-key regardless of which parent declares it.
   // Nested-only keys (colorBy, outline, details, ...) have no top-level
   // ParameterDefinition, and this is the only place their prose lives.
   findNestedKeyDescription(blockType: string, key: string): string | undefined {
     const nestedKeys = this.highlightConfigs.get(blockType)?.nestedKeys;
+
     if (!nestedKeys) return undefined;
 
     for (const definitions of Object.values(nestedKeys)) {
       const match = definitions.find(definition => definition.name === key);
+
       if (match?.description) return match.description;
     }
+
     return undefined;
   }
 
@@ -177,6 +253,8 @@ export class CodeBlockRegistry {
     this.definitions = [];
     this.highlightConfigs.clear();
     this.knownValues.clear();
+    this.providedValues.clear();
+    this.providedValueDescriptions.clear();
     this.validKeysByBlockType.clear();
   }
 }
@@ -184,26 +262,41 @@ export class CodeBlockRegistry {
 function mergeHighlightConfig(existing: CodeBlockHighlightConfig, incoming: CodeBlockHighlightConfig): CodeBlockHighlightConfig {
   const mergeNested = <T extends { name?: string; label?: string }>(left: readonly T[] = [], right: readonly T[] = []): T[] => {
     const merged = new Map<string, T>();
+
     for (const item of [...left, ...right]) merged.set(item.name ?? item.label ?? JSON.stringify(item), item);
+
     return [...merged.values()];
   };
   const nestedKeys: Record<string, NestedKeyDefinition[]> = { ...(existing.nestedKeys ?? {}) };
+
   for (const [parent, definitions] of Object.entries(incoming.nestedKeys ?? {})) {
     nestedKeys[parent] = mergeNested(nestedKeys[parent], definitions);
   }
+
   const listItemTemplates: Record<string, ListItemTemplate[]> = { ...(existing.listItemTemplates ?? {}) };
+
   for (const [parent, templates] of Object.entries(incoming.listItemTemplates ?? {})) {
     listItemTemplates[parent] = mergeNested(listItemTemplates[parent], templates);
   }
+
   const knownValues: Record<string, string[]> = { ...(existing.knownValues ?? {}) };
+
   for (const [key, values] of Object.entries(incoming.knownValues ?? {})) {
     knownValues[key] = [...new Set([...(knownValues[key] ?? []), ...values])];
   }
+
+  const valueDetails: Record<string, Record<string, string>> = { ...(existing.valueDetails ?? {}) };
+
+  for (const [key, details] of Object.entries(incoming.valueDetails ?? {})) {
+    valueDetails[key] = { ...(valueDetails[key] ?? {}), ...details };
+  }
+
   return {
     ...existing,
     validKeys: [...new Set([...existing.validKeys, ...incoming.validKeys])],
     rootKeys: [...new Set([...(existing.rootKeys ?? existing.validKeys), ...(incoming.rootKeys ?? [])])],
     knownValues,
+    valueDetails,
     multiValueKeys: [...new Set([...(existing.multiValueKeys ?? []), ...(incoming.multiValueKeys ?? [])])],
     contextualKnownValues: [...(existing.contextualKnownValues ?? []), ...(incoming.contextualKnownValues ?? [])],
     nestedKeys,
@@ -216,44 +309,41 @@ export const COMMON_KEYS = COMMON_SIZE_KEYS;
 
 const COMMON_MAP_PARAMS: ParameterDefinition[] = [
   { name: "mapProvider", values: "(first available provider)" },
-  { name: "style", description: "Map style variant", values: "streets, satellite, terrain, outdoors (varies by provider)" },
-  { name: "initialZoom", description: "Initial map zoom level", values: "auto, 10, 14, 18" },
+  { name: "style", values: "streets, satellite, terrain, outdoors (varies by provider)" },
+  { name: "initialZoom", values: "auto, 10, 14, 18" },
   { name: "initialCenter", description: "Initial map center as lat,lng", values: "41.408, -75.662" },
-  { name: "minZoom", description: "Minimum map zoom level", values: "0, 3, 5" }
+  { name: "minZoom", values: "0, 3, 5" }
 ];
 
 const COMMON_QUERY_PARAMS: ParameterDefinition[] = [
-  { name: "dataview", description: "Dataview DQL query", values: "FROM \"folder\" WHERE location" },
-  { name: "query", description: "VaultQuery SQL query", values: "SELECT n.path FROM notes n..." },
-  { name: "linkedPlaces", description: "Additional place notes to append", values: "[[Place A]], [[Place B]]" }
+  { name: "dataview", values: { examples: ["FROM \"folder\" WHERE location"] } },
+  { name: "query", values: "SELECT n.path FROM notes n..." },
+  { name: "places", description: "A list of linked files and manual place properties", values: { examples: ["YAML list"] } }
 ];
 
 export const MAP_KEYS = ['mapProvider', 'style', 'initialZoom', 'initialCenter', 'minZoom'];
 export const QUERY_KEYS_HIGHLIGHT = ['query', 'dataview'];
 
 const OVERLAY_KEYS = ['overlays'];
-// Overlay-entry sub-keys (nested under an overlays list item), not root keys.
-const STRUCTURED_OVERLAY_KEYS = ['path', 'bounds', 'corners', 'tiles', 'url', 'tileJson', 'sourceLayer', 'sourceLayers', 'type', 'layerType', 'style', 'hoverStyle', 'attribution', 'filter', 'textField', 'symbolPlacement', 'sprite', 'icon', 'visible'];
+const STRUCTURED_OVERLAY_KEYS = ['path', 'bounds', 'corners', 'tiles', 'url', 'tileJson', 'preset', 'sourceLayer', 'sourceLayers', 'type', 'layerType', 'style', 'hoverStyle', 'popup', 'attribution', 'filter', 'textField', 'symbolPlacement', 'sprite', 'icon', 'visible'];
 
-// Keys valid at the TOP LEVEL of a places block. Drives root key completion.
-// Mirrors the accepted config/data keys (MapConfigResolver CONFIG_KEYS plus the
-// overlays/query-parameter/track-builder/data-source keys parsed separately).
-// Nested-only sub-keys (mode, optimize, waypoints, path, centers, ...) are NOT
-// here - they live in PLACES_NESTED_KEYS and complete only under their parent.
 const PLACES_ROOT_KEYS = [
   ...COMMON_KEYS, ...MAP_KEYS, ...QUERY_KEYS_HIGHLIGHT,
-  'linkedPlaces', 'radius', 'location', 'embeddedPlaces',
-  'showLabels', 'labelTemplate', 'iconRotation', 'markerRenderer', 'legend',
-  'clusterThreshold', 'clusterGeoJsonOverlays',
+  'places', 'radius', 'location',
+  'showLabels', 'showCurrentDevicePosition', 'labelTemplate', 'iconRotation', 'iconImage', 'markerRenderer', 'legend',
+  'popup',
+  'markerMinZoom', 'markerMaxZoom', 'labelMinZoom', 'labelMaxZoom',
+  'trackMinZoom', 'trackMaxZoom', 'overlayMinZoom', 'overlayMaxZoom',
+  'clusterThreshold', 'clusterGeoJsonOverlays', 'clusterStyle', 'heatmapColorScheme', 'iconImageDetail',
   ...OVERLAY_KEYS,
-  'css', 'iconStyles', 'labelStyles', 'markerFilter',
+  'css', 'iconStyles', 'iconImageStyles', 'labelStyles', 'markerFilter',
   'routeProvider', 'directions', 'isochrones',
   'routeLabelTemplate', 'metricLabels', 'legLabelTemplate',
   'waypointLabelTemplate',
   'queryParameters', 'queryParametersPosition', 'queryParametersLayout', 'queryParametersCollapsed', 'track', 'selection',
   'tools',
   'poiDiscovery', 'pitch', 'terrain', 'showHelpWithEmptyMap', 'debug',
-  'fromTemplate',
+  'fromTemplate', 'defaultTemplate',
 ];
 
 // Sub-keys completable on lines nested under structural parent keys. Field
@@ -268,10 +358,11 @@ const OVERLAY_STYLE_NESTED_KEYS: NestedKeyDefinition[] = [
   { name: "color", description: "Line, circle, or fallback fill color" },
   { name: "opacity", description: "Line, circle, text, or icon opacity" },
   { name: "width", description: "Line width in pixels" },
-  { name: "dashArray", description: "Line dash and gap lengths, e.g. 2,2" },
+  { name: "dashArray", description: "Comma-separated dash and gap lengths in multiples of line width, e.g. 2,5" },
   { name: "fillColor", description: "Polygon or circle fill color" },
   { name: "fillOpacity", description: "Polygon fill opacity, 0-1" },
   { name: "circleRadius", description: "Circle radius in pixels" },
+  { name: "radius", description: "Circle radius in pixels (alias for circleRadius)" },
   { name: "strokeColor", description: "Polygon outline or circle stroke color" },
   { name: "strokeWidth", description: "Polygon outline or circle stroke width" },
   { name: "strokeOpacity", description: "Polygon outline or circle stroke opacity" },
@@ -284,8 +375,7 @@ const OVERLAY_STYLE_NESTED_KEYS: NestedKeyDefinition[] = [
 
 // The completion offered under any `style:`/`hoverStyle:` node. Union of the file/vector-tile
 // overlay style fields plus the isochrone-only `colors` list: directions/isochrones/overlay
-// style all complete (and never squiggle) from one shared set. Precise per-node acceptance is
-// enforced at parse time (assertKnownKeys), not here.
+// style all complete (and never squiggle) from one shared set.
 const ALL_STYLE_NESTED_KEYS: NestedKeyDefinition[] = unionNestedKeys(OVERLAY_STYLE_NESTED_KEYS, [
   { name: "colors", description: "Isochrone contour colors (list); repeat when there are more contours than colors", apply: "colors:\n  - " },
 ]);
@@ -299,14 +389,16 @@ const IMAGE_OVERLAY_NESTED_KEYS: NestedKeyDefinition[] = [
 ];
 
 const VECTOR_OVERLAY_NESTED_KEYS: NestedKeyDefinition[] = [
+  { name: "preset", description: "A vector tileset an installed extension supplies, in place of tiles or url. sourceLayers picks among its layers; style, filter, popup, and zoom override its own" },
   { name: "tiles", description: "Vector tile URL template with {z}/{x}/{y}" },
   { name: "url", description: "TileJSON URL supplying the tile source" },
-  { name: "tileJson", description: "TileJSON URL supplying the tile source" },
+  { name: "tileJson", description: "true marks a tiles address as a TileJSON document when it does not end in .json; url entries are TileJSON already" },
   { name: "sourceLayer", description: "Source layer name inside the tiles" },
   { name: "sourceLayers", description: "Source layer names inside the tiles", apply: "sourceLayers:\n  - " },
   { name: "layerType", description: "Layer rendering type: line, fill, circle, or symbol (labels)" },
   { name: "style", description: "Normal feature style", apply: "style:\n  color: " },
   { name: "hoverStyle", description: "Style overrides for the feature under the pointer", apply: "hoverStyle:\n  color: " },
+  { name: "popup", description: "Popup body sections for a clicked feature; without it, features do not answer clicks", apply: "popup:\n  content:\n    - renderer: knap\n      options:\n        templateFile: Places Templates/Popup.knap.md" },
   { name: "filter", description: "Show only matching features. DSL: `index == 1`, `ele >= 1000`, joined with AND. Comparisons: == != > < >= <=" },
   { name: "textField", description: "Symbol layers: feature property to label with (e.g. ele for contour elevations)" },
   { name: "sprite", description: "Symbol layers: external sprite sheet URL supplying icon images (base URL without .json/.png)" },
@@ -318,16 +410,18 @@ const VECTOR_OVERLAY_NESTED_KEYS: NestedKeyDefinition[] = [
 ];
 
 const GEODATA_OVERLAY_NESTED_KEYS: NestedKeyDefinition[] = [
-  { name: "path", description: "Vault GeoJSON, GPX, CSV, or note path" },
+  { name: "path", description: "Vault GeoJSON, GPX, FIT, CSV, or note path" },
   { name: "labelTemplate", description: "Label template resolved against overlay features" },
-  { name: "waypointLabelTemplate", description: "Label template for GPX <wpt> markers (and directions route endpoints). Defaults to the waypoint name; an empty value hides the labels. Cascades from the global setting of the same name." },
+  { name: "waypointLabelTemplate", description: "GPX waypoint and route endpoint labels; defaults to the waypoint name, or empty to hide" },
   { name: "style", description: "Normal feature style", apply: "style:\n  color: " },
   { name: "hoverStyle", description: "Style overrides for the feature under the pointer", apply: "hoverStyle:\n  color: " },
+  { name: "popup", description: "Popup body sections for this overlay", apply: "popup:\n  content:\n    - renderer: knap\n      options:\n        templateFile: Places Templates/Popup.knap.md" },
   ...OVERLAY_ZOOM_NESTED_KEYS,
 ];
 
 function unionNestedKeys(...lists: NestedKeyDefinition[][]): NestedKeyDefinition[] {
   const byName = new Map<string, NestedKeyDefinition>();
+
   for (const list of lists) {
     for (const definition of list) {
       if (!byName.has(definition.name)) {
@@ -335,16 +429,30 @@ function unionNestedKeys(...lists: NestedKeyDefinition[][]): NestedKeyDefinition
       }
     }
   }
+
   return [...byName.values()];
 }
 
 const PLACES_NESTED_KEYS: Record<string, NestedKeyDefinition[]> = {
+  popup: [
+    { name: "content", description: "Ordered renderer and note sections", apply: "content:\n  - renderer: knap\n    options:\n      templateFile: Places Templates/Popup.knap.md" },
+  ],
+  content: [
+    { name: "note", description: "Source note body" },
+    { name: "renderer", description: "Knap or extension popup renderer" },
+    { name: "options", apply: "options:\n  templateFile: Places Templates/Popup.knap.md" },
+  ],
+  'content.options': [
+    { name: "templateFile", description: "Vault Knap template file for renderer: knap", apply: "templateFile: Places Templates/Popup.knap.md" },
+  ],
   style: ALL_STYLE_NESTED_KEYS,
   hoverStyle: ALL_STYLE_NESTED_KEYS,
+  'directions.style': OVERLAY_STYLE_NESTED_KEYS.filter(key => ['color', 'strokeWidth', 'strokeOpacity'].includes(key.name)),
+  'isochrones.style': ALL_STYLE_NESTED_KEYS.filter(key => ['colors', 'fillOpacity', 'strokeWidth', 'strokeOpacity'].includes(key.name)),
   terrain: [
-    { name: "provider", description: "DEM source; enables 3D terrain and turns on hillshade/color relief. Any installed DEM provider (uses that provider's key), `aws` for AWS Terrain Tiles, or a tile URL for a custom raster-DEM source. Unavailable provider is an error, not a fallback." },
-    { name: "reliefProvider", description: "DEM for the hillshade and color-relief layers only; the map stays flat and pitch stays off. Takes the same values as `provider`. Applies when the map provider publishes no DEM of its own, or to draw relief from a different DEM than the 3D surface." },
-    { name: "exaggeration", description: "Vertical exaggeration of the 3D surface. A constant factor (higher = more dramatic), or a zoom curve of @z stops. Default 1.4." },
+    { name: "provider", description: "DEM source enabling 3D terrain and relief; accepts an installed provider, aws, or a tile URL" },
+    { name: "reliefProvider", description: "DEM source for hillshade and color relief on a flat map" },
+    { name: "exaggeration", description: "Vertical scale as a constant or a zoom curve of @z stops; defaults to 1.4" },
     { name: "hillshade", description: "Shaded-relief layer settings", apply: "hillshade:\n  intensity: 0.8" },
     { name: "colorRelief", description: "Elevation-tint layer settings", apply: "colorRelief:\n  opacity: 0.4" },
   ],
@@ -358,15 +466,17 @@ const PLACES_NESTED_KEYS: Record<string, NestedKeyDefinition[]> = {
   ],
   colorRelief: [
     { name: "opacity", description: "Elevation-tint opacity, 0-1. Defaults to 0.4 when terrain is on; 0 disables it." },
-    { name: "colors", description: "Elevation-to-color ramp: a preset name (hypsometric, viridis, spectral, grayscale) or a list of `<elevation in metres>: <color>` entries. Unset uses the default hypsometric tint.", apply: "colors: viridis" },
+    { name: "colors", description: "Elevation-to-color ramp: a preset name (hypsometric, viridis, spectral, grayscale) or a list of `<elevation in meters>: <color>` entries. Unset uses the default hypsometric tint.", apply: "colors: viridis" },
   ],
   track: [
-    { name: "directionArrows", description: "Direction arrow scale along tracks (0 disables, 1 = default)" },
+    { name: "style", description: "Line width, solid/dashed, color, opacity; optional semicolon and outline style. Unspecified values inherit.", apply: 'style: "4 solid red"' },
+    { name: "directionArrows", description: "Direction arrow scale on MapLibre tracks (0 disables, 1 = default)" },
     { name: "details", description: "Clicked-point details presentation: popup or panel" },
-    { name: "colorBy", description: "Color track lines by none, elevation, grade, speed, or pace" },
+    { name: "colorBy", description: "Color track lines by a metric" },
     { name: "outline", description: "Show an outline around track lines" },
-    { name: "defaultVisibility", description: "Initial track visibility: hidden or visible" },
-    { name: "gradeWindow", description: "Span the rolling grade is measured over: a distance such as 100ft or 50m, or a time such as 10min" },
+    { name: "defaultVisibility", description: "Initial track visibility: hidden or visible; unset shows a single unclustered track automatically" },
+    { name: "gradeWindow", description: "Span the rolling map grade is measured over: a distance such as 100ft or 50m" },
+    { name: "gradeDistance", description: "Grade averaging distance in feet; gradeWindow takes precedence" },
     { name: "speedWindow", description: "Span speed and pace are averaged over: a distance such as 200m or 0.25mi, or a time such as 30s" },
     { name: "selection", description: "Parameters written by track and point selection", apply: "selection:\n  trackParameter: selected\n  pointParameter: selectedPoint" },
     { name: "labels", description: "Track start, midpoint, and end labels", apply: "labels:\n  visibility: all" },
@@ -376,12 +486,21 @@ const PLACES_NESTED_KEYS: Record<string, NestedKeyDefinition[]> = {
     { name: "trackParameter", description: "Parameter receiving the selected track path" },
     { name: "pointParameter", description: "Location parameter receiving the exact selected point" },
     { name: "channel", description: "Shared selection channel exposed to installed Places extensions (default: primary)" },
+    { name: "viewportParameter", description: "Base name for note-scoped parameters carrying this map's viewport: view publishes viewNorth, viewSouth, viewEast, viewWest and viewZoom for any block in the note to query" },
+  ],
+  'track.selection': [
+    { name: 'trackParameter' },
+    { name: 'pointParameter' },
+  ],
+  routes: [
+    { name: 'waypoints', description: 'Ordered waypoint notes or coordinates' },
+    { name: 'query', description: 'Query returning ordered waypoints' },
   ],
   labels: [
-    { name: "visibility", description: "Visible track labels: all, none, start, mid, end, or a comma-separated combination" },
-    { name: "start", description: "Start label template" },
-    { name: "midpoint", description: "Midpoint label template" },
-    { name: "end", description: "End label template" },
+    { name: "visibility", description: "Visible track labels: all, none, start, midpoint, end, or a comma-separated combination" },
+    { name: "start" },
+    { name: "midpoint" },
+    { name: "end" },
   ],
   queryParameters: QUERY_PARAMETER_NESTED_KEYS,
   directions: [
@@ -396,7 +515,7 @@ const PLACES_NESTED_KEYS: Record<string, NestedKeyDefinition[]> = {
     { name: "metricLabels", description: "Show total, per-leg, both, or no route metric labels" },
     { name: "labelTemplate", description: "Resolves {this.*} against the whole route, for its total distance and duration label" },
     { name: "legLabelTemplate", description: "Resolves {this.*} against one leg, replacing the total-route label per leg" },
-    { name: "routes", description: "Structured route entries", apply: "routes:\n  - waypoints:\n      - \"[[Pizza By Alfredo]]\"\n      - \"[[Alfredos Pizza Cafe]]\"" },
+    { name: "routes", description: "Structured route entries", apply: "routes:\n  - waypoints:\n      - \"[[Poor Richards]]\"\n      - \"[[Alfredos Pizza Cafe]]\"" },
   ],
   isochrones: [
     { name: "name", description: "Optional overlay group name" },
@@ -419,12 +538,15 @@ const PLACES_NESTED_KEYS: Record<string, NestedKeyDefinition[]> = {
 };
 
 const PLACES_LIST_ITEM_TEMPLATES: Record<string, ListItemTemplate[]> = {
-  // Structural scaffolds only. Waypoint notes are filled from the real-file
-  // completion offered on each list item, and no placeholder note names appear.
+  places: [{ label: "location", insert: "location: 41.408, -75.662\n  name: ", description: "Add a manual place" }],
   routes: [
     { label: "waypoints", insert: "waypoints:\n    - \n    - ", description: "Route through an explicit list of waypoint notes or coordinates" },
     { label: "query", insert: "query: SELECT * FROM places WHERE path IN ({this.outgoingLinks}) ORDER BY title", description: "Route through places returned by VaultQuery" },
     { label: "waypoints from current note", insert: "waypoints:\n    - \"{this}\"\n    - ", description: "Route from this note to a destination" },
+  ],
+  content: [
+    { label: "note", insert: "note", description: "Source note body" },
+    { label: "renderer", insert: "renderer: ", description: "Knap or extension popup renderer" },
   ],
 };
 
@@ -437,23 +559,26 @@ const PLACES_BLOCK_KEYS = Array.from(new Set([
   ...PLACES_ROOT_KEYS,
   ...PLACES_NESTED_KEY_NAMES,
   ...STRUCTURED_OVERLAY_KEYS,
-  'waypoints',       // routes list-item sub-key (from PLACES_LIST_ITEM_TEMPLATES)
-  'embeddedPlaces',  // written as block body, but accepted if typed as a key
+  'waypoints',        
 ]));
 
-// Known values for places block and related help blocks (places-style, places-overlay, places-bases)
 const PLACES_BLOCK_KNOWN_VALUES = {
   clusterGeoJsonOverlays: ['true', 'false'],
+  clusterStyle: ['circles', 'heatmap'],
+  heatmapColorScheme: Object.keys(HEATMAP_COLOR_PRESETS),
+  iconImageDetail: ['standard', 'sharp', 'maximum'],
+  defaultTemplate: ['false'],
   showLabels: ['true', 'false'],
+  showCurrentDevicePosition: ['true', 'false'],
   details: ['popup', 'panel'],
-  colorBy: ['none', 'elevation', 'grade', 'speed', 'pace'],
+  colorBy: [...TRACK_COLOR_BY_MODES],
   outline: ['true', 'false'],
   defaultVisibility: ['hidden', 'visible'],
   shapeMatch: ['map_snap', 'edge_walk', 'walk_or_snap'],
   wayDetails: ['true', 'false'],
   tidy: ['true', 'false'],
   timestamps: ['true', 'false'],
-  visibility: ['all', 'none', 'start', 'mid', 'end'],
+  visibility: ['all', 'none', 'start', 'midpoint', 'end', 'mid', 'middle'],
   markerRenderer: ['native', 'html'],
   method: ['standard', 'basic', 'combined', 'igor', 'multidirectional'],
   poiDiscovery: ['true', 'false'],
@@ -466,75 +591,92 @@ const PLACES_BLOCK_KNOWN_VALUES = {
   queryParametersPosition: ['below', 'above', 'floating'],
   queryParametersLayout: ['horizontal', 'vertical'],
   queryParametersCollapsed: ['true', 'false'],
-  // Covers both query parameter types and overlay kind overrides.
+  showOnMap: ['true', 'false'],
+  showValue: ['true', 'false'],
   type: ['int', 'float', 'string', 'date', 'datetime', 'time', 'boolean', 'enum', 'list', 'location', 'geodata', 'image', 'vector-tile'],
   layerType: ['line', 'fill', 'circle', 'symbol'],
   control: ['slider', 'range', 'number', 'text', 'combobox', 'dropdown', 'segmented', 'toggle', 'date', 'datetime', 'time', 'multiselect', 'location', 'stops', 'custom'],
+  scale: ['linear', 'log'],
 };
 
 const PLACES_BLOCK_DEFINITION: CodeBlockDefinition = {
   type: "places",
   description: "Map with markers, paths, and overlays",
   parameters: [
-      { name: "fromTemplate", description: "Apply a template note's settings as defaults. Accepts one name or a list; later templates override earlier ones, and keys in this block override all. A template is a places-template block in any note, named by link - [[Base Map]], [[Styles#Category]], or a bare name.", values: "[[Base Map]]" },
+      { name: "fromTemplate", description: "Inherit settings from one or more template notes.", values: "[[Base Map]]" },
+      { name: "defaultTemplate", description: "Set false to skip the vault-wide Default template setting for this block. A block's own fromTemplate and keys still apply.", values: { choices: ["false"] } },
       ...COMMON_SIZE_PARAMS,
       ...COMMON_MAP_PARAMS,
       ...COMMON_QUERY_PARAMS,
-      { name: "showLabels", description: "Show each marker name beside its icon", values: "**true**, false" },
-      { name: "markerFilter", description: "Show only markers matching a condition (icon and label together). Same syntax as an iconStyles condition (no => part); the left side is a metadata field, the right side may be a {parameter.*} value. Example patterns: field == value (show that value), field != value (hide it), field >= value (threshold), field IN a, b (set membership; tag IN a, b for tags - pairs with a multiselect parameter).", values: "tag IN {parameter.show}" },
-      { name: "iconRotation", description: "Rotate every marker icon, in degrees clockwise from true north. A plain number rotates them all equally; a per-place template rotates each by its own data, e.g. {this.wind_direction_10m}. Arrow glyphs usually point east, so add an offset in the template: {(this.wind_direction_10m + 270) % 360}.", values: "45, {this.wind_direction_10m}, {(this.bearing + 270) % 360}" },
-      { name: "markerRenderer", description: "Marker renderer for MapLibre-based providers. Native is the default; opt into HTML markers only when a block needs arbitrary marker CSS.", values: "**native**, html" },
+      { name: "showLabels", description: "Show each marker name beside its icon", values: { choices: ["true", "false"], default: "true" } },
+      { name: "showCurrentDevicePosition", description: "Available on mobile.", values: { choices: ["true", "false"], default: "false" } },
+      { name: "popup", description: "Marker popup body sections", values: "content:\n  - renderer: knap\n    options:\n      templateFile: Places Templates/Popup.knap.md\n  - note" },
+      ...['marker', 'label', 'track', 'overlay'].flatMap(target => [
+        { name: `${target}MinZoom`, description: `Minimum zoom (0-24) for ${target} visibility. Also supported in note properties and query columns.`, values: { examples: ["0", "12", "24"] } },
+        { name: `${target}MaxZoom`, description: `Maximum zoom (0-24) for ${target} visibility. Also supported in note properties and query columns.`, values: { examples: ["0", "12", "24"] } },
+      ]),
+      { name: "markerFilter", description: "Filter markers and labels by metadata conditions; a list keeps matches to any rule", values: "tag IN {parameter.show}" },
+      { name: "iconRotation", description: "Degrees clockwise from north; accepts a number or a per-place template", values: "45, {this.wind_direction_10m}, {(this.bearing + 270) % 360}" },
+      { name: "iconImageStyles", description: "Conditional picture-marker styles; accepts iconStyles rule syntax", values: "condition => css-properties" },
+      { name: "iconImage", description: "Picture marker from a path, URL, or per-place template; missing images retain the glyph", values: { examples: ["{this.path}", "02 - Overlays/scranton-1889-usgs-topo.jpg"] } },
+      { name: "markerRenderer", description: "MapLibre markers; native is the default, HTML supports arbitrary marker CSS", values: { choices: ["native", "html"], default: "native" } },
       { name: "track", description: "Track rendering, details, labels, and shared selection parameters.", values: "directionArrows: 1\n  details: panel\n  selection:\n    trackParameter: selected\n    pointParameter: selectedPoint" },
-      { name: "selection", description: "General item and point selection shared by parameters and installed Places extensions.", values: "itemParameter: selectedItem\n  pointParameter: selectedPoint\n  channel: primary" },
-      { name: "legend", description: "Show color legend for elevation/grade coloring", values: "**hidden**, top, bottom" },
-      { name: "overlays", description: "Overlays as an expanded list; entry kind is inferred. Supports GeoJSON, GPX, CSV, and note paths, plus image and vector tile entries.", values: "- path: 02 - Overlays/scranton-neighborhoods.geojson\n  labelTemplate: \"{this.name}\"\n  minZoom: 10" },
+      { name: "selection", description: "Parameters for selected items, track points, and the map viewport", values: "itemParameter: selectedItem\n  pointParameter: selectedPoint\n  viewportParameter: view" },
+      { name: "legend", description: "Show color legend for elevation/grade coloring", values: { choices: ["hidden", "top", "bottom"], default: "hidden" } },
+      { name: "overlays", description: "Overlays as an expanded list; entry kind is inferred. Supports GeoJSON, GPX, FIT, CSV, and note paths, plus image and vector tile entries.", values: { examples: ["- path: 02 - Overlays/scranton-neighborhoods.geojson\n  labelTemplate: \"{this.name}\"\n  minZoom: 10"] } },
       { name: "routeProvider", description: "Default route service for all directions/isochrones in this block. Falls back to the map provider's own service when omitted.", values: "any installed route provider" },
-      { name: "directions", description: "Generated route overlays as a list of group mappings. Every route entry holds either a `waypoints` list or a `query`, not both.", values: "- mode: drive\n  routes:\n    - waypoints:\n        - \"[[Pizza By Alfredo]]\"\n        - \"[[Alfredos Pizza Cafe]]\"" },
-      { name: "isochrones", description: "Generated reachable-area overlays as a list of mappings with unit-bearing ranges and text centers.", values: "- mode: walk\n  ranges:\n    - 15 min\n    - 5 mi\n  centers:\n    - \"[[Dunder Mifflin Scranton]]\"" },
-      { name: "name", description: "Optional name for a directions or isochrone group.", values: "bike route" },
+      { name: "directions", description: "Route overlays; each route specifies waypoints or a query", values: "- mode: drive\n  routes:\n    - waypoints:\n        - \"[[Poor Richards]]\"\n        - \"[[Alfredos Pizza Cafe]]\"" },
+      { name: "isochrones", description: "Reachable-area overlays with time or distance ranges", values: "- mode: walk\n  ranges:\n    - 15 min\n    - 5 mi\n  centers:\n    - \"[[Dunder Mifflin Scranton]]\"" },
+      { name: "name", description: "Optional name for a directions or isochrone group.", values: { examples: ["bike route"] } },
       { name: "provider", description: "Route service for one directions/isochrones group when nested under those settings. Overrides routeProvider.", values: "any installed route provider" },
       { name: "cache", description: `Set inside a directions/isochrones group. ${CACHE_PARAMETER_DESCRIPTION}`, values: CACHE_PARAMETER_VALUES },
-      { name: "mode", description: "Travel mode for directions/isochrones when nested under those settings", values: "**drive**, walk, bike" },
-      { name: "routes", description: "Structured route mappings nested under directions. Each entry holds either a `waypoints` list or a `query`, not both.", values: "- waypoints:\n    - \"[[Pizza By Alfredo]]\"\n    - \"[[Dunder Mifflin Scranton]]\"\n    - \"[[Alfredos Pizza Cafe]]\"" },
-      { name: "optimize", description: "When true, reorder intermediate direction stops if the provider supports route optimization", values: "**false**, true" },
+      { name: "mode", description: "Travel mode for directions/isochrones when nested under those settings", values: { choices: ["drive", "walk", "bike"], default: "drive" } },
+      { name: "routes", description: "Structured route mappings nested under directions. Each entry holds either a `waypoints` list or a `query`, not both.", values: "- waypoints:\n    - \"[[Poor Richards]]\"\n    - \"[[Dunder Mifflin Scranton]]\"\n    - \"[[Alfredos Pizza Cafe]]\"" },
+      { name: "optimize", description: "When true, reorder intermediate direction stops if the provider supports route optimization", values: { examples: ["false", "true"], default: "false" } },
       { name: "metricLabels", description: "Directions metric labels to render: total route, each leg between stops, both, or none.", values: "**total**, legs, both, none" },
-      { name: "color", description: "Directions route line color. Quote hexadecimal values so YAML does not treat them as comments.", values: "\"#2563eb\"" },
-      { name: "routeLabelTemplate", description: "Template for generated directions labels. Uses route properties like {this.distance_text}, {this.duration_text}, {this.start_name}, and {this.end_name}.", values: "{this.distance_text} · {this.duration_text}" },
-      { name: "legLabelTemplate", description: "Template for generated per-leg directions labels. Uses leg properties like {this.from_name}, {this.to_name}, {this.distance_text}, and {this.duration_text}.", values: "{this.from_name} → {this.to_name}: {this.distance_text} · {this.duration_text}" },
-      { name: "waypointLabelTemplate", description: "Template for the marker label at each route waypoint (start / stop / end). Uses {this.name}, {this.role}, {this.role_label}, {this.index}, {this.icon}, {this.path}. Empty hides the labels. Also applies to GPX <wpt> markers.", values: "{this.role_label}: {this.name}" },
+      { name: "color", description: "Directions route line color", values: "\"#2563eb\"" },
+      { name: "routeLabelTemplate", description: "Labels resolved against generated route properties", values: "{this.distance_text} · {this.duration_text}" },
+      { name: "legLabelTemplate", description: "Labels resolved against properties of each route leg", values: "{this.from_name} → {this.to_name}: {this.distance_text} · {this.duration_text}" },
+      { name: "waypointLabelTemplate", description: "Route waypoint and GPX waypoint labels; empty hides labels", values: "{this.role_label}: {this.name}" },
       { name: "ranges", description: "Positive isochrone contours with a time or distance unit. Time and distance values may be mixed.", values: "- 15 min\n- 30 min\n- 5 mi" },
       { name: "centers", description: "Isochrone center points as a list of note references, coordinates, or named coordinates.", values: "- \"[[Schrute Farms]]\"\n- \"Downtown Scranton: 41.408, -75.662\"" },
-      { name: "polygons", description: "Render isochrones as polygons instead of lines when provider supports it", values: "**true**, false" },
-      { name: "traffic", description: "Account for traffic on driving directions and isochrones. Honored by Mapbox and Geoapify; ignored by other providers and non-drive modes. Bypasses the overlay cache.", values: "**false**, true" },
+      { name: "polygons", description: "Render isochrones as polygons instead of lines when provider supports it", values: { choices: ["true", "false"], default: "true" } },
+      { name: "traffic", description: "Account for traffic on driving directions and isochrones. Honored by Mapbox and Geoapify; ignored by other providers and non-drive modes. Bypasses the overlay cache.", values: { choices: ["false", "true"], default: "false" } },
       { name: "colors", description: "List of quoted colors for isochrone polygons. Colors repeat when there are more contours than colors.", values: "- \"#4f46e5\"\n- \"#0891b2\"\n- \"#16a34a\"" },
       { name: "fillOpacity", description: "Isochrone polygon fill opacity. Accepts decimals from 0 to 1 or percentages.", values: "0.14 or 14%" },
       { name: "strokeOpacity", description: "Directions route or isochrone contour line opacity. Accepts decimals from 0 to 1 or percentages.", values: "0.85 or 85%" },
       { name: "strokeWidth", description: "Directions route or isochrone contour line width in pixels.", values: "2" },
       { name: "maxZoom", description: "Maximum zoom where an isochrone overlay group is visible.", values: "8, 12, 16" },
       { name: "clusterThreshold", description: "Override marker clustering for this map. 0 disables clustering; positive numbers cluster when point count reaches that threshold.", values: "0, 100, 500" },
-      { name: "clusterGeoJsonOverlays", description: "Include GeoJSON overlay point features in marker clustering for this map.", values: "**true**, false" },
-      { name: "css", description: "Raw CSS injected with the map. Marker selectors need HTML markers (Leaflet or markerRenderer: html); popup/legend/container selectors are supported on every provider.", values: ".places-marker-icon { opacity: 0.7; }" },
+      { name: "clusterGeoJsonOverlays", description: "Include GeoJSON overlay point features in marker clustering for this map.", values: { choices: ["true", "false"], default: "true" } },
+      { name: "clusterStyle", description: "Draw clusters as counted circles or as a density heatmap. Zoom drills into either.", values: { choices: ["circles", "heatmap"], default: "circles" } },
+      { name: "heatmapColorScheme", description: "Gradient for clusterStyle: heatmap. Accepts preset names or comma-separated hex colors.", values: { choices: Object.keys(HEATMAP_COLOR_PRESETS), default: DEFAULT_DENSITY_COLOR_SCHEME } },
+      { name: "iconImageDetail", description: "Image pixel ratio for picture markers", values: { choices: ["standard", "sharp", "maximum"], default: "standard" } },
+      { name: "css", description: "Raw CSS injected with the map. Marker selectors need HTML markers (Leaflet or markerRenderer: html); popup/legend/container selectors are supported on every provider.", values: { examples: [".places-marker-icon { opacity: 0.7; }"] } },
       { name: "iconStyles", description: "Conditional icon styling rules. Native markers translate a supported property subset; the rest needs markerRenderer: html.", values: "condition => css-properties" },
       { name: "labelStyles", description: "Conditional label styling rules. Native labels translate a property subset; full CSS applies on Leaflet only.", values: "condition => css-properties" },
       { name: "labelTemplate", description: "Template for marker label text", values: "{this.filename}, {h.before(this.name, '(')}" },
-      { name: "queryParameters", description: "UI-adjustable parameters. Each entry declares a name referenced as {parameter.name} in the query or any other block setting, with a type, optional control, and default. Changing a control re-renders the affected data.", values: "- name: days\n  type: int\n  control: slider\n  min: 0\n  max: 100\n  default: 7" },
-      { name: "queryParametersPosition", description: "Where the query parameter controls render relative to the map.", values: "**below**, above, floating" },
-      { name: "queryParametersLayout", description: "Whether the query parameter controls flow along a row or stack one per line.", values: "**horizontal**, vertical" },
-      { name: "queryParametersCollapsed", description: "Initial state of the control strip's collapse toggle. A floating strip always has the toggle; declaring this adds it to an above or below strip too.", values: "true, **false**" },
-      { name: "tools", description: "Extension-owned interactive MapLibre tools, keyed by registered tool id.", values: "playback:\n  track: \"[[Lake Scranton Weekend Run]]\"\n  duration: 60s" },
-      { name: "control", description: "Input control for a query parameter, nested under queryParameters. Inferred from type when omitted.", values: "slider, range, number, text, combobox, dropdown, segmented, toggle, date, datetime, time, multiselect, location, stops" },
-      { name: "label", description: "Display label for a query parameter control, nested under queryParameters. Defaults to the parameter name.", values: "Days ahead" },
-      { name: "default", description: "Initial value for a query parameter, nested under queryParameters. On a list parameter, all selects every option, including optionsQuery results.", values: "7, all" },
+      { name: "queryParameters", description: "Controls for {parameter.name} values; changes refresh affected data", values: "- name: days\n  type: int\n  control: slider\n  min: 0\n  max: 100\n  default: 7" },
+      { name: "queryParametersPosition", description: "Where the query parameter controls render relative to the map.", values: { choices: ["below", "above", "floating"], default: "below" } },
+      { name: "queryParametersLayout", description: "Whether the query parameter controls flow along a row or stack one per line.", values: { choices: ["horizontal", "vertical"], default: "horizontal" } },
+      { name: "queryParametersCollapsed", description: "Initial state of the control strip's collapse toggle. A floating strip always has the toggle; declaring this adds it to an above or below strip too.", values: { choices: ["true", "false"], default: "false" } },
+      { name: "tools", description: "Interactive map tools supplied by installed extensions", values: "playback:\n  track: \"[[Lake Scranton Weekend Run]]\"\n  duration: 60s" },
+      { name: "control", description: "Input control for a query parameter, nested under queryParameters. Inferred from type when omitted.", values: { examples: ["slider", "range", "number", "text", "combobox", "dropdown", "segmented", "toggle", "date", "datetime", "time", "multiselect", "location", "stops"] } },
+      { name: "label", description: "Display label for a query parameter control, nested under queryParameters. Defaults to the parameter name.", values: { examples: ["Days ahead"] } },
+      { name: "default", description: "Initial value for a query parameter, nested under queryParameters. On a list parameter, all selects every option, including optionsQuery results.", values: { examples: ["7", "all"] } },
       { name: "options", description: "Allowed values for an enum or list query parameter, nested under queryParameters. Also suggestions for a combobox.", values: "[any, 🍕, 🍝]" },
-      { name: "optionsQuery", description: "VaultQuery SQL whose first column supplies the options at render time, in query order. Nested under queryParameters.", values: "SELECT DISTINCT icon FROM places ORDER BY icon" },
-      { name: "step", description: "Slider or number step for a numeric query parameter, nested under queryParameters.", values: "1, 0.5" },
-      { name: "width", description: "Control width for a query parameter, nested under queryParameters. Fixed lengths size the input; percentages size the parameter relative to the full control strip. Fixed lengths have no effect on toggle, segmented, or multiselect.", values: "240px, 18rem, 30ch, 50%" },
-      { name: "range", description: "Shorthand for min and max on a numeric query parameter, nested under queryParameters.", values: "0, 100" },
-      { name: "poiDiscovery", description: "Enable clicking map features to discover POIs", values: "**true**, false" },
-      { name: "pitch", description: "Allow tilting the map into an oblique 3D view (drag with right mouse / two fingers).", values: "**false**, true" },
-      { name: "terrain", description: "3D terrain, hillshade, and color relief, grouped. Sub-keys: provider (DEM source, enables 3D + relief), exaggeration, and the hillshade/colorRelief layers.", values: "provider: mapbox\n  exaggeration: 2\n  hillshade:\n    intensity: 0.8" },
-      { name: "showHelpWithEmptyMap", description: "When this block has no places, show the empty map either way; set false to hide the help text below it. Overrides the global setting.", values: "**true**, false" },
-      { name: "debug", description: "Diagnostics, combinable as a comma list. true shows map state/viewport/performance on the map; settings shows a table of how every setting resolved across defaults, global, provider, and block layers; parameters shows parameter values, {parameter.*} substitutions, and per-rule markerFilter results, and adds a fields-and-filters inspector to marker popups", values: "**false**, true, settings, parameters" }
+      { name: "optionsQuery", description: "VaultQuery SQL whose first column supplies the options at render time, in query order. On a range control it supplies the limits instead: the column's smallest and largest number. Nested under queryParameters.", values: { examples: ["SELECT DISTINCT icon FROM places ORDER BY icon"] } },
+      { name: "step", description: "Slider or number step for a numeric query parameter, nested under queryParameters.", values: { examples: ["1", "0.5"] } },
+      { name: "scale", description: "Spacing of a range control's values along its slider, nested under queryParameters. log spaces them by ratio, giving values near min most of the slider.", values: { choices: ["linear", "log"], default: "linear" } },
+      { name: "range", description: "Shorthand for min and max on a numeric query parameter, nested under queryParameters.", values: { examples: ["[0, 100]"] } },
+      { name: "showOnMap", description: "Show a location parameter or every stops entry as a map marker.", values: { choices: ["false", "true"], default: "false" } },
+      { name: "icon", description: "Marker icon for a parameter shown on the map. Declaring it enables showOnMap.", values: { examples: ["🎯"] } },
+      { name: "icons", description: "Positional marker icons for a stops parameter. Declaring the list enables showOnMap.", values: { examples: ["[1️⃣, 2️⃣, 🏁]"] } },
+      { name: "poiDiscovery", description: "Enable clicking map features to discover POIs", values: { choices: ["true", "false"], default: "true" } },
+      { name: "pitch", description: "Allow tilting the map into an oblique 3D view (drag with right mouse / two fingers).", values: { examples: ["false", "true"], default: "false" } },
+      { name: "terrain", description: "3D terrain, hillshade, and elevation tint", values: "provider: mapbox\n  exaggeration: 2\n  hillshade:\n    intensity: 0.8" },
+      { name: "showHelpWithEmptyMap", description: "Show help below an empty map. Overrides the global setting", values: { choices: ["true", "false"], default: "true" } },
+      { name: "debug", description: "Map diagnostics or settings and parameter tables; accepts a comma-separated list", values: { choices: ["false", "true", "settings", "parameters"], default: "false" } }
   ]
 };
 
@@ -545,8 +687,8 @@ export const MAIN_PLUGIN_DEFINITIONS: CodeBlockDefinition[] = [
     description: "Note-scoped parameter controls shared by every block in the note",
     parameters: [
       { name: "queryParameters", description: "Parameter definitions; every block in the note resolves them as {parameter.name}. Block-local declarations shadow them by name.", values: "- name: days\n  type: int\n  control: slider\n  min: 0\n  max: 100\n  default: 7" },
-      { name: "queryParametersLayout", description: "Whether the controls flow along a row or stack one per line.", values: "**horizontal**, vertical" },
-      { name: "queryParametersCollapsed", description: "Declaring this adds a collapse toggle to the strip, starting collapsed when true.", values: "true, false" },
+      { name: "queryParametersLayout", description: "Whether the controls flow along a row or stack one per line.", values: { choices: ["horizontal", "vertical"], default: "horizontal" } },
+      { name: "queryParametersCollapsed", description: "Declaring this adds a collapse toggle to the strip, starting collapsed when true.", values: { choices: ["true", "false"] } },
     ],
   },
   {
@@ -554,28 +696,28 @@ export const MAIN_PLUGIN_DEFINITIONS: CodeBlockDefinition[] = [
     description: "Elevation and track analysis charts",
     parameters: [
       ...COMMON_SIZE_PARAMS,
-      { name: "chartType", values: "**elevation**, elevation-grade, elevation-time, speed, speed-time, pace, pace-time, grade" },
+      { name: "chartType", values: { choices: ["elevation", "elevation-grade", "elevation-time", "speed", "speed-time", "pace", "pace-time", "grade"], default: "elevation" } },
       { name: "track1", description: "First track for comparison (or single track), as a track note or track file path", values: "[[Morning Run - Monday]]" },
       { name: "track2", description: "Second track for comparison, as a track note or track file path", values: "[[Morning Run - Tuesday]]" },
-      { name: "position", description: "Coordinate to highlight on a single-track chart", values: "{parameter.selectedPoint}" },
+      { name: "position", description: "Coordinate to highlight on a single-track chart", values: { examples: ["{parameter.selectedPoint}"] } },
       { name: "selection", description: "Typed selection channel shared with maps and other charts", values: "channel: primary" },
-      { name: "title", description: "Heading above the chart. Omit for no title", values: "\"Elevation Profile\", \"My Hike\"" },
-      { name: "fillArea", description: "Fill area under line", values: "**true**, false" },
-      { name: "colorBy", description: "Color chart fill by data", values: "**none**, elevation, grade" },
+      { name: "title", description: "Heading above the chart. Omit for no title", values: { examples: ["\"Elevation Profile\"", "\"My Hike\""] } },
+      { name: "fillArea", values: { choices: ["true", "false"], default: "true" } },
+      { name: "colorBy", description: "Color chart fill by data", values: { choices: ["none", "elevation", "grade"], default: "none" } },
       { name: "gradeWindow", description: "Span the rolling grade is measured over", values: "**100ft**, 50m, 0.1mi, 10min" },
       { name: "speedWindow", description: "Span speed and pace are averaged over", values: "**200m**, 500ft, 0.25mi, 30s, 5min" },
-      { name: "legend", description: "Show color legend for grade/elevation coloring", values: "**hidden**, top, bottom" },
-      { name: "showGrid", values: "**true**, false" },
-      { name: "showPoints", values: "**false**, true" },
-      { name: "smoothing", description: "Smooth the line", values: "**true**, false" },
-      { name: "stats", description: "Statistics to display", values: "elevation, time, speed, pace, distance, points" },
+      { name: "legend", description: "Show color legend for grade/elevation coloring", values: { choices: ["hidden", "top", "bottom"], default: "hidden" } },
+      { name: "showGrid", values: { choices: ["true", "false"], default: "true" } },
+      { name: "showPoints", values: { choices: ["false", "true"], default: "false" } },
+      { name: "smoothing", values: { choices: ["true", "false"], default: "true" } },
+      { name: "stats", values: { examples: ["elevation", "time", "speed", "pace", "distance", "points"] } },
       { name: "axisColor", values: "**#666**, #000, rgb()" },
       { name: "elevationColor", values: "**#2196F3**" },
       { name: "speedColor", values: "**#ff7f00**" },
       { name: "paceColor", values: "**#dc3545**" },
       { name: "gradeColor", values: "**#ff7f00**" },
       { name: "fontSize", values: "**12**, 10, 14, 16" },
-      { name: "autorefresh", description: "Re-render when the vault index changes", values: "**(global setting)**, true, false" }
+      { name: "autorefresh", description: "Re-render when the vault index changes", values: { choices: ["true", "false"], default: "(global setting)" } }
     ]
   },
   {
@@ -585,19 +727,19 @@ export const MAIN_PLUGIN_DEFINITIONS: CodeBlockDefinition[] = [
       ...COMMON_SIZE_PARAMS,
       ...COMMON_MAP_PARAMS,
       ...COMMON_QUERY_PARAMS,
-      { name: "strategy", description: "Analysis algorithm", values: "**track-corridor**, density-cloud, opacity-stacking" },
+      { name: "strategy", values: { choices: ["track-corridor", "density-cloud", "opacity-stacking"], default: "track-corridor" } },
       { name: "gridSize", description: "Grid cell size (feet/meters)", values: "**100**, 50, 200, 500" },
-      { name: "minFrequency", description: "Hide segments fewer tracks than this passed along", values: "**2**, 1, 3, 5" },
-      { name: "maxSegments", description: "Cap on rendered segments. Lower it when a dense vault makes the map slow", values: "**100**, 50, 200, unlimited" },
-      { name: "colorScheme", description: "Color palette: a preset name or a custom comma-separated list of hex colors interpolated low-to-high.", values: "**yellow-to-red**, blues, heat, traffic, or a custom gradient" },
-      { name: "lineThickness", description: "Line thickness (pixels)", values: "**3**, 2, 5, 10" },
-      { name: "lineStyle", description: "Line dash pattern", values: "**solid**, \"5,10\", \"10,5\"" },
+      { name: "minFrequency", description: "Minimum number of tracks required to display a segment", values: "**2**, 1, 3, 5" },
+      { name: "maxSegments", description: "Maximum number of rendered segments", values: "**100**, 50, 200" },
+      { name: "colorScheme", description: `Defaults to ${DEFAULT_DENSITY_COLOR_SCHEME} for density-cloud and yellow-to-red for routes. Accepts preset names or comma-separated hex colors.`, values: `${Object.keys(HEATMAP_COLOR_PRESETS).join(', ')}, or a custom gradient`, multiValue: true },
+      { name: "lineWidth", description: "Line width (pixels)", values: "**3**, 2, 5, 10" },
+      { name: "lineStyle", description: "solid, dashed, or dash lengths in multiples of line width", values: "**solid**, dashed, \"2,5\", \"2 5\"" },
       { name: "lineOpacity", description: "One opacity for every segment, overriding the frequency-driven range", values: "0.0 - 1.0" },
       { name: "minOpacity", description: "Minimum opacity (opacity-stacking)", values: "**0.01**, 0.05, 0.1" },
       { name: "maxOpacity", description: "Maximum opacity at max overlap", values: "**1.0**, 0.8, 0.5" },
-      { name: "legendLocation", description: "Legend position", values: "**hidden**, top, bottom" },
-      { name: "infoLocation", description: "Info text position", values: "**hidden**, top, bottom" },
-      { name: "autorefresh", description: "Re-render when the vault index changes", values: "**(global setting)**, true, false" }
+      { name: "legendLocation", values: { choices: ["hidden", "top", "bottom"], default: "hidden" } },
+      { name: "infoLocation", values: { choices: ["hidden", "top", "bottom"], default: "hidden" } },
+      { name: "autorefresh", description: "Re-render when the vault index changes", values: { choices: ["true", "false"], default: "(global setting)" } }
     ]
   },
   {
@@ -608,26 +750,26 @@ export const MAIN_PLUGIN_DEFINITIONS: CodeBlockDefinition[] = [
       { name: "minOverlap", description: "Minimum overlap (0-100 or 0-1)", values: "50, 70, 85 (or 0.5, 0.7)" },
       { name: "tolerance", description: "Max deviation in degrees for Frechet matching (~111 km/degree)", values: "**0.01** (~1.1km), 0.1 (~11km), 0.5 (~55km)" },
       { name: "overlapTolerance", description: "Distance tolerance in meters for overlap calculation", values: "**50**, 25, 100" },
-      { name: "maxResults", description: "Maximum tracks to show", values: "**unlimited**, 5, 10, 20" },
+      { name: "maxResults", description: "Maximum tracks to show; omit for all matches", values: "5, 10, 20" },
       { name: "radius", description: "Search radius (miles/km)", values: "**note's Distance**, 1.0, 2, 5, 10" },
       { name: "location", description: "Coordinates for point-based search", values: "**note's Location**, 41.408,-75.662" },
-      { name: "showPersonalBest", description: "Mark the fastest run of each matched route", values: "**false**, true" },
-      { name: "showSpeedTime", description: "Show speed/duration columns", values: "**false**, true" },
-      { name: "autorefresh", description: "Re-render when the vault index changes", values: "**(global setting)**, true, false" }
+      { name: "showPersonalBest", description: "Mark the fastest run of each matched route", values: { choices: ["false", "true"], default: "false" } },
+      { name: "showSpeedTime", description: "Show speed/duration columns", values: { choices: ["false", "true"], default: "false" } },
+      { name: "autorefresh", description: "Re-render when the vault index changes", values: { choices: ["true", "false"], default: "(global setting)" } }
     ]
   },
   {
     type: "places-compare",
     description: "Compare two tracks side-by-side",
     parameters: [
-      { name: "track1", description: "First track to compare", values: "[[Lake Scranton Weekend Run]]" },
-      { name: "track2", description: "Second track to compare", values: "[[Fun Run Training Route]]" },
+      { name: "track1", values: "[[Lake Scranton Weekend Run]]" },
+      { name: "track2", values: "[[Fun Run Training Route]]" },
       { name: "tolerance", description: "Overlap detection distance (m/ft)", values: "**50**, 20, 100" },
       { name: "height", values: "**300px**, 400px, 500px" },
       { name: "mapProvider", values: "any installed map provider" },
-      { name: "showMiniMap", description: "Show track comparison map", values: "**true**, false" },
-      { name: "showMetrics", description: "Show the distance, elevation, and overlap comparison tables", values: "**true**, false" },
-      { name: "autorefresh", description: "Re-render when the vault index changes", values: "**(global setting)**, true, false" }
+      { name: "showMiniMap", values: { choices: ["true", "false"], default: "true" } },
+      { name: "showMetrics", description: "Show the distance, elevation, and overlap comparison tables", values: { choices: ["true", "false"], default: "true" } },
+      { name: "autorefresh", description: "Re-render when the vault index changes", values: { choices: ["true", "false"], default: "(global setting)" } }
     ]
   },
   {
@@ -636,18 +778,18 @@ export const MAIN_PLUGIN_DEFINITIONS: CodeBlockDefinition[] = [
     parameters: [
       { name: "track", description: "Track note or file to snap. Defaults to the current note.", values: "[[Morning Run - Monday]]" },
       { name: "provider", description: "Snap service to use. Defaults to the first available provider with snap support.", values: "any installed snap provider" },
-      { name: "mode", description: "Travel mode. Decides which ways are eligible: walk and bike include footpaths, tracks, and cycleways, drive is roads only", values: "**drive**, walk, bike" },
-      { name: "radius", description: "Search radius around each point. A bare number uses the units setting; an explicit unit overrides it", values: "**300m**, 500m, 0.2mi" },
-      { name: "costing", description: "Valhalla costing name, overriding the one mode resolves to. Reaches costings mode cannot express", values: "pedestrian, bicycle, auto, truck, bus, motor_scooter" },
+      { name: "mode", description: "Travel mode. Decides which ways are eligible: walk and bike include footpaths, tracks, and cycleways, drive is roads only", values: { choices: ["drive", "walk", "bike"], default: "drive" } },
+      { name: "radius", description: "Search radius around each point. A bare number uses the units setting; an explicit unit overrides it", values: { examples: ["300m", "500m", "0.2mi"], default: "300m" } },
+      { name: "costing", description: "Valhalla costing name, overriding the one mode resolves to. Reaches costings mode cannot express", values: { examples: ["pedestrian", "bicycle", "auto", "truck", "bus", "motor_scooter"] } },
       { name: "costingOptions", description: "Options for the effective costing, passed through verbatim. Valhalla-based providers only", values: "walkway_factor: 0.5" },
-      { name: "timestamps", description: "Send each point's recorded time so elapsed time constrains the match. On by default when the track has times", values: "**true**, false" },
-      { name: "tidy", description: "Collapse near-duplicate and stationary points before matching. Mapbox only", values: "true, **false**" },
-      { name: "exclude", description: "Way classes to keep the match off. Mapbox only", values: "motorway, toll, ferry" },
-      { name: "shapeMatch", description: "Valhalla matching strategy. edge_walk suits a trace that already follows the network", values: "**map_snap**, edge_walk, walk_or_snap" },
-      { name: "traceOptions", description: "Valhalla trace options tuning the matcher itself, passed through verbatim. Valhalla measures these in metres regardless of the units setting", values: "search_radius: 35\n  gps_accuracy: 8" },
-      { name: "wayDetails", description: "Report the named ways and surfaces the match ran along. Valhalla-based providers only", values: "true, **false**" },
+      { name: "timestamps", description: "Send recorded point times to the matcher. Enabled when the track has timestamps", values: { examples: ["true", "false"], default: "true" } },
+      { name: "tidy", description: "Collapse near-duplicate and stationary points before matching. Mapbox only", values: { examples: ["true", "false"], default: "false" } },
+      { name: "exclude", description: "Way classes to keep the match off. Mapbox only", values: { examples: ["motorway", "toll", "ferry"] } },
+      { name: "shapeMatch", description: "Valhalla matching strategy. edge_walk suits a trace that already follows the network", values: { examples: ["map_snap", "edge_walk", "walk_or_snap"], default: "map_snap" } },
+      { name: "traceOptions", description: "Valhalla trace options tuning the matcher itself, passed through verbatim. Valhalla measures these in meters regardless of the units setting", values: "search_radius: 35\n  gps_accuracy: 8" },
+      { name: "wayDetails", description: "Report the named ways and surfaces the match ran along. Valhalla-based providers only", values: { examples: ["true", "false"], default: "false" } },
       { name: "mapProvider", description: "Map used for the preview. Defaults to the global default provider.", values: "any installed map provider" },
-      { name: "height", description: "Preview map height", values: "**400px**, 500px" },
+      { name: "height", values: "**400px**, 500px" },
     ],
   },
   {
@@ -656,14 +798,14 @@ export const MAIN_PLUGIN_DEFINITIONS: CodeBlockDefinition[] = [
     parameters: [
       { name: "track", description: "Track note or file to populate. Defaults to the current note.", values: "[[Morning Run - Monday]]" },
       { name: "provider", description: "Elevation service to use. Defaults to the first available provider with elevation support.", values: "any installed elevation provider" },
-      { name: "height", description: "Preview chart height", values: "**320px**, 400px" },
-      { name: "width", description: "Preview chart width", values: "**100%**, 800px" },
-      { name: "title", description: "Heading above the chart. Omit for no title", values: "\"Elevation Replacement Preview\"" },
-      { name: "showGrid", values: "**true**, false" },
-      { name: "showPoints", values: "**false**, true" },
-      { name: "smoothing", description: "Smooth chart lines", values: "**true**, false" },
-      { name: "fillArea", description: "Shade the area under chart lines", values: "**false**, true" },
-      { name: "autorefresh", description: "Re-render when the vault index changes", values: "**(global setting)**, true, false" }
+      { name: "height", values: "**320px**, 400px" },
+      { name: "width", values: "**100%**, 800px" },
+      { name: "title", description: "Heading above the chart. Omit for no title", values: { examples: ["\"Elevation Replacement Preview\""] } },
+      { name: "showGrid", values: { choices: ["true", "false"], default: "true" } },
+      { name: "showPoints", values: { choices: ["false", "true"], default: "false" } },
+      { name: "smoothing", values: { choices: ["true", "false"], default: "true" } },
+      { name: "fillArea", description: "Shade the area under chart lines", values: { choices: ["false", "true"], default: "false" } },
+      { name: "autorefresh", description: "Re-render when the vault index changes", values: { choices: ["true", "false"], default: "(global setting)" } }
     ],
   },
   {
@@ -671,22 +813,14 @@ export const MAIN_PLUGIN_DEFINITIONS: CodeBlockDefinition[] = [
     description: "Interactive image overlay alignment tool",
     parameters: [
       { name: "mapProvider", values: "any installed map provider" },
-      { name: "overlays", description: "Image with optional initial coordinates", values: "- path: 02 - Overlays/scranton-1889-usgs-topo.jpg\n  bounds: 41.25,-75.75,41.5,-75.5" },
+      { name: "overlays", description: "One image to align, plus optional reference tracks or geodata beneath it, in any order", values: { examples: ["- path: 02 - Overlays/scranton-1889-usgs-topo.jpg\n  bounds: 41.25,-75.75,41.5,-75.5"] } },
       { name: "height", values: "**500px**, 400px, 600px" },
+      { name: "width", values: "**100%**, 800px, 90vw" },
       { name: "style", values: "streets, satellite, terrain, outdoors" },
-      { name: "opacity", values: "**1.0**, 0.5, 0.8" },
-      { name: "initialZoom", description: "Initial map zoom level", values: "**auto**, 10, 14, 18" },
+      { name: "initialZoom", values: "**auto**, 10, 14, 18" },
       { name: "initialCenter", description: "Initial map center (lat,lng)", values: "**auto**, 41.408, -75.662" }
     ]
   },
-  // The help blocks render `places` examples and already share its keys, known
-  // values and nested keys. Without a definition of their own, every key and
-  // value inside them completed with a placeholder description.
-  //
-  // `places-template` holds a reusable block body in a note. It shares the same
-  // keys because that is literally what it contains, and being a `places-*`
-  // language is what gives it highlighting and completion; it has no processor,
-  // and renders as plain code rather than a half-configured map.
   ...['places-style', 'places-overlay', 'places-bases', 'places-template'].map((type): CodeBlockDefinition => ({
     type,
     description: PLACES_BLOCK_DEFINITION.description,
@@ -714,8 +848,6 @@ export const MAIN_PLUGIN_HIGHLIGHT_CONFIGS: CodeBlockHighlightConfig[] = [
     knownValues: {
       type: PLACES_BLOCK_KNOWN_VALUES.type,
       control: PLACES_BLOCK_KNOWN_VALUES.control,
-      queryParametersLayout: PLACES_BLOCK_KNOWN_VALUES.queryParametersLayout,
-      queryParametersCollapsed: PLACES_BLOCK_KNOWN_VALUES.queryParametersCollapsed,
     },
     nestedKeys: { queryParameters: PLACES_NESTED_KEYS.queryParameters },
   },
@@ -730,64 +862,37 @@ export const MAIN_PLUGIN_HIGHLIGHT_CONFIGS: CodeBlockHighlightConfig[] = [
   {
     blockType: 'places-snap',
     validKeys: [...COMMON_KEYS, 'track', 'provider', 'mode', 'radius', 'costing', 'costingOptions', 'traceOptions', 'timestamps', 'tidy', 'exclude', 'shapeMatch', 'wayDetails', 'mapProvider', 'style', 'poiDiscovery', 'queryParameters', ...DATA_BLOCK_PARAMETER_STRIP_KEYS],
-    knownValues: { ...DATA_BLOCK_PARAMETER_KNOWN_VALUES, mode: ['drive', 'walk', 'bike'], poiDiscovery: ['true', 'false'] },
+    knownValues: { ...DATA_BLOCK_PARAMETER_KNOWN_VALUES, poiDiscovery: ['true', 'false'] },
     nestedKeys: DATA_BLOCK_PARAMETER_NESTED_KEYS,
   },
   {
     blockType: 'places-elevation',
     validKeys: [...COMMON_KEYS, 'track', 'provider', 'title', 'showGrid', 'showPoints', 'smoothing', 'fillArea', 'autorefresh', 'queryParameters', ...DATA_BLOCK_PARAMETER_STRIP_KEYS],
-    knownValues: {
-      ...DATA_BLOCK_PARAMETER_KNOWN_VALUES,
-      autorefresh: ['true', 'false'],
-      showGrid: ['true', 'false'],
-      showPoints: ['true', 'false'],
-      smoothing: ['true', 'false'],
-      fillArea: ['true', 'false'],
-    },
+    knownValues: DATA_BLOCK_PARAMETER_KNOWN_VALUES,
     nestedKeys: DATA_BLOCK_PARAMETER_NESTED_KEYS,
   },
   {
     blockType: 'places-chart',
-    validKeys: [...COMMON_KEYS, 'chartType', 'track1', 'track2', 'position', 'selection', 'title', 'showGrid', 'showPoints', 'smoothing', 'fillArea', 'axisColor', 'elevationColor', 'speedColor', 'paceColor', 'gradeColor', 'fontSize', 'stats', 'colorBy', 'gradeWindow', 'gradeDistance', 'speedWindow', 'legend', 'autorefresh', 'debug', 'queryParameters', ...DATA_BLOCK_PARAMETER_STRIP_KEYS],
-    rootKeys: [...COMMON_KEYS, 'chartType', 'track1', 'track2', 'position', 'selection', 'title', 'showGrid', 'showPoints', 'smoothing', 'fillArea', 'axisColor', 'elevationColor', 'speedColor', 'paceColor', 'gradeColor', 'fontSize', 'stats', 'colorBy', 'gradeWindow', 'gradeDistance', 'speedWindow', 'legend', 'autorefresh', 'debug', 'queryParameters', ...DATA_BLOCK_PARAMETER_STRIP_KEYS],
+    validKeys: [...COMMON_KEYS, 'chartType', 'track1', 'track2', 'position', 'selection', 'title', 'showGrid', 'showPoints', 'smoothing', 'fillArea', 'axisColor', 'elevationColor', 'speedColor', 'paceColor', 'gradeColor', 'fontSize', 'stats', 'colorBy', 'gradeWindow', 'gradeDistance', 'speedWindow', 'legend', 'autorefresh', 'queryParameters', ...DATA_BLOCK_PARAMETER_STRIP_KEYS],
+    rootKeys: [...COMMON_KEYS, 'chartType', 'track1', 'track2', 'position', 'selection', 'title', 'showGrid', 'showPoints', 'smoothing', 'fillArea', 'axisColor', 'elevationColor', 'speedColor', 'paceColor', 'gradeColor', 'fontSize', 'stats', 'colorBy', 'gradeWindow', 'gradeDistance', 'speedWindow', 'legend', 'autorefresh', 'queryParameters', ...DATA_BLOCK_PARAMETER_STRIP_KEYS],
     nestedKeys: { ...DATA_BLOCK_PARAMETER_NESTED_KEYS, selection: PLACES_NESTED_KEYS.selection },
-    knownValues: {
-      ...DATA_BLOCK_PARAMETER_KNOWN_VALUES,
-      autorefresh: ['true', 'false'],
-      chartType: ['elevation', 'elevation-grade', 'elevation-time', 'speed', 'speed-time', 'pace', 'pace-time', 'grade'],
-      showGrid: ['true', 'false'],
-      showPoints: ['true', 'false'],
-      smoothing: ['true', 'false'],
-      fillArea: ['true', 'false'],
-      colorBy: ['none', 'elevation', 'grade'],
-      legend: ['hidden', 'top', 'bottom']
-    }
+    knownValues: DATA_BLOCK_PARAMETER_KNOWN_VALUES
   },
   {
     blockType: 'places-heatmap',
-    validKeys: [...COMMON_KEYS, ...MAP_KEYS, ...QUERY_KEYS_HIGHLIGHT, 'strategy', 'gridSize', 'minFrequency', 'maxSegments', 'colorScheme', 'lineThickness', 'lineStyle', 'minOpacity', 'maxOpacity', 'lineOpacity', 'legendLocation', 'infoLocation', 'poiDiscovery', 'averageSegments', 'autorefresh', 'css', 'debug', 'queryParameters', ...DATA_BLOCK_PARAMETER_STRIP_KEYS],
+    validKeys: [...COMMON_KEYS, ...MAP_KEYS, ...QUERY_KEYS_HIGHLIGHT, 'strategy', 'gridSize', 'minFrequency', 'maxSegments', 'colorScheme', 'lineWidth', 'lineStyle', 'minOpacity', 'maxOpacity', 'lineOpacity', 'legendLocation', 'infoLocation', 'poiDiscovery', 'autorefresh', 'queryParameters', ...DATA_BLOCK_PARAMETER_STRIP_KEYS],
     nestedKeys: DATA_BLOCK_PARAMETER_NESTED_KEYS,
     knownValues: {
       ...DATA_BLOCK_PARAMETER_KNOWN_VALUES,
-      autorefresh: ['true', 'false'],
-      strategy: ['density-cloud', 'track-corridor', 'opacity-stacking'],
-      colorScheme: ['yellow-to-red', 'blues', 'heat', 'traffic'],
-      legendLocation: ['hidden', 'top', 'bottom'],
-      infoLocation: ['hidden', 'top', 'bottom'],
+      colorScheme: Object.keys(HEATMAP_COLOR_PRESETS),
       poiDiscovery: ['true', 'false'],
-      averageSegments: ['true', 'false'],
     }
   },
   {
     blockType: 'places-similar',
     validKeys: ['minSimilarity', 'minOverlap', 'tolerance', 'overlapTolerance', 'maxResults', 'radius', 'location', 'showPersonalBest', 'showSpeedTime', 'autorefresh', 'queryParameters', ...DATA_BLOCK_PARAMETER_STRIP_KEYS],
     nestedKeys: DATA_BLOCK_PARAMETER_NESTED_KEYS,
-    knownValues: {
-      ...DATA_BLOCK_PARAMETER_KNOWN_VALUES,
-      autorefresh: ['true', 'false'],
-      showPersonalBest: ['true', 'false'],
-      showSpeedTime: ['true', 'false']
-    }
+    knownValues: DATA_BLOCK_PARAMETER_KNOWN_VALUES
   },
   {
     blockType: 'places-compare',
@@ -795,23 +900,53 @@ export const MAIN_PLUGIN_HIGHLIGHT_CONFIGS: CodeBlockHighlightConfig[] = [
     nestedKeys: DATA_BLOCK_PARAMETER_NESTED_KEYS,
     knownValues: {
       ...DATA_BLOCK_PARAMETER_KNOWN_VALUES,
-      autorefresh: ['true', 'false'],
-      showMiniMap: ['true', 'false'],
-      showMetrics: ['true', 'false'],
       poiDiscovery: ['true', 'false'],
     }
   },
   {
     blockType: 'places-reference',
-    validKeys: []  // No parameters
+    validKeys: []   
   },
   {
     blockType: 'places-image-align',
-    validKeys: ['mapProvider', 'overlays', 'path', 'bounds', 'corners', 'height', 'style', 'opacity', 'initialZoom', 'initialCenter'],
-    rootKeys: ['mapProvider', 'overlays', 'height', 'style', 'opacity', 'initialZoom', 'initialCenter'],
-    nestedKeys: { overlays: IMAGE_OVERLAY_NESTED_KEYS }
+    validKeys: ['mapProvider', 'overlays', 'path', 'type', 'bounds', 'corners', 'height', 'width', 'style', 'opacity', 'initialZoom', 'initialCenter', 'alignment', 'fit', 'points', 'pixel', 'latlng', 'enabled', 'imageSize',
+      ...GEODATA_OVERLAY_NESTED_KEYS.map(key => key.name), ...OVERLAY_STYLE_NESTED_KEYS.map(key => key.name),
+      ...PLACES_NESTED_KEYS.popup.map(key => key.name), ...PLACES_NESTED_KEYS.content.map(key => key.name)],
+    rootKeys: ['mapProvider', 'overlays', 'height', 'width', 'style', 'initialZoom', 'initialCenter'],
+    knownValues: { type: ['image', 'geodata'], fit: ['similarity', 'affine'], enabled: ['true', 'false'] },
+    valueDetails: { fit: {
+      similarity: 'Preserve proportions: move, rotate, and uniformly scale using at least two point pairs',
+      affine: 'Allow stretching and skew using at least three non-collinear point pairs',
+    } },
+    nestedKeys: {
+      overlays: unionNestedKeys([
+        { name: "path", description: "Image to align, or reference GPX, FIT, CSV, GeoJSON, or recorded-track note" },
+        { name: "type", description: "Optional kind override: image or geodata; normally inferred from the path" },
+        { name: "bounds", description: "Axis-aligned georeference: swLat,swLng,neLat,neLng" },
+        { name: "corners", description: "Four-corner georeference, clockwise from NW: nwLat,nwLng,neLat,neLng,seLat,seLng,swLat,swLng" },
+        { name: "opacity", description: "Image overlay opacity, 0-1 (default: 1)" },
+        { name: "alignment", description: "Point pairs for fitting this image" },
+      ], GEODATA_OVERLAY_NESTED_KEYS),
+      'overlays.alignment': [
+        { name: 'fit', description: 'similarity preserves proportions; affine also permits stretching/skew' },
+        { name: 'points', description: 'Matched original-image pixels and map locations' },
+        { name: 'imageSize', description: 'Image dimensions [width, height]', apply: 'imageSize: [1000, 1000]' },
+      ],
+      'overlays.alignment.points': [
+        { name: 'pixel', description: 'Image [x, y] measured from the top-left', apply: 'pixel: [0, 0]' },
+        { name: 'latlng', description: 'Map location [latitude, longitude]', apply: 'latlng: [0, 0]' },
+        { name: 'enabled', description: 'Include this pair when fitting (default: true)' },
+      ],
+      'overlays.style': OVERLAY_STYLE_NESTED_KEYS,
+      'overlays.hoverStyle': OVERLAY_STYLE_NESTED_KEYS,
+      popup: PLACES_NESTED_KEYS.popup,
+      content: PLACES_NESTED_KEYS.content,
+      'content.options': PLACES_NESTED_KEYS['content.options'],
+    },
+    listItemTemplates: {
+      'overlays.alignment.points': [{ label: 'Point pair', insert: 'pixel: [0, 0]\n  latlng: [0, 0]', description: 'Match image pixels to latitude and longitude' }],
+    },
   },
-  // Help-related block types - same keys as 'places', giving examples in help blocks proper highlighting
   { blockType: 'places-style', validKeys: PLACES_BLOCK_KEYS, rootKeys: PLACES_ROOT_KEYS, knownValues: PLACES_BLOCK_KNOWN_VALUES, nestedKeys: PLACES_NESTED_KEYS, listItemTemplates: PLACES_LIST_ITEM_TEMPLATES },
   { blockType: 'places-overlay', validKeys: PLACES_BLOCK_KEYS, rootKeys: PLACES_ROOT_KEYS, knownValues: PLACES_BLOCK_KNOWN_VALUES, nestedKeys: PLACES_NESTED_KEYS, listItemTemplates: PLACES_LIST_ITEM_TEMPLATES },
   { blockType: 'places-bases', validKeys: PLACES_BLOCK_KEYS, rootKeys: PLACES_ROOT_KEYS, knownValues: PLACES_BLOCK_KNOWN_VALUES, nestedKeys: PLACES_NESTED_KEYS, listItemTemplates: PLACES_LIST_ITEM_TEMPLATES },

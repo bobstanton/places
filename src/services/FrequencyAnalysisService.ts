@@ -3,10 +3,7 @@ import { App, TFile } from "obsidian";
 import { Meters } from "places-shared/units";
 import { TrackDataExtractor } from "./TrackDataExtractor";
 import { TrackDataService } from "./TrackDataService";
-import { IFrequencyStrategy, FrequencyTrackData, FrequencyAnalysisResult } from "./strategies/IFrequencyStrategy";
-import { OpacityStackingStrategy } from "./strategies/OpacityStackingStrategy";
-import { TrackCorridorStrategy } from "./strategies/TrackCorridorStrategy";
-import { DensityCloudStrategy } from "./strategies/DensityCloudStrategy";
+import { DensityCloudStrategy, OpacityStackingStrategy, TrackCorridorStrategy, type FrequencyAnalysisResult, type FrequencyTrackData, type IFrequencyStrategy } from 'places/core/strategies';
 import { getFrequencyWorkerManager, terminateFrequencyWorker } from "./FrequencyWorkerManager";
 
 const logger = rootLogger.scope('Heatmap');
@@ -30,6 +27,7 @@ export class FrequencyAnalysisService {
 
   getStrategyOutputType(strategyName: string): 'points' | 'segments' {
     const strategy = this.strategies.get(strategyName);
+
     return strategy ? strategy.outputType : 'segments';
   }
 
@@ -38,7 +36,6 @@ export class FrequencyAnalysisService {
   }
 
   async analyzeVaultFrequency(files: TFile[], gridSize: Meters, minFrequency: number, maxSegments: number, onProgress: (message: string) => void, strategy: string = "track-corridor", minOpacity: number, maxOpacity: number): Promise<FrequencyAnalysisResult> {
-
     if (!this.strategies.has(strategy)) {
       logger.warn(`Strategy '${strategy}' not found, using 'track-corridor' instead`);
       strategy = "track-corridor";
@@ -70,6 +67,7 @@ export class FrequencyAnalysisService {
 
     logger.debug(`Using web worker for ${strategyName} analysis`);
     const workerManager = getFrequencyWorkerManager();
+
     return workerManager.analyze(strategyName, tracks, {
       gridSize,
       minFrequency,
@@ -79,5 +77,4 @@ export class FrequencyAnalysisService {
       maxOpacity
     });
   }
-
 }

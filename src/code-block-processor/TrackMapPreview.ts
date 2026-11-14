@@ -1,28 +1,26 @@
-import { logger as rootLogger } from "places-shared/utils";
 import { MarkdownPostProcessorContext } from "obsidian";
 import { buildTrackPreviewPlace, PreviewTrack } from "places-shared/overlay";
 import { type MapContextAction } from "places-shared/settings";
 import { renderMapSurface } from "../services/MapSurfaceRenderer";
 import { resolveMapSettings } from "../services/MapSettingsResolver";
 
-const logger = rootLogger.scope('TrackMapPreview');
-
 export { buildTrackPreviewPlace } from "places-shared/overlay";
 export type { PreviewTrack } from "places-shared/overlay";
 
 export interface TrackMapPreviewOptions {
-  mapContainer: HTMLElement;
+  host: HTMLElement;
+  mapContainerClass: string;
   ctx: MarkdownPostProcessorContext;
   mapProviderName: string;
   height: string;
-  width: string;
   style?: string;
   poiDiscovery?: boolean;
   tracks: PreviewTrack[];
   contextMenuActions?: readonly MapContextAction[];
+  isStale?: () => boolean;
+  onRerenderRequested: (reason: string) => Promise<void>;
 }
 
-// renderMapSurface registers teardown through MapCleanupRenderChild; callers add none.
 export async function renderTrackPreviewMap(options: TrackMapPreviewOptions): Promise<boolean> {
   const places = options.tracks.map(buildTrackPreviewPlace);
 
@@ -32,7 +30,6 @@ export async function renderTrackPreviewMap(options: TrackMapPreviewOptions): Pr
     rawBlockSettings: {
       mapProvider: options.mapProviderName,
       height: options.height,
-      width: options.width,
       ...(options.style ? { style: options.style } : {}),
     },
     blockOverrides: {
@@ -43,18 +40,20 @@ export async function renderTrackPreviewMap(options: TrackMapPreviewOptions): Pr
   });
 
   const result = await renderMapSurface({
-    host: options.mapContainer.parentElement ?? options.mapContainer,
-    mapContainer: options.mapContainer,
+    host: options.host,
+    mapContainerClass: options.mapContainerClass,
+    height: options.height,
     places,
     providerName: options.mapProviderName,
     ctx: options.ctx,
+    isStale: options.isStale,
     config: resolved.config,
     clusteringEnabled: resolved.clusteringEnabled,
     source: { path: options.ctx.sourcePath },
+    sourcePath: options.ctx.sourcePath,
     contextMenuActions: options.contextMenuActions,
+    onRerenderRequested: options.onRerenderRequested,
   });
-  if (!result.rendered) {
-    logger.debug('Track preview map did not render', { provider: options.mapProviderName });
-  }
+
   return result.rendered;
 }

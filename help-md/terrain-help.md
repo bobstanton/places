@@ -24,13 +24,13 @@ terrain:
     opacity: 0.4
 ~~~
 
-| Setting      | Description                                                                                | Examples                                                                                                    |
-| ------------ | ------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------- |
-| provider     | DEM source. Enables 3D terrain and turns pitch, hillshade and color relief on.      | {{dynamic:terrainProviderNames}}, `https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png` |
+| Setting        | Description                                                                                  | Examples                                                                                                    |
+| -------------- | -------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| provider       | DEM source. Enables 3D terrain and turns pitch, hillshade and color relief on.               | {{dynamic:terrainProviderNames}}, `https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png` |
 | reliefProvider | DEM for the hillshade and color-relief layers only. The map stays flat, and pitch stays off. | {{dynamic:terrainProviderNames}}, `https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png` |
-| exaggeration | Vertical exaggeration of the 3D surface. A constant factor, or a zoom curve of `@z` stops. | **1.4**, 2, `1 @z6, 2.5 @z13`                                                                               |
-| hillshade    | Shaded-relief layer, a nested block of the settings below                                  | `intensity: 0.8`<br>`method: igor`                                                                          |
-| colorRelief  | Elevation-tint layer, a nested block of the settings below                                 | `opacity: 0.4`                                                                                              |
+| exaggeration   | Vertical exaggeration of the 3D surface. A constant factor, or a zoom curve of `@z` stops.   | **1.4**, 2, `1 @z6, 2.5 @z13`                                                                               |
+| hillshade      | Shaded-relief layer, a nested block of the settings below                                    | `intensity: 0.8`<br>`method: igor`                                                                          |
+| colorRelief    | Elevation-tint layer, a nested block of the settings below                                   | `opacity: 0.4`                                                                                              |
 
 ### hillshade settings
 
@@ -48,7 +48,7 @@ terrain:
 | Setting | Description                                                                                            | Examples                                                                    |
 | ------- | ------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------- |
 | opacity | Elevation-tint opacity, 0-1. Defaults to 0.4 when terrain is on; 0 disables.                           | 0.4, 0, 0.7                                                                 |
-| colors  | Elevation-to-color ramp: a preset name or a custom stop list. Unset uses the default hypsometric tint. | hypsometric, viridis, spectral, grayscale, or a list of `<metres>: <color>` |
+| colors  | Elevation-to-color ramp: a preset name or a custom stop list. Unset uses the default hypsometric tint. | hypsometric, viridis, spectral, grayscale, or a list of `<meters>: <color>` |
 
 ## Relief without the 3D surface
 
@@ -89,7 +89,7 @@ terrain:
     colors: viridis
 ~~~
 
-Custom stops (metres to color) are interpolated between:
+Custom stops (meters to color) are interpolated between:
 
 ~~~places
 mapProvider: mapbox

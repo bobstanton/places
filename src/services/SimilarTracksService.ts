@@ -2,14 +2,10 @@ import { App, normalizePath, TFile } from "obsidian";
 import { Coordinate, DistanceCalculator } from "places-shared/geo";
 import { getFileNameWithoutExtension } from "places-shared/utils";
 import { TrackDataService } from "./TrackDataService";
-import { TrackMatcher, TrackSimilarity } from "./TrackMatcher";
+import { TrackMatcher, TrackSimilarity } from "places/core/strategies";
 import { TrackDataExtractor } from "./TrackDataExtractor";
 import { Kilometers, Meters, km } from "places-shared/units";
-import {
-  DEFAULT_FRECHET_TOLERANCE,
-  DEFAULT_OVERLAP_TOLERANCE_METERS,
-  DEFAULT_MIN_SIMILARITY
-} from "../constants/track";
+import { DEFAULT_FRECHET_TOLERANCE, DEFAULT_OVERLAP_TOLERANCE_METERS, DEFAULT_MIN_SIMILARITY } from "places/core/strategies";
 
 export interface SimilarTracksOptions {
   // Minimum Fréchet similarity (0-1). If undefined and minOverlap undefined, defaults to 0.7
@@ -99,6 +95,7 @@ export class SimilarTracksService {
       if (error instanceof SimilarTracksError) {
         throw error;
       }
+
       throw new SimilarTracksError(
         'PROCESSING_ERROR',
         'Failed to process similarity search',
@@ -120,6 +117,7 @@ export class SimilarTracksService {
     }
 
     const currentFile = this.app.vault.getFileByPath(normalizePath(ctx.sourcePath));
+
     if (!currentFile) {
       throw new SimilarTracksError(
         'INVALID_CONTEXT',
@@ -133,6 +131,7 @@ export class SimilarTracksService {
   private async performSimilaritySearch(currentFile: TFile, minSimilarity: number | undefined, minOverlap: number | undefined, maxResults: number, tolerance: number, overlapToleranceMeters: Meters): Promise<TrackSimilarity[]> {
     try {
       const currentTrack = await this.trackExtractor.extractTrackFromFile(currentFile);
+
       if (!currentTrack || currentTrack.length === 0) {
         throw new SimilarTracksError(
           'NO_TRACK_DATA',
@@ -171,6 +170,7 @@ export class SimilarTracksService {
       if (error instanceof SimilarTracksError) {
         throw error;
       }
+
       throw new SimilarTracksError(
         'PROCESSING_ERROR',
         'Error during similarity search',
@@ -194,6 +194,7 @@ export class SimilarTracksService {
 
       for (const [filePath, track] of candidateTracks) {
         const result = this.processTrackForNearPoint(point, filePath, track, radiusKm);
+
         if (result) {
           results.push(result);
         }
@@ -213,6 +214,7 @@ export class SimilarTracksService {
       if (error instanceof SimilarTracksError) {
         throw error;
       }
+
       throw new SimilarTracksError(
         'PROCESSING_ERROR',
         'Error searching for nearby tracks',
@@ -285,6 +287,7 @@ export class SimilarTracksService {
         targetPoint.latitude, targetPoint.longitude,
         track[0].latitude, track[0].longitude
       );
+
       return { distance, point: track[0] };
     }
 
@@ -302,5 +305,4 @@ export class SimilarTracksService {
       point: track[0]
     });
   }
-
 }

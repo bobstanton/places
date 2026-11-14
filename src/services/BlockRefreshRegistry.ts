@@ -1,4 +1,4 @@
-import { parseBooleanOptional } from 'places-shared/settings';
+import { parseBooleanOptional } from "places-shared/settings";
 import { MapRefreshService, type RefreshableBlockEntry, type RefreshAllBlocksOptions, type RefreshableBlockRegistration } from './MapRefreshService';
 
 // Data-driven code blocks (heatmap, chart, similar, compare) re-render when the vault index changes.
@@ -8,9 +8,11 @@ export type RefreshAllOptions = RefreshAllBlocksOptions;
 // The per-block `autorefresh:` option wins; otherwise data-driven blocks auto-refresh when the vault index changes.
 export function resolveAutoRefreshSetting(blockValue: unknown): boolean {
   const parsedOverride = parseBooleanOptional(blockValue);
+
   if (parsedOverride !== undefined) {
     return parsedOverride;
   }
+
   return true;
 }
 

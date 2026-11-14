@@ -1,9 +1,11 @@
 import { App, Component, loadPrism, setIcon } from "obsidian";
-import { IMapBlockProcessor, type PlaceProviderExport, CodeBlockDefinition } from "places-shared/services";
+import { IMapBlockProcessor } from "places-shared/services";
+import { type PlaceProviderExport, CodeBlockDefinition } from "places-shared/obsidian/services";
 import { ServiceRegistry } from "../services/ServiceRegistry";
 import { renderError } from "places-shared/utils";
 import { CodeBlockRegistry } from "../services/CodeBlockRegistry";
-import { missingMapProviderError } from "../services/MissingPluginError";
+import type { PopupRenderer } from "places-shared/map";
+import type { VectorTileOverlayPreset } from "places-shared/overlay";
 import type { RenderContext } from "../generated-help/index.generated";
 import * as mainHelp from "../generated-help/main-help.generated";
 import * as chartHelp from "../generated-help/chart-help.generated";
@@ -65,7 +67,7 @@ export class PlacesHelpCodeBlockProcessor {
     ['places-bases-help', 'Places maps in Bases views'],
   ]);
 
-  constructor(private app: App, private component: Component, private mapBlockProcessors: ServiceRegistry<IMapBlockProcessor>, private getProviders: () => readonly PlaceProviderExport[], private getExtensionHelpBlockTypes: () => readonly string[] = () => [], private getCommands: () => ReadonlyArray<{ name: string; description: string }> = () => []) {}
+  constructor(private app: App, private component: Component, private mapBlockProcessors: ServiceRegistry<IMapBlockProcessor>, private getProviders: () => readonly PlaceProviderExport[], private getExtensionHelpBlockTypes: () => readonly string[] = () => [], private getCommands: () => ReadonlyArray<{ name: string; description: string }> = () => [], private getPopupRenderers: () => readonly PopupRenderer[] = () => [], private getOverlayPresets: () => readonly VectorTileOverlayPreset[] = () => []) {}
 
   private createRenderContext(): RenderContext {
     return {
@@ -104,16 +106,24 @@ export class PlacesHelpCodeBlockProcessor {
       const routeNames = this.getProviders()
         .filter((provider) => provider.routeOverlay !== undefined)
         .map((provider) => provider.routeOverlay?.getCapabilities?.()?.supportsIsochrones === false ? `${provider.name} (directions only)` : provider.name);
+
       this.renderInlineNames(container, routeNames.sort((a, b) => a.localeCompare(b)), 'no route providers installed');
     } else if (key === 'terrainProviderNames') {
       const terrainNames = this.getProviders().filter((provider) => provider.terrain !== undefined).map((provider) => provider.name);
+
       this.renderInlineNames(container, [...terrainNames, 'aws'].sort((a, b) => a.localeCompare(b)), 'aws');
     } else if (key === 'trackMatchProviderNames') {
       const trackMatchNames = this.getProviders().filter((provider) => provider.trackMatch !== undefined).map((provider) => provider.name);
+
       this.renderInlineNames(container, trackMatchNames.sort((a, b) => a.localeCompare(b)), 'no track-match providers installed');
     } else if (key === 'imageAlignmentProviderNames') {
       const alignmentNames = this.getProviders().filter((provider) => provider.imageAlignment !== undefined).map((provider) => provider.name);
+
       this.renderInlineNames(container, alignmentNames.sort((a, b) => a.localeCompare(b)), 'no alignment-capable providers installed');
+    } else if (key === 'popupRenderers') {
+      this.renderPopupRenderers(container);
+    } else if (key === 'overlayPresets') {
+      this.renderOverlayPresets(container);
     } else {
       container.createSpan({ text: `{{${key}}}` });
     }
@@ -125,21 +135,26 @@ export class PlacesHelpCodeBlockProcessor {
 
     if (providers.length === 0) {
       const para = section.createEl("p");
+
       para.appendText("No provider plugins are active yet. Install a Places provider plugin and configure its API key if required. ");
       para.createEl("a", { text: "Browse Places plugins", href: "https://obsidian.md/plugins?search=places" });
+
       return;
     }
 
     const scroll = section.createDiv({ cls: "places-help-table-scroll" });
     const table = scroll.createEl("table", { cls: "places-help-table" });
     const head = table.createEl("thead").createEl("tr");
+
     for (const label of ["Provider", "Maps", "Geocoding", "Elevation", "Directions", "Isochrones", "Snap", "Track matching"]) {
       head.createEl("th", { text: label });
     }
 
     const body = table.createEl("tbody");
+
     for (const provider of providers) {
       const row = body.createEl("tr");
+
       row.createEl("td", { text: provider.name });
       const capabilities = [
         provider.map !== undefined,
@@ -150,25 +165,65 @@ export class PlacesHelpCodeBlockProcessor {
         provider.snap !== undefined,
         provider.trackMatch !== undefined,
       ];
+
       for (const supported of capabilities) {
         row.createEl("td", { text: supported ? "✓" : "" });
       }
     }
-
   }
 
   private renderInlineNames(container: HTMLElement, names: readonly string[], emptyText: string): void {
     container.createSpan({ text: names.length > 0 ? names.join(', ') : emptyText });
   }
 
+  private renderPopupRenderers(container: HTMLElement): void {
+    const renderers = [...this.getPopupRenderers()].sort((left, right) => left.id.localeCompare(right.id));
+
+    if (renderers.length === 0) {
+      container.createEl('p', { text: 'No popup renderers are installed.' });
+
+      return;
+    }
+
+    const list = container.createEl('ul');
+
+    for (const renderer of renderers) {
+      const item = list.createEl('li');
+
+      item.createEl('code', { text: renderer.id });
+      if (renderer.description) item.appendText(`: ${renderer.description}`);
+    }
+  }
+
+  private renderOverlayPresets(container: HTMLElement): void {
+    const presets = [...this.getOverlayPresets()].sort((left, right) => left.id.localeCompare(right.id));
+
+    if (presets.length === 0) {
+      container.createEl('p', { text: 'No installed extension supplies an overlay preset.' });
+
+      return;
+    }
+
+    const list = container.createEl('ul');
+
+    for (const preset of presets) {
+      const item = list.createEl('li');
+
+      item.createEl('code', { text: preset.id });
+      item.appendText(`: ${preset.description}. Layers: ${preset.layers.map(layer => layer.sourceLayer).join(', ')}.`);
+    }
+  }
+
   private renderTerrainProviders(container: HTMLElement): void {
     const installed = this.getProviders().filter((provider) => provider.terrain !== undefined).map((provider) => provider.name);
     const names = [...installed, 'aws'].sort((a, b) => a.localeCompare(b));
+
     container.createEl("p", { text: `Available terrain (DEM) providers: ${names.join(", ")}. A tile URL is also accepted.` });
   }
 
   private renderInstalledServiceList(container: HTMLElement, kind: string, supports: (provider: PlaceProviderExport) => boolean, label: (provider: PlaceProviderExport) => string): void {
     const names = this.getProviders().filter(supports).map(label).sort((a, b) => a.localeCompare(b));
+
     container.createEl("p", {
       text: names.length > 0
         ? `Currently installed ${kind} providers: ${names.join(", ")}.`
@@ -182,11 +237,15 @@ export class PlacesHelpCodeBlockProcessor {
 
   processHelpCodeBlock(helpType: string, el: HTMLElement): Promise<void> | void {
     const helpModule = this.helpModules.get(helpType);
+
     if (!helpModule) {
       renderError(el, { icon: "❓", title: "Unknown Help Topic", message: `No help found for: ${helpType}` });
+
       return;
     }
+
     const helpContainer = el.createDiv({ cls: "places-help-container" });
+
     // places-* fences are tokenized at build time; yaml/js/css display fences
     // fall back to Obsidian's Prism at render time. Before loadPrism resolves,
     // the Prism global may exist half-initialized. Rendering proceeds
@@ -199,8 +258,10 @@ export class PlacesHelpCodeBlockProcessor {
   // Registered palette commands - the main plugin's and every extension's - with their help lines.
   private renderCommandList(container: HTMLElement): void {
     const list = container.createEl("ul");
+
     for (const command of this.getCommands()) {
       const item = list.createEl("li");
+
       item.appendText(command.description ? `${command.name}: ${command.description}` : command.name);
     }
   }
@@ -208,15 +269,19 @@ export class PlacesHelpCodeBlockProcessor {
   // Help pages a fence language reaches, main-plugin and extension alike.
   private availableHelpTypes(): Set<string> {
     const types = new Set([...this.helpModules.keys()].filter((type) => type !== 'places-help'));
+
     for (const type of this.getExtensionHelpBlockTypes()) types.add(type);
+
     return types;
   }
 
   private renderCodeBlockList(container: HTMLElement): void {
     const definitions: CodeBlockDefinition[] = CodeBlockRegistry.instance.getAllDefinitions();
+
     if (definitions.length === 0) {
       return;
     }
+
     const helpTypes = this.availableHelpTypes();
     const blockTypes = new Set(definitions.map((def) => def.type));
     // Pages documenting a setting or topic of the `places` block rather than a
@@ -226,6 +291,7 @@ export class PlacesHelpCodeBlockProcessor {
     const table = container.createEl("table", { cls: "places-help-table" });
     const thead = table.createEl("thead");
     const headerRow = thead.createEl("tr");
+
     headerRow.createEl("th", { text: "Code block" });
     headerRow.createEl("th", { text: "Description" });
     headerRow.createEl("th", { text: "Help page" });
@@ -235,27 +301,34 @@ export class PlacesHelpCodeBlockProcessor {
     const helpPageAliases: Record<string, string> = { 'places-parameters': 'places-queryparameters-help' };
 
     const tbody = table.createEl("tbody");
+
     for (const def of definitions) {
       const row = tbody.createEl("tr");
+
       row.createEl("td").createEl("code", { text: def.type });
       row.createEl("td", { text: def.description });
       const helpCell = row.createEl("td");
       const helpPage = helpPageAliases[def.type] ?? `${def.type}-help`;
+
       if (helpTypes.has(helpPage)) {
         helpCell.createEl("code", { text: helpPage });
       }
 
       if (def.type !== 'places') continue;
+
       for (const type of topicHelpTypes) {
         const topicRow = tbody.createEl("tr", { cls: "places-help-topic-row" });
+
         topicRow.createEl("td");
         const description = this.helpDescriptions.get(type) ?? "";
+
         topicRow.createEl("td", { text: description });
         topicRow.createEl("td").createEl("code", { text: type });
       }
     }
 
     const note = container.createEl("p", { cls: "places-help-note" });
+
     note.appendText("For full parameter details, use: ");
     note.createEl("code", { text: "```places-reference```" });
   }
@@ -264,14 +337,17 @@ export class PlacesHelpCodeBlockProcessor {
     const providersSection = helpContainer.createDiv({ cls: "places-help-section" });
 
     const installedProviders = this.mapBlockProcessors.getNames();
+
     if (installedProviders.length > 0) {
       providersSection.createEl("h3", { text: "Available map providers" });
       const providerList = providersSection.createEl("ul");
+
       installedProviders.forEach(provider => {
         providerList.createEl("li", { text: provider });
       });
     } else {
       const heading = providersSection.createEl("h3");
+
       heading.appendText("No map providers installed. ");
       heading.createEl("a", {
         text: "Browse Places plugins",
@@ -280,22 +356,7 @@ export class PlacesHelpCodeBlockProcessor {
     }
   }
 
-
-  createMapProviderErrorDiv(container: HTMLElement, requestedProvider: string): void {
-    renderError(container, missingMapProviderError(requestedProvider));
-
-    this.showMapProviderSection(container);
-    this.renderHelpReference(container);
-  }
-
   renderPlaceMethods(container: HTMLElement): void {
     addPlacesMethods.render(container, this.createRenderContext());
-  }
-
-  private renderHelpReference(container: HTMLElement): void {
-    const helpSection = container.createDiv({ cls: "places-help-reference" });
-    const helpText = helpSection.createEl("p");
-    helpText.appendText("For complete documentation, use: ");
-    helpText.createEl("code", { text: "```places-help```" });
   }
 }

@@ -120,7 +120,13 @@ export function render(container: HTMLElement, _ctx: RenderContext): void {
   const row11 = tbody.createEl('tr');
   row11.createEl('td', { text: "queryParameters" });
   const td9 = row11.createEl('td');
-  td9.appendText("UI controls that adjust the block without editing it. See ");
+  td9.appendText("UI controls that adjust the block without editing it; ");
+  td9.createEl('code', { cls: 'places-help-code', text: "queryParametersPosition" });
+  td9.appendText(", ");
+  td9.createEl('code', { cls: 'places-help-code', text: "queryParametersLayout" });
+  td9.appendText(", and ");
+  td9.createEl('code', { cls: 'places-help-code', text: "queryParametersCollapsed" });
+  td9.appendText(" place them. See ");
   td9.createEl('code', { cls: 'places-help-code', text: "places-queryparameters-help" });
   const td10 = row11.createEl('td');
   td10.createEl('code', { cls: 'places-help-code', text: "- name: limit" });

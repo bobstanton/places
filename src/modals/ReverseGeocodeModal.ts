@@ -43,6 +43,7 @@ export class ReverseGeocodeModal extends SuggestModal<Place> {
 
     if (this.initialCoordinate) {
       const coordString = `${this.initialCoordinate.latitude}, ${this.initialCoordinate.longitude}`;
+
       this.inputEl.value = coordString;
       this.lastQuery = coordString;
       void this.updateSearchResults(coordString);
@@ -58,6 +59,7 @@ export class ReverseGeocodeModal extends SuggestModal<Place> {
       this.lastQuery = query;
       this.debouncedSearch(query);
     }
+
     return this.results;
   }
 
@@ -71,9 +73,11 @@ export class ReverseGeocodeModal extends SuggestModal<Place> {
       renderCustomDetails: (contentContainer, p) => {
         if (this.coordinate) {
           const distance = DistanceCalculator.calculateDistanceBetween(this.coordinate, p);
+
           if (distance < 1000) { // km
             const distanceEl = contentContainer.createDiv({ cls: SearchResultClasses.website });
             const formattedDistance = formatKmInSystem(km(distance), this.units, distance < 1 ? 0 : 1);
+
             distanceEl.appendText(`${formattedDistance} away`);
           }
         }
@@ -103,6 +107,7 @@ export class ReverseGeocodeModal extends SuggestModal<Place> {
       this.results = [];
       this.coordinate = null;
       refreshSuggestModal(this);
+
       return;
     }
 
@@ -111,6 +116,7 @@ export class ReverseGeocodeModal extends SuggestModal<Place> {
       this.results = [];
       this.coordinate = null;
       refreshSuggestModal(this);
+
       return;
     }
 
@@ -127,6 +133,7 @@ export class ReverseGeocodeModal extends SuggestModal<Place> {
       this.results = results;
     } catch (error) {
       logger.error("Reverse geocoding error:", error);
+
       if (!this.isClosed) {
         this.results = [];
       }
@@ -145,10 +152,12 @@ export class ReverseGeocodeModal extends SuggestModal<Place> {
 
   private parseCoordinates(input: string): Coordinate | null {
     const coord = parseCoordinate(input);
+
     if (coord) return coord;
 
     const cleaned = input.replace(/\s+/g, ' ').trim();
     const spaceMatch = cleaned.match(/^(-?\d+\.?\d*)\s+(-?\d+\.?\d*)$/);
+
     if (spaceMatch) {
       const lat = parseFloat(spaceMatch[1]);
       const lng = parseFloat(spaceMatch[2]);
@@ -160,5 +169,4 @@ export class ReverseGeocodeModal extends SuggestModal<Place> {
 
     return null;
   }
-
 }

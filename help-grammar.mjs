@@ -12,7 +12,6 @@ export function covers(language) {
 
 export const grammar = {
   'comment': /#.*/,
-  'delimiter': /^---$/m,
   'keyword': {
     pattern: /(^[\t ]*(?:-\s*)?)[a-zA-Z][a-zA-Z0-9_-]*(?=\s*:)/m,
     lookbehind: true,

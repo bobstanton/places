@@ -16,19 +16,19 @@ minSimilarity: 70
 
 ## Settings
 
-| Setting          | Description                                                                                  | Examples                                      |
-| ---------------- | -------------------------------------------------------------------------------------------- | --------------------------------------------- |
-| minSimilarity    | Frechet similarity threshold (0-100). Measures how identical the track shapes are end-to-end | **70** (or 0.7), 50, 85, 90                   |
-| minOverlap       | Overlap percentage threshold (0-100). Measures what % of the track shares the same route     | 50, 70, 85                                    |
-| tolerance        | Max deviation in degrees for Frechet calculation. Higher = more lenient                      | **0.01** (~1.1km), 0.05 (~5.5km), 0.1 (~11km) |
-| overlapTolerance | Distance in meters for overlap calculation. How close points must be to count as overlapping | **50**, 25, 100                               |
-| maxResults       | Cap results to this many tracks                                                              | **unlimited**, 5, 10, 20                      |
-| radius           | Search radius for point-based search. Uses configured units (miles/km)                       | **note's Distance** or **1.0**, 2, 5, 10      |
-| location         | Center point for point-based search                                                          | **note's Location**, 41.408,-75.662           |
-| showPersonalBest | Highlight the fastest completion with a trophy icon                                          | **false**, true                               |
-| showSpeedTime    | Add columns showing average speed and total duration                                         | **false**, true                               |
-| autorefresh      | Re-render when the vault index changes               | **true**, false                                   |
-| queryParameters  | UI controls that adjust the block without editing it. See `places-queryparameters-help`      | `- name: limit`<br>`  type: int`<br>`  min: 1`<br>`  max: 40`                 |
+| Setting          | Description                                                                                                                                                                            | Examples                                                      |
+| ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------- |
+| minSimilarity    | Frechet similarity threshold (0-100). Measures how identical the track shapes are end-to-end                                                                                           | **70** (or 0.7), 50, 85, 90                                   |
+| minOverlap       | Overlap percentage threshold (0-100). Measures what % of the track shares the same route                                                                                               | 50, 70, 85                                                    |
+| tolerance        | Max deviation in degrees for Frechet calculation. Higher = more lenient                                                                                                                | **0.01** (~1.1km), 0.05 (~5.5km), 0.1 (~11km)                 |
+| overlapTolerance | Distance in meters for overlap calculation. How close points must be to count as overlapping                                                                                           | **50**, 25, 100                                               |
+| maxResults       | Cap results to this many tracks                                                                                                                                                        | **unlimited**, 5, 10, 20                                      |
+| radius           | Search radius for point-based search. Uses configured units (miles/km)                                                                                                                 | **note's Distance** or **1.0**, 2, 5, 10                      |
+| location         | Center point for point-based search                                                                                                                                                    | **note's Location**, 41.408,-75.662                           |
+| showPersonalBest | Highlight the fastest completion with a trophy icon                                                                                                                                    | **false**, true                                               |
+| showSpeedTime    | Add columns showing average speed and total duration                                                                                                                                   | **false**, true                                               |
+| autorefresh      | Re-render when the vault index changes                                                                                                                                                 | **true**, false                                               |
+| queryParameters  | UI controls that adjust the block without editing it; `queryParametersPosition`, `queryParametersLayout`, and `queryParametersCollapsed` place them. See `places-queryparameters-help` | `- name: limit`<br>`  type: int`<br>`  min: 1`<br>`  max: 40` |
 
 ## Matching Method
 

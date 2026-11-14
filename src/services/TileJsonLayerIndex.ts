@@ -1,6 +1,5 @@
-import { requestUrl } from 'obsidian';
-import { createTileJsonResolver, type TileJsonVectorLayer } from 'places-shared/overlay';
-import { logger } from 'places-shared/utils';
+import { createTileJsonResolver, type TileJsonVectorLayer } from "places-shared/overlay";
+import { logger, loggedRequestUrl as requestUrl } from "places-shared/utils";
 
 // TileJSON metadata for the editor.
 //
@@ -25,6 +24,7 @@ export class TileJsonLayerIndex {
 
   static get instance(): TileJsonLayerIndex {
     TileJsonLayerIndex._instance ??= new TileJsonLayerIndex();
+
     return TileJsonLayerIndex._instance;
   }
 
@@ -39,9 +39,11 @@ export class TileJsonLayerIndex {
   // Schedules the fetch as a side effect; subscribers hear about the result.
   peek(url: string | undefined): TileJsonVectorLayer[] | undefined {
     const key = url?.trim();
+
     if (!key) return undefined;
 
     const cached = this.loaded.get(key);
+
     if (cached) return cached;
     if (this.unavailable.has(key) || this.inFlight.has(key) || !FETCHABLE_URL.test(key)) return undefined;
 
@@ -70,31 +72,37 @@ export class TileJsonLayerIndex {
   // Field names and declared types for one source layer of a tileset.
   fields(url: string | undefined, sourceLayer: string | undefined): Record<string, string> | undefined {
     if (!sourceLayer) return undefined;
+
     return this.peek(url)?.find(layer => layer.id === sourceLayer)?.fields;
   }
 
   // True while a fetch for this URL is outstanding.
   isLoading(url: string | undefined): boolean {
     const key = url?.trim();
+
     return Boolean(key && this.inFlight.has(key));
   }
 
   // Adopt a TileJSON another caller already fetched; block rendering records every vector tileset it resolves.
   record(url: string, tileJson: { vectorLayers?: TileJsonVectorLayer[] }): void {
     const key = url.trim();
+
     if (!key) return;
+
     if (tileJson.vectorLayers?.length) {
       this.loaded.set(key, tileJson.vectorLayers);
       this.unavailable.delete(key);
     } else {
       this.unavailable.add(key);
     }
+
     for (const listener of this.listeners) listener();
   }
 
   // Notified when any fetch settles.
   subscribe(listener: () => void): () => void {
     this.listeners.add(listener);
+
     return () => this.listeners.delete(listener);
   }
 

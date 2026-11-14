@@ -59,6 +59,7 @@ export function rewriteTemplateReferences(markdown: string, target: TemplateRena
 
     if (fence) {
       const marker = fence[1];
+
       if (fenceMarker === undefined) {
         fenceMarker = marker;
         fenceLanguage = fence[2];
@@ -66,6 +67,7 @@ export function rewriteTemplateReferences(markdown: string, target: TemplateRena
         fenceMarker = undefined;
         fenceLanguage = undefined;
       }
+
       inTemplateList = false;
       continue;
     }
@@ -73,34 +75,43 @@ export function rewriteTemplateReferences(markdown: string, target: TemplateRena
     if (fenceMarker === undefined || !fenceLanguage || !isPlacesCodeBlock(fenceLanguage)) continue;
 
     const keyMatch = line.match(/^(\s*)([A-Za-z]\w*)(\s*:\s*)(.*)$/u);
+
     if (keyMatch) {
       const [, indent, key, separator, value] = keyMatch;
+
       if (key.toLowerCase() !== TEMPLATE_KEY) {
         inTemplateList = false;
         continue;
       }
+
       // `fromTemplate:` with nothing after it opens a YAML list; its items are
       // the following `- ` lines at the key's own indent or deeper.
       inTemplateList = value.trim().length === 0;
       listIndent = indent.length;
+
       if (!inTemplateList) {
         const rewritten = rewriteValue(value, target);
+
         if (rewritten !== undefined) {
           lines[index] = `${indent}${key}${separator}${rewritten}`;
           changed = true;
         }
       }
+
       continue;
     }
 
     if (!inTemplateList) continue;
 
     const item = line.match(/^(\s*)(-\s+)(.*)$/u);
+
     if (!item || item[1].length < listIndent) {
       inTemplateList = false;
       continue;
     }
+
     const rewritten = rewriteValue(item[3], target);
+
     if (rewritten !== undefined) {
       lines[index] = `${item[1]}${item[2]}${rewritten}`;
       changed = true;
@@ -120,10 +131,12 @@ function rewriteValue(value: string, target: TemplateRenameTarget): string | und
     const leading = part.match(/^\s*/u)?.[0] ?? "";
     const token = part.trim();
     const next = rewriteReference(token, target);
+
     // A bare name matched during a folder rename rebuilds to itself; reporting
     // that as a change would write - and sync - a byte-identical note.
     if (next === undefined || next === token) return part;
     changed = true;
+
     return `${leading}${next}`;
   });
 
@@ -136,13 +149,16 @@ function rewriteReference(token: string, target: TemplateRenameTarget): string |
   // parser resolves it the same as an unquoted one, and the rewrite must see
   // through the quotes too.
   const quoted = token.match(/^(["'])(.+)\1$/u);
+
   if (quoted) {
     const inner = rewriteReference(quoted[2], target);
+
     return inner === undefined ? undefined : `${quoted[1]}${inner}${quoted[1]}`;
   }
 
   const linked = token.match(/^\[\[(.+?)\]\]$/u);
   const inner = linked?.[1] ?? token;
+
   if (!inner.trim()) return undefined;
 
   const [beforeAlias, ...aliasParts] = inner.split("|");
@@ -151,21 +167,26 @@ function rewriteReference(token: string, target: TemplateRenameTarget): string |
   const heading = hashIndex < 0 ? "" : beforeAlias.slice(hashIndex);
 
   const replacement = matchLinkpath(linkpath, target);
+
   if (replacement === undefined) return undefined;
 
   const alias = aliasParts.length > 0 ? `|${aliasParts.join("|")}` : "";
   const rebuilt = `${replacement}${heading}${alias}`;
+
   return linked ? `[[${rebuilt}]]` : rebuilt;
 }
 
 // The new linkpath for a reference naming the renamed note, in the form it was written unless only the full path is unambiguous.
 function matchLinkpath(linkpath: string, target: TemplateRenameTarget): string | undefined {
   const normalized = linkpath.replace(/\.md$/iu, "");
+
   if (normalized.toLowerCase() === target.oldLinkpath.toLowerCase()) return target.newLinkpath;
 
   if (!target.allowBasenameMatch) return undefined;
   const oldBase = basename(target.oldLinkpath);
+
   if (normalized.toLowerCase() !== oldBase.toLowerCase()) return undefined;
+
   return target.qualifyBareReferences ? target.newLinkpath : basename(target.newLinkpath);
 }
 
@@ -177,7 +198,9 @@ function basename(path: string): string {
 // One read of the renamed note replaces a read of every note in the vault.
 async function definesTemplate(app: App, path: string): Promise<boolean> {
   const file = app.vault.getAbstractFileByPath(path);
+
   if (!(file instanceof TFile) || file.extension.toLowerCase() !== "md") return false;
+
   try {
     return extractTemplateBlock(await app.vault.cachedRead(file)) !== undefined;
   } catch {
@@ -189,6 +212,7 @@ async function definesTemplate(app: App, path: string): Promise<boolean> {
 function buildTarget(app: App, oldPath: string, newPath: string): TemplateRenameTarget | undefined {
   const oldLinkpath = oldPath.replace(/\.md$/iu, "");
   const newLinkpath = newPath.replace(/\.md$/iu, "");
+
   if (oldLinkpath === newLinkpath) return undefined;
 
   // A bare `[[Base Map]]` only meant this note while no other note shares the
@@ -220,6 +244,7 @@ export async function renameTemplateReferences(app: App, targets: readonly Templ
   for (const file of app.vault.getMarkdownFiles()) {
     try {
       const current = await app.vault.cachedRead(file);
+
       if (!current.toLowerCase().includes("fromtemplate")) continue;
       // Decide from the cached copy: a note that merely mentions the key is
       // never written back. `process` writes whatever it is handed, and a write
@@ -236,16 +261,20 @@ export async function renameTemplateReferences(app: App, targets: readonly Templ
   if (updated > 0) {
     logger.info("Updated template references after rename", { renames: targets.length, notes: updated });
   }
+
   return updated;
 }
 
 // Apply every rename to one note's text, or undefined when none of them matched.
 function applyTargets(markdown: string, targets: readonly TemplateRenameTarget[]): string | undefined {
   let result: string | undefined;
+
   for (const target of targets) {
     const next = rewriteTemplateReferences(result ?? markdown, target);
+
     if (next !== undefined) result = next;
   }
+
   return result;
 }
 
@@ -267,6 +296,7 @@ export class TemplateRenameQueue {
     if (!await definesTemplate(this.app, newPath)) return;
 
     const target = buildTarget(this.app, oldPath, newPath);
+
     if (!target) return;
 
     this.pending.push(target);
@@ -277,6 +307,7 @@ export class TemplateRenameQueue {
   private async flush(): Promise<void> {
     this.timer = null;
     const targets = this.pending.splice(0);
+
     if (await renameTemplateReferences(this.app, targets) > 0) this.onUpdated();
   }
 

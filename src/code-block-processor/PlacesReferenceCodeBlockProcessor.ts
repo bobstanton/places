@@ -1,4 +1,4 @@
-import { ParameterDefinition } from "places-shared/services";
+import { formatParameterValues, type ParameterDefinition } from "places-shared/services";
 import { CodeBlockRegistry } from "../services/CodeBlockRegistry";
 
 export class PlacesReferenceCodeBlockProcessor {
@@ -12,6 +12,7 @@ export class PlacesReferenceCodeBlockProcessor {
       const section = container.createDiv({ cls: "places-reference-section" });
 
       const header = section.createEl("h3");
+
       header.createEl("code", { text: blockDef.type });
       header.appendText(` - ${blockDef.description}`);
 
@@ -24,24 +25,28 @@ export class PlacesReferenceCodeBlockProcessor {
 
     const thead = table.createEl("thead");
     const headerRow = thead.createEl("tr");
+
     headerRow.createEl("th", { text: "Setting" });
     headerRow.createEl("th", { text: "Description" });
     headerRow.createEl("th", { text: "Examples" });
 
     const tbody = table.createEl("tbody");
+
     for (const param of parameters) {
       const row = tbody.createEl("tr");
+
       row.createEl("td", { text: param.name, cls: "places-setting-name" });
-      // An omitted description renders an empty cell, not a placeholder.
       row.createEl("td", { text: param.description ?? "" });
 
       const valuesCell = row.createEl("td");
-      this.renderBoldMarkdown(valuesCell, param.values);
+
+      this.renderBoldMarkdown(valuesCell, formatParameterValues(param.values));
     }
   }
 
   private renderBoldMarkdown(container: HTMLElement, text: string): void {
     const parts = text.split(/(\*\*.*?\*\*)/g);
+
     for (const part of parts) {
       if (part.startsWith("**") && part.endsWith("**")) {
         container.createEl("strong", { text: part.slice(2, -2) });

@@ -1,3 +1,4 @@
+import { positionFloatingPanel } from "../ui/FloatingPanelPosition";
 import { logger } from "places-shared/utils";
 import { Place } from "places-shared/place";
 import { PlacesBoundingBox } from "places-shared/geo";
@@ -31,7 +32,6 @@ const GeocodingSearchClasses = {
   hidden: 'places-search-hidden',
 } as const;
 
-// Searches within the current map bounding box using configured geocoding services.
 export class MapGeocodingSearch {
   private container: HTMLElement;
   private input!: HTMLInputElement;
@@ -40,28 +40,39 @@ export class MapGeocodingSearch {
 
   private callbacks: GeocodingSearchCallbacks;
   private isVisible = false;
+  private destroyed = false;
+  private disposePosition: (() => void) | null = null;
   private searchTimeout: number | null = null;
+  private focusTimeout: number | null = null;
   private currentResults: Place[] = [];
   private lastSearchedQuery = '';
   private activeInputQuery = '';
   private abortController: AbortController | null = null;
 
-  constructor(parentContainer: HTMLElement, callbacks: GeocodingSearchCallbacks) {
+  constructor(private readonly parentContainer: HTMLElement, callbacks: GeocodingSearchCallbacks) {
     this.callbacks = callbacks;
     this.container = this.createSearchBar(parentContainer);
   }
 
   show(): void {
+    if (this.destroyed) return;
     this.container.removeClass(GeocodingSearchClasses.hidden);
     this.isVisible = true;
+    this.disposePosition?.();
+    this.disposePosition = positionFloatingPanel(this.parentContainer, this.container);
     this.input.focus();
   }
 
   hide(): void {
+    if (this.destroyed) return;
     this.cancelPendingSearch();
+    if (this.focusTimeout !== null) window.clearTimeout(this.focusTimeout);
+    this.focusTimeout = null;
 
-    this.container.addClass(GeocodingSearchClasses.hidden);
     this.isVisible = false;
+    this.container.addClass(GeocodingSearchClasses.hidden);
+    this.disposePosition?.();
+    this.disposePosition = null;
     this.input.value = '';
     this.currentResults = [];
     this.lastSearchedQuery = '';
@@ -85,6 +96,7 @@ export class MapGeocodingSearch {
 
   private createSearchBar(parent: HTMLElement): HTMLElement {
     const container = parent.createDiv();
+
     container.className = `${GeocodingSearchClasses.container} ${GeocodingSearchClasses.hidden}`;
     parent.insertBefore(container, parent.firstChild);
 
@@ -98,11 +110,13 @@ export class MapGeocodingSearch {
     });
 
     const refreshBtn = container.createDiv({ cls: GeocodingSearchClasses.refreshButton });
+
     refreshBtn.createSpan({ text: '↻' });
     refreshBtn.setAttribute('aria-label', 'Refresh search in current area');
     refreshBtn.setAttribute('title', 'Search in current map area');
 
     const closeBtn = container.createDiv({ cls: GeocodingSearchClasses.closeButton, text: '×' });
+
     closeBtn.setAttribute('aria-label', 'Close search');
 
     this.loadingEl = container.createDiv({ cls: GeocodingSearchClasses.loading });
@@ -111,7 +125,6 @@ export class MapGeocodingSearch {
 
     this.resultsEl = container.createDiv({ cls: GeocodingSearchClasses.results });
 
-    // Prevent wheel events on results from bubbling to map (which causes zoom)
     this.resultsEl.addEventListener('wheel', (e) => {
       const canScrollUp = this.resultsEl.scrollTop > 0;
       const canScrollDown = this.resultsEl.scrollTop < this.resultsEl.scrollHeight - this.resultsEl.clientHeight;
@@ -121,7 +134,6 @@ export class MapGeocodingSearch {
       }
     }, { passive: true });
 
-    // Also prevent touch scroll from affecting map
     this.resultsEl.addEventListener('touchmove', (e) => {
       e.stopPropagation();
     }, { passive: true });
@@ -142,13 +154,13 @@ export class MapGeocodingSearch {
 
     this.input.addEventListener('keydown', (e) => {
       stopEvent(e);
+
       if (e.key === 'Escape') {
         this.hide();
         e.preventDefault();
       }
     });
 
-    // Stop all keyboard events from reaching Obsidian
     this.input.addEventListener('keyup', stopEvent);
     this.input.addEventListener('keypress', stopEvent);
 
@@ -168,8 +180,12 @@ export class MapGeocodingSearch {
     container.addEventListener('keyup', stopEvent);
     container.addEventListener('keypress', stopEvent);
     container.addEventListener('focusout', () => {
-      window.setTimeout(() => {
-        if (!container.contains(activeDocument.activeElement)) {
+      if (!this.isVisible || this.destroyed) return;
+      if (this.focusTimeout !== null) window.clearTimeout(this.focusTimeout);
+      this.focusTimeout = window.setTimeout(() => {
+        this.focusTimeout = null;
+
+        if (!container.contains(container.ownerDocument.activeElement)) {
           this.collapseResults();
         }
       }, 150);
@@ -193,6 +209,7 @@ export class MapGeocodingSearch {
     this.cancelPendingSearch();
 
     const trimmedQuery = query.trim();
+
     this.activeInputQuery = trimmedQuery;
     this.currentResults = [];
     this.resultsEl.empty();
@@ -201,6 +218,7 @@ export class MapGeocodingSearch {
 
     if (trimmedQuery.length < 3) {
       this.lastSearchedQuery = '';
+
       return;
     }
 
@@ -213,7 +231,9 @@ export class MapGeocodingSearch {
   // Refresh search with current query in current map bounds.
   private refreshSearch(): void {
     const query = this.input.value.trim();
+
     this.activeInputQuery = query;
+
     if (query.length >= 3) {
       this.cancelPendingSearch();
       void this.performSearch(query);
@@ -224,7 +244,10 @@ export class MapGeocodingSearch {
     this.lastSearchedQuery = query;
 
     const searchAbortController = new AbortController();
+
     this.abortController = searchAbortController;
+    const isCurrent = () => this.abortController === searchAbortController && !searchAbortController.signal.aborted
+      && query === this.lastSearchedQuery && query === this.activeInputQuery && this.isVisible;
 
     this.loadingEl.removeClass('places-hidden');
     this.resultsEl.empty();
@@ -232,7 +255,7 @@ export class MapGeocodingSearch {
     try {
       const bounds = this.callbacks.getMapBounds();
       const updateResultsIfCurrent = (results: Place[]) => {
-        if (query !== this.lastSearchedQuery || query !== this.activeInputQuery || !this.isVisible) {
+        if (!isCurrent()) {
           return;
         }
 
@@ -242,21 +265,15 @@ export class MapGeocodingSearch {
         this.callbacks.onResultsChanged?.(this.currentResults);
       };
 
-      this.currentResults = await this.callbacks.searchPlaces(query, bounds, updateResultsIfCurrent);
+      const results = await this.callbacks.searchPlaces(query, bounds, updateResultsIfCurrent);
 
-      // Check if this search was superseded by a newer one (race condition guard)
-      if (query !== this.lastSearchedQuery || query !== this.activeInputQuery || !this.isVisible) {
-        return;
-      }
-
-      updateResultsIfCurrent(this.currentResults);
+      updateResultsIfCurrent(results);
     } catch (error) {
-      // Ignore abort errors - they're intentional
       if (error instanceof Error && error.name === 'AbortError') {
         return;
       }
 
-      if (query !== this.lastSearchedQuery || query !== this.activeInputQuery || !this.isVisible) {
+      if (!isCurrent()) {
         return;
       }
 
@@ -266,9 +283,10 @@ export class MapGeocodingSearch {
       this.currentResults = [];
       this.callbacks.onResultsChanged?.([]);
     } finally {
-      if (query === this.lastSearchedQuery && query === this.activeInputQuery) {
+      if (isCurrent()) {
         this.loadingEl.addClass('places-hidden');
       }
+
       if (this.abortController === searchAbortController) {
         this.abortController = null;
       }
@@ -280,16 +298,19 @@ export class MapGeocodingSearch {
 
     if (this.currentResults.length === 0) {
       this.resultsEl.createDiv({ cls: 'places-geocoding-no-results', text: 'No results found in this area.' });
+
       return;
     }
 
     this.currentResults.forEach((place, index) => {
       const item = this.resultsEl.createDiv({ cls: GeocodingSearchClasses.resultItem });
+
       item.setAttribute('data-index', String(index));
 
       // Show the marker-rule icon the result's note would get: the row, the
       // preview marker, and the eventual note all agree.
       const ruleIcon = this.callbacks.resolveResultIcon?.(place);
+
       renderSearchResult(item, place, {
         renderIcon: ruleIcon
           ? (iconEl) => { iconEl.textContent = ruleIcon; }
@@ -297,6 +318,7 @@ export class MapGeocodingSearch {
         showWebsite: false,
         renderActions: (actionsEl) => {
           const createButton = actionsEl.createEl('button', { cls: 'places-button mod-cta places-geocoding-create-note', text: 'Create note' });
+
           createButton.setAttribute('aria-label', `Create note for ${place.name || 'this place'}`);
           createButton.addEventListener('click', (e) => {
             e.preventDefault();
@@ -318,9 +340,8 @@ export class MapGeocodingSearch {
 
   private async focusResult(place: Place): Promise<void> {
     const resolved = await this.ensureCoordinates(place);
-    // Still pending after a resolve attempt (the retrieve failed): centering
-    // would fly to the placeholder 0,0.
-    if (resolved.coordinatesPending) return;
+
+    if (!this.isVisible || !this.currentResults.includes(resolved) || resolved.coordinatesPending) return;
     this.callbacks.centerOnPlace?.(resolved);
   }
 
@@ -331,10 +352,12 @@ export class MapGeocodingSearch {
     if (!place.coordinatesPending || !place.resolvePlace) return place;
     const resolved = await place.resolvePlace();
     const index = this.currentResults.indexOf(place);
+
     if (index >= 0 && this.currentResults[index] === place) {
       this.currentResults[index] = resolved;
       this.callbacks.onResultsChanged?.(this.currentResults);
     }
+
     return resolved;
   }
 
@@ -342,23 +365,22 @@ export class MapGeocodingSearch {
     const withCoordinates = await this.ensureCoordinates(place);
     // Resolve place if needed (some APIs need additional calls)
     const resolvedPlace = withCoordinates.resolvePlace ? await withCoordinates.resolvePlace() : withCoordinates;
+
     this.callbacks.onCreateNote(resolvedPlace);
     this.hide();
   }
 
   destroy(): void {
-    this.cancelPendingSearch();
-
-    this.currentResults = [];
-    this.lastSearchedQuery = '';
-    this.activeInputQuery = '';
-    this.callbacks.onResultsChanged?.([]);
-
+    if (this.destroyed) return;
+    this.hide();
+    this.destroyed = true;
     this.container.remove();
   }
 
   private cancelPendingSearch(): void {
-    if (this.searchTimeout) {
+    this.loadingEl.addClass('places-hidden');
+
+    if (this.searchTimeout !== null) {
       window.clearTimeout(this.searchTimeout);
       this.searchTimeout = null;
     }

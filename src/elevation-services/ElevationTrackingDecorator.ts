@@ -1,17 +1,13 @@
 import { Coordinate } from "places-shared/geo";
-import { IElevationService, ElevationProfile } from "places-shared/services";
-import {
-  ServiceTrackingDecoratorBase,
-  IDailyStats,
-  StatsChangedCallback,
-} from "../ServiceDecorators";
+import { API_USAGE_SERVICES, IElevationService, ElevationProfile, type ApiUsageOrigin, type ApiUsageRecorder } from "places-shared/services";
+import { ServiceTrackingDecoratorBase } from "../ServiceDecorators";
 
 export class ElevationTrackingDecorator
-  extends ServiceTrackingDecoratorBase<IDailyStats>
+  extends ServiceTrackingDecoratorBase
   implements IElevationService
 {
-  constructor(private wrappedService: IElevationService, serviceName: string, apiStatsSettings: Record<string, unknown>, onStatsChanged: StatsChangedCallback) {
-    super(serviceName, "elevation", apiStatsSettings, onStatsChanged);
+  constructor(private wrappedService: IElevationService, serviceName: string, recorder: ApiUsageRecorder, origin?: ApiUsageOrigin) {
+    super(recorder, serviceName, API_USAGE_SERVICES.elevation, origin);
   }
 
   getProviderName(): string {

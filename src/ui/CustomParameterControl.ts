@@ -1,6 +1,7 @@
 import { renderUserHtmlTemplate, UserTemplateRenderError } from 'user-template-renderer';
-import { getErrorMessage, logger, scalarToString } from 'places-shared/utils';
-import { QueryParameterDefinition, QueryParameterValue } from '../services/QueryParameters';
+import { getErrorMessage, logger, scalarToString } from "places-shared/utils";
+import { resourceUrl } from "places-shared/obsidian/utils";
+import { QueryParameterDefinition, QueryParameterValue } from 'places/core';
 
 // `control: custom` - a query parameter drawn by user JavaScript.
 //
@@ -8,7 +9,7 @@ import { QueryParameterDefinition, QueryParameterValue } from '../services/Query
 // compiler, cache and error type the weather template block uses):
 //
 // - `render` returns the control's HTML. Required.
-// - `mount` runs after each render and wires behaviour imperatively. Optional.
+// - `mount` runs after each render and wires behavior imperatively. Optional.
 //
 // The markup `render` returns is wired declaratively: an element carrying
 // `data-places-value` sets that value when clicked, and a form field carrying
@@ -37,6 +38,7 @@ export interface CustomParameterHelpers {
   valueAttribute: string;
   // The attribute name that makes a form field report its own value.
   inputAttribute: string;
+  resource: (path: unknown) => string;
 }
 
 // The `param` argument passed to both scripts.
@@ -82,12 +84,15 @@ function createHelpers(): CustomParameterHelpers {
     ),
     range: (start, end) => {
       const result: number[] = [];
+
       for (let value = start; value < end; value++) result.push(value);
+
       return result;
     },
     classNames: map => Object.entries(map).filter(([, on]) => Boolean(on)).map(([name]) => name).join(' '),
     valueAttribute: VALUE_ATTRIBUTE,
     inputAttribute: INPUT_ATTRIBUTE,
+    resource: path => resourceUrl(path),
   };
 }
 
@@ -133,8 +138,10 @@ export function renderCustomParameter(options: CustomParameterControlOptions): (
         logger.warn('Custom parameter cleanup failed', { parameter: definition.name, error });
       }
     }
+
     mountCleanups = [];
   };
+
   options.cleanups.push(runMountCleanups);
 
   const api: CustomParameterApi = {
@@ -153,11 +160,15 @@ export function renderCustomParameter(options: CustomParameterControlOptions): (
     },
     setValue: (raw, setOptions) => {
       const applied = report(raw);
+
       if (applied === undefined) return;
+
       if (setOptions?.redraw === false) {
         currentValue = applied;
+
         return;
       }
+
       draw(applied);
     },
     onDispose: cleanup => mountCleanups.push(cleanup),
@@ -165,6 +176,7 @@ export function renderCustomParameter(options: CustomParameterControlOptions): (
 
   const showError = (error: unknown): void => {
     const message = error instanceof UserTemplateRenderError || getErrorMessage(error);
+
     host.replaceChildren();
     host.createDiv({ cls: 'places-query-param-error', text: `Parameter "${definition.name}": ${message}` });
     logger.warn('Custom parameter script failed', { parameter: definition.name, error });
@@ -173,6 +185,7 @@ export function renderCustomParameter(options: CustomParameterControlOptions): (
   const draw = (value: QueryParameterValue): void => {
     currentValue = value;
     runMountCleanups();
+
     try {
       renderUserHtmlTemplate({
         template: definition.render ?? '',
@@ -180,21 +193,20 @@ export function renderCustomParameter(options: CustomParameterControlOptions): (
         args: [
           { name: 'value', value },
           { name: 'options', value: definition.options ?? [] },
+          { name: 'rows', value: definition.optionRows ?? [] },
           { name: 'param', value: api },
           { name: 'h', value: helpers },
         ],
         container: host,
-        // No cacheKey: supplying one *replaces* the script text in the compile
-        // cache key, and two parameters that happen to share a name would run
-        // each other's body. Keying on the source is correct and invalidates
-        // itself the moment the user edits the block.
       });
     } catch (error) {
       showError(error);
+
       return;
     }
 
     if (!definition.mount) return;
+
     try {
       renderUserHtmlTemplate({
         template: wrapMountSource(definition.mount),
@@ -203,12 +215,11 @@ export function renderCustomParameter(options: CustomParameterControlOptions): (
           { name: 'el', value: host },
           { name: 'value', value },
           { name: 'options', value: definition.options ?? [] },
+          { name: 'rows', value: definition.optionRows ?? [] },
           { name: 'param', value: api },
           { name: 'h', value: helpers },
         ],
         container: host,
-        // The wrapper returns "", and nothing is appended; the rendered markup
-        // must survive for mount to wire it.
         clearContainer: false,
       });
     } catch (error) {
@@ -216,22 +227,21 @@ export function renderCustomParameter(options: CustomParameterControlOptions): (
     }
   };
 
-  // Delegated: draw() replaces every node the markup produced.
   const onClick = (event: MouseEvent): void => {
     const target = (event.target as HTMLElement | null)?.closest?.(`[${VALUE_ATTRIBUTE}]`);
+
     if (!target || !host.contains(target)) return;
     event.preventDefault();
-    // Redraw: only the user's markup knows how this control shows its value.
-    // Built-in controls repaint themselves before reporting.
     const applied = report(target.getAttribute(VALUE_ATTRIBUTE));
+
     if (applied !== undefined) draw(applied);
   };
   const onInput = (event: Event): void => {
     const target = event.target as HTMLElement | null;
+
     if (!target?.hasAttribute?.(INPUT_ATTRIBUTE)) return;
     const field = target as HTMLInputElement;
-    // No redraw: the field already shows what was typed, and replacing it
-    // mid-edit would drop focus and the caret on every keystroke.
+
     report(field.type === 'checkbox' ? field.checked : field.value);
   };
 
@@ -242,11 +252,10 @@ export function renderCustomParameter(options: CustomParameterControlOptions): (
     host.removeEventListener('click', onClick);
     host.removeEventListener('input', onInput);
     host.removeEventListener('change', onInput);
-    // Emptying the host drops every node the user's scripts created, and with
-    // them any listener a `mount` body attached without returning a cleanup.
     host.replaceChildren();
   });
 
   draw(options.initial);
+
   return draw;
 }

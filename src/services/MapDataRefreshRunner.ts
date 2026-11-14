@@ -43,9 +43,11 @@ export async function runMapDataRefresh(request: MapDataRefreshRequest): Promise
     if (!previousPlan || !nextPlan) {
       return { refreshed: false, status: 'requires-rebuild', reason: 'canonical render plans are required for incremental updates' };
     }
+
     const changes = classifyMapRenderPlanChanges(previousPlan, nextPlan, planDiff ?? undefined);
     const capabilities = provider.getIncrementalUpdateCapabilities();
     const unsupported = [...changes].filter(change => !capabilities[change]);
+
     if (unsupported.length > 0) {
       return {
         refreshed: false,
@@ -62,30 +64,36 @@ export async function runMapDataRefresh(request: MapDataRefreshRequest): Promise
       planDiff: planDiff ? summarizeMapRenderPlanDiff(planDiff) : undefined,
     });
 
+    const updateStarted = Date.now();
     const result = await provider.updateMapData(mapContainer, places, renderRequest, {
       previousPlan,
       nextPlan,
       planDiff,
     });
+
     if (!result.updated) {
       logger?.debug('map data update rejected by provider', {
         provider: providerName,
         places: places.length,
         reason: result.reason
       });
+
       return { refreshed: false, status: result.status, reason: result.reason };
     }
 
     logger?.debug('map data update complete', {
       provider: providerName,
-      places: places.length
+      places: places.length,
+      providerAwaitMs: Date.now() - updateStarted,
     });
+
     return { refreshed: true };
   } catch (error) {
     logger?.debug('map data update failed', {
       provider: providerName,
       error
     });
+
     return { refreshed: false, status: 'temporarily-unavailable', reason: getErrorMessage(error) };
   }
 }

@@ -1,17 +1,19 @@
 import { App, MarkdownPostProcessorContext, TFile } from "obsidian";
-import { createLoadingIndicator } from "places-shared/ui";
+import { applyBlockWidth, createLoadingIndicator } from "places-shared/obsidian/ui";
 import { UnitsSystem, formatMetersInSystem, meters } from "places-shared/units";
 import { normalizeChartBlockSettings } from "places-shared/settings";
-import { IElevationService } from "places-shared/services";
+import { IElevationService, type ApiUsageOrigin } from "places-shared/services";
 import { getErrorMessage, renderErrorWithHelp, logger as rootLogger } from "places-shared/utils";
 import PlacesPlugin from "../main";
-import { ChartService } from "../services/ChartService";
-import { optionalStringSetting, parseCodeBlock } from "../services/CodeBlockParser";
+import { ChartService } from 'places/core/charts';
+import { optionalStringSetting, parseCodeBlock } from 'places/core';
 import { TrackData, TrackDataService } from "../services/TrackDataService";
-import { registerRefreshableCodeBlock, renderHoverPlaceholder, createOwnNoteEditRefreshGuard } from "./RefreshableCodeBlock";
+import { registerRefreshableCodeBlock, createOwnNoteEditRefreshGuard } from "./RefreshableCodeBlock";
+import { renderHoverPlaceholder } from "places-shared/obsidian/ui";
 import { disposeManagedChart, registerManagedChart } from "./ManagedChartRenderChild";
 import { renderTrackActionBar } from "./TrackActionBar";
 import { BlockParameterSupport } from "../services/BlockParameters";
+import { resolveCurrentSourcePath } from "../services/SourcePathRenames";
 
 const logger = rootLogger.scope("places-elevation");
 
@@ -41,31 +43,45 @@ export class ElevationBlockProcessor {
     if (renderHoverPlaceholder(el, "📈 Elevation preview not available in hover")) return;
 
     const parsed = parseCodeBlock(source);
+    const autoRefresh = parsed.settings.autorefresh;
     const parameters = await this.blockParameters.apply(parsed, el, ctx);
+    const settings = this.parseSettings(parsed.settings);
+    const trackInput = settings.track || `"${ctx.sourcePath}"`;
+    const shouldRefreshOwnNote = createOwnNoteEditRefreshGuard(source, ctx.sourcePath);
+    let trackFile = this.trackDataService.resolveTrackFile(trackInput, ctx.sourcePath);
+
     registerRefreshableCodeBlock({
+      autoRefresh,
       source,
       el,
       ctx,
       process: (src, container, context) => this.processCodeBlock(src, container, context),
-      shouldAutoRefresh: createOwnNoteEditRefreshGuard(source, ctx.sourcePath),
+      shouldAutoRefresh: changedPath => {
+        if (!changedPath) return true;
+        trackFile ??= this.trackDataService.resolveTrackFile(trackInput, resolveCurrentSourcePath(ctx.sourcePath));
+        if (trackFile && changedPath === resolveCurrentSourcePath(trackFile.path)) return true;
+
+        return changedPath === resolveCurrentSourcePath(ctx.sourcePath) && shouldRefreshOwnNote(changedPath);
+      },
       ariaLabel: "Recalculate elevation",
       onError: error => logger.error("Recalculate elevation failed:", error),
       usesParameters: parameters !== null,
     });
 
-    const settings = this.parseSettings(parsed.settings);
-    const elevationService = this.resolveElevationService(settings.provider);
+    const elevationService = this.resolveElevationService(settings.provider, { sourcePath: ctx.sourcePath, blockType: 'places-elevation' });
+
     if (!elevationService.service) {
       renderErrorWithHelp(el, { icon: "⚠️", title: "Elevation provider unavailable", message: elevationService.error });
       await parameters?.renderStrip();
+
       return;
     }
 
-    const trackInput = settings.track || `"${ctx.sourcePath}"`;
     const loading = createLoadingIndicator(el, "Fetching elevation profile...");
 
     try {
       const original = await this.trackDataService.loadTrackFromPath(trackInput, ctx.sourcePath, { skipCache: true });
+
       if (original.points.length < 2) {
         throw new Error("The track needs at least two points to fetch an elevation profile");
       }
@@ -79,6 +95,7 @@ export class ElevationBlockProcessor {
       logger.error("Elevation preview failed:", error);
       renderErrorWithHelp(el, { icon: "⚠️", title: "Elevation preview failed", message: getErrorMessage(error) });
     }
+
     await parameters?.renderStrip();
   }
 
@@ -96,12 +113,14 @@ export class ElevationBlockProcessor {
     };
   }
 
-  private resolveElevationService(requested: string | undefined): { service?: IElevationService; error: string } {
+  private resolveElevationService(requested: string | undefined, origin: ApiUsageOrigin): { service?: IElevationService; error: string } {
     const available = PlacesPlugin.getElevationServiceNames();
 
     if (requested) {
-      const service = PlacesPlugin.getElevationService(requested);
+      const service = PlacesPlugin.getElevationService(requested, origin);
+
       if (service) return { service, error: "" };
+
       return {
         error: available.length > 0
           ? `Unknown elevation provider "${requested}". Available: ${available.join(", ")}`
@@ -109,30 +128,21 @@ export class ElevationBlockProcessor {
       };
     }
 
-    const service = PlacesPlugin.getFirstElevationService();
+    const service = PlacesPlugin.getFirstElevationService(origin);
+
     if (service) return { service, error: "" };
+
     return { error: "No elevation provider is available. Enable a provider plugin with elevation support (see places-help)." };
   }
 
-  private renderPreview(
-    el: HTMLElement,
-    ctx: MarkdownPostProcessorContext,
-    settings: ElevationBlockSettings,
-    trackInput: string,
-    original: TrackData,
-    candidate: TrackData,
-    elevationService: IElevationService,
-  ): void {
+  private renderPreview(el: HTMLElement, ctx: MarkdownPostProcessorContext, settings: ElevationBlockSettings, trackInput: string, original: TrackData, candidate: TrackData, elevationService: IElevationService): void {
+    applyBlockWidth(el, settings.width);
     const container = el.createDiv({ cls: "places-elevation-container places-chart-container" });
     const chartEl = container.createDiv({ cls: "places-elevation-chart places-chart" });
+
     chartEl.setCssProps({
       "--places-chart-height": settings.height,
     });
-    if (settings.width !== "100%") {
-      chartEl.setCssProps({
-        "--places-chart-width": settings.width,
-      });
-    }
 
     const hasOriginalElevation = this.trackDataService.hasElevationData(original);
     const chartSettings = normalizeChartBlockSettings({
@@ -189,6 +199,7 @@ export class ElevationBlockProcessor {
     replacementLabel: string,
   ): void {
     const stats = container.createDiv({ cls: "places-stats-grid places-elevation-stats" });
+
     this.addElevationStat(stats, `${existingLabel} gain`, hasOriginalElevation ? original.metrics.elevationGain : undefined);
     this.addElevationStat(stats, `${replacementLabel} gain`, candidate.metrics.elevationGain);
     this.addElevationStat(stats, `${existingLabel} range`, hasOriginalElevation ? this.formatRange(original) : undefined);
@@ -197,6 +208,7 @@ export class ElevationBlockProcessor {
 
   private addElevationStat(container: HTMLElement, label: string, value: string | number | undefined): void {
     const stat = container.createDiv({ cls: "places-stat" });
+
     stat.createDiv({ cls: "places-stat-value", text: typeof value === "number" ? formatMetersInSystem(meters(value), this.units) : value ?? "n/a" });
     stat.createDiv({ cls: "places-stat-label", text: label });
   }
@@ -204,7 +216,9 @@ export class ElevationBlockProcessor {
   private formatRange(trackData: TrackData): string | undefined {
     const min = trackData.metrics.minElevation;
     const max = trackData.metrics.maxElevation;
+
     if (min === undefined || max === undefined) return undefined;
+
     return `${formatMetersInSystem(min, this.units)} - ${formatMetersInSystem(max, this.units)}`;
   }
 }

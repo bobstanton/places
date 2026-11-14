@@ -1,5 +1,7 @@
 import { logger } from "places-shared/utils";
-import { createLoadingIndicator } from "places-shared/ui";
+import { openLocalFile } from "places-shared/obsidian/utils";
+import { popupLinkClass } from "places-shared/map";
+import { createLoadingIndicator } from "places-shared/obsidian/ui";
 import { App, MarkdownPostProcessorContext, normalizePath } from "obsidian";
 import { km, kph, meters, formatKmInSystem, formatKphInSystem, UnitsSystem, Kilometers, Meters } from "places-shared/units";
 import { normalizePercentage, parsePositiveFloat, parsePositiveInt, parseBoolean, parseLongDistanceAsKilometers, parseDistanceStringAsKilometers, conditionalProps } from "places-shared/settings";
@@ -7,10 +9,11 @@ import { renderError, formatDisplayCoordinate, getErrorMessage, clamp, scalarToS
 import { parseCoordinate } from "places-shared/geo";
 import PlacesPlugin from "../main";
 import { BlockParameterSupport } from "../services/BlockParameters";
-import { ParsedCodeBlock, optionalStringSetting, parseCodeBlock } from "../services/CodeBlockParser";
+import { ParsedCodeBlock, optionalStringSetting, parseCodeBlock } from 'places/core';
 import { SimilarTracksService } from "../services/SimilarTracksService";
 import { TrackDataService } from "../services/TrackDataService";
-import { registerRefreshableCodeBlock, renderHoverPlaceholder, createOwnNoteEditRefreshGuard } from "./RefreshableCodeBlock";
+import { registerRefreshableCodeBlock, createOwnNoteEditRefreshGuard } from "./RefreshableCodeBlock";
+import { renderHoverPlaceholder } from "places-shared/obsidian/ui";
 
 interface SimilarTracksBlockSettings {
   // Minimum Fréchet similarity (0-1). Use with or without minOverlap.
@@ -77,8 +80,11 @@ export class SimilarTracksBlockProcessor {
     if (renderHoverPlaceholder(el, '📊 Similar tracks preview not available in hover')) return;
 
     const parsed = parseCodeBlock(source);
+    const autoRefresh = parsed.settings.autorefresh;
     const parameters = await this.blockParameters.apply(parsed, el, ctx);
+
     registerRefreshableCodeBlock({
+      autoRefresh,
       source,
       el,
       ctx,
@@ -87,12 +93,14 @@ export class SimilarTracksBlockProcessor {
       ariaLabel: 'Refresh similar tracks',
       onError: error => logger.error('Refresh similar tracks failed:', error),
       usesParameters: parameters !== null,
+      query: null,
     });
 
     try {
       const settings = this.parseSettings(parsed, ctx);
 
       let searchLocation = settings.location;
+
       if (!searchLocation && ctx?.sourcePath) {
         searchLocation = extractLocationFromFrontmatter(this.app, ctx.sourcePath);
       }
@@ -100,6 +108,7 @@ export class SimilarTracksBlockProcessor {
       const loadingText = settings.searchType === 'point' || searchLocation
         ? "Finding tracks near location..."
         : "Finding similar tracks...";
+
       createLoadingIndicator(el, loadingText);
 
       let results: EnrichedTrackResult[];
@@ -119,6 +128,7 @@ export class SimilarTracksBlockProcessor {
 
         results = pointSearchResults.map(r => {
           const proximityRatio = clamp(1 - (r.distance / settings.radius), 0, 1);
+
           return {
             fileName: r.fileName,
             filePath: r.filePath,
@@ -146,12 +156,14 @@ export class SimilarTracksBlockProcessor {
           text: "No similar tracks found.",
           cls: "places-centered places-empty"
         });
+
         return;
       }
 
       const isPointSearch = settings.searchType === 'point' || (!hasTrackData && !!searchLocation);
 
       let enrichedResults = results;
+
       if (settings.showSpeedTime || settings.showPersonalBest) {
         enrichedResults = this.enrichResultsWithTrackData(results);
       }
@@ -159,7 +171,6 @@ export class SimilarTracksBlockProcessor {
       const personalBest = settings.showPersonalBest ? this.findPersonalBest(enrichedResults) : undefined;
 
       this.renderResults(el, enrichedResults, isPointSearch, settings, searchLocation, hasTrackData, personalBest ?? undefined);
-
     } catch (error) {
       logger.error("Error in places-similar code block:", error);
       renderError(el, {
@@ -168,8 +179,6 @@ export class SimilarTracksBlockProcessor {
         message: getErrorMessage(error)
       });
     } finally {
-      // Render after the content and any internal el.empty(); 'above' placement
-      // still displays the strip on top.
       await parameters?.renderStrip();
     }
   }
@@ -181,6 +190,7 @@ export class SimilarTracksBlockProcessor {
 
     if (ctx.sourcePath && pairs.radius === undefined) {
       const distanceRadius = this.getDistanceFromCurrentNote(ctx.sourcePath);
+
       if (distanceRadius !== null) {
         settings.radius = distanceRadius;
       }
@@ -204,26 +214,32 @@ export class SimilarTracksBlockProcessor {
     if (pairs.radius !== undefined) {
       const radiusStr = scalarToString(pairs.radius);
       const fromIndex = radiusStr.toLowerCase().indexOf(' from ');
+
       if (fromIndex !== -1) {
         const distanceStr = radiusStr.substring(0, fromIndex).trim();
         const coordStr = radiusStr.substring(fromIndex + 6).trim();
         const radiusKm = parseLongDistanceAsKilometers(distanceStr, units);
+
         if (radiusKm !== undefined) settings.radius = radiusKm;
         const center = parseCoordinate(coordStr);
+
         if (center) {
           settings.location = center;
           settings.searchType = 'point';
         }
       } else {
         const radiusKm = parseLongDistanceAsKilometers(radiusStr, units);
+
         if (radiusKm !== undefined) settings.radius = radiusKm;
       }
     }
 
     // Location setting - lower priority than FROM in radius
     const location = optionalStringSetting(pairs, 'location');
+
     if (location && !settings.location) {
       const parsed = parseCoordinate(location);
+
       if (parsed) {
         settings.location = parsed;
         settings.searchType = 'point';
@@ -236,12 +252,15 @@ export class SimilarTracksBlockProcessor {
   private getDistanceFromCurrentNote(filePath: string): Kilometers | null {
     try {
       const file = this.app.vault.getFileByPath(normalizePath(filePath));
+
       if (!file) return null;
 
       const fileCache = this.app.metadataCache.getFileCache(file);
+
       if (!fileCache?.frontmatter) return null;
 
       const distance: unknown = fileCache.frontmatter['Distance'];
+
       return parseDistanceStringAsKilometers(distance) ?? null;
     } catch {
       return null;
@@ -252,10 +271,13 @@ export class SimilarTracksBlockProcessor {
     return results.map((result) => {
       try {
         const file = this.app.vault.getFileByPath(normalizePath(result.filePath));
+
         if (!file) {
           return result;
         }
+
         const trackData = this.trackDataService.extractTrackFromNote(file);
+
         return { ...result, trackData };
       } catch {
         return result;
@@ -265,11 +287,13 @@ export class SimilarTracksBlockProcessor {
 
   private findPersonalBest(results: EnrichedTrackResult[]): EnrichedTrackResult | null {
     const tracksWithSpeed = results.filter(r => r.trackData?.metrics?.averageSpeed !== undefined);
+
     if (tracksWithSpeed.length === 0) return null;
 
     return tracksWithSpeed.reduce((best, current) => {
       const currentSpeed = current.trackData?.metrics?.averageSpeed ?? 0;
       const bestSpeed = best.trackData?.metrics?.averageSpeed ?? 0;
+
       return currentSpeed > bestSpeed ? current : best;
     });
   }
@@ -283,6 +307,7 @@ export class SimilarTracksBlockProcessor {
     });
 
     const table = this.createResultsTable(container, isPointSearch, settings);
+
     this.populateTableData(table, results, isPointSearch, settings, personalBest);
 
     this.addSettingsInfo(container, isPointSearch, settings, searchLocation, hasTrackData);
@@ -294,16 +319,20 @@ export class SimilarTracksBlockProcessor {
     const headerRow = thead.createEl("tr");
 
     let headers: string[];
+
     if (isPointSearch) {
       headers = ["Track", "Distance", "Proximity"];
     } else {
       headers = ["Track"];
+
       if (shouldShowSimilarity(settings)) {
         headers.push("Similarity");
       }
+
       if (settings.minOverlap !== undefined) {
         headers.push("Overlap");
       }
+
       headers.push("Distance", "Length Match");
     }
 
@@ -326,6 +355,7 @@ export class SimilarTracksBlockProcessor {
 
   private populateTableData(table: HTMLTableElement, results: EnrichedTrackResult[], isPointSearch: boolean, settings: SimilarTracksBlockSettings, personalBest?: EnrichedTrackResult): void {
     const tbody = table.querySelector("tbody");
+
     if (!tbody) return;
 
     for (const result of results) {
@@ -334,11 +364,12 @@ export class SimilarTracksBlockProcessor {
       const nameCell = row.createEl("td");
       const link = nameCell.createEl("a", {
         text: result.fileName,
-        cls: "internal-link"
+        cls: popupLinkClass(result.filePath)
       });
+
       link.addEventListener('click', (e) => {
         e.preventDefault();
-        void this.app.workspace.openLinkText(result.filePath, '');
+        openLocalFile(this.app, result.filePath);
       });
 
       if (isPointSearch) {
@@ -360,44 +391,54 @@ export class SimilarTracksBlockProcessor {
   private addPointSearchCells(row: HTMLTableRowElement, result: EnrichedTrackResult, _settings: SimilarTracksBlockSettings): void {
     const distanceCell = row.createEl("td");
     const distanceText = formatKmInSystem(km(result.distance), PlacesPlugin.settings.units, 1);
+
     distanceCell.textContent = distanceText;
 
     const proximityCell = row.createEl("td");
+
     proximityCell.textContent = `${Math.round(result.overlapPercent ?? 0)}%`;
   }
 
   private addTrackSimilarityCells(row: HTMLTableRowElement, result: EnrichedTrackResult, settings: SimilarTracksBlockSettings): void {
     if (shouldShowSimilarity(settings)) {
       const similarityCell = row.createEl("td");
+
       similarityCell.textContent = `${Math.round((result.similarity ?? 0) * 100)}%`;
     }
 
     if (settings.minOverlap !== undefined) {
       const overlapCell = row.createEl("td");
+
       overlapCell.textContent = `${Math.round(result.overlapPercent ?? 0)}%`;
     }
 
     const distanceCell = row.createEl("td");
     const distanceText = formatKmInSystem(km(result.distance), PlacesPlugin.settings.units, 1);
+
     distanceCell.textContent = distanceText;
 
     const lengthMatchCell = row.createEl("td");
+
     lengthMatchCell.textContent = `${Math.round(result.lengthMatchPercentage ?? 0)}%`;
   }
 
   private addSpeedTimeCells(row: HTMLTableRowElement, result: EnrichedTrackResult): void {
     const speedCell = row.createEl("td");
+
     if (result.trackData?.metrics?.averageSpeed) {
       const speedText = formatKphInSystem(kph(result.trackData.metrics.averageSpeed), PlacesPlugin.settings.units, 1);
+
       speedCell.textContent = speedText;
     } else {
       speedCell.textContent = "-";
     }
 
     const durationCell = row.createEl("td");
+
     if (result.trackData?.metrics?.duration) {
       const hours = Math.floor(result.trackData.metrics.duration);
       const minutes = Math.round((result.trackData.metrics.duration - hours) * 60);
+
       durationCell.textContent = hours > 0 ? `${hours}h ${minutes}m` : `${minutes}m`;
     } else {
       durationCell.textContent = "-";
@@ -406,6 +447,7 @@ export class SimilarTracksBlockProcessor {
 
   private addPersonalBestCell(row: HTMLTableRowElement, result: EnrichedTrackResult, personalBest?: EnrichedTrackResult): void {
     const pbCell = row.createEl("td");
+
     if (personalBest && result.filePath === personalBest.filePath) {
       pbCell.textContent = "🏆";
       pbCell.title = "Personal best - fastest average speed";
@@ -416,10 +458,13 @@ export class SimilarTracksBlockProcessor {
 
   private addSettingsInfo(container: HTMLElement, isPointSearch: boolean, settings: SimilarTracksBlockSettings, searchLocation: SearchLocation | undefined, hasTrackData: boolean): void {
     let settingsText = "";
+
     if (isPointSearch) {
       const radius = settings.radius;
       const radiusText = formatKmInSystem(km(radius), PlacesPlugin.settings.units, 1);
+
       settingsText = `Showing tracks within ${radiusText} of location`;
+
       if (searchLocation && typeof searchLocation.latitude === 'number' && typeof searchLocation.longitude === 'number') {
         settingsText += ` (${formatDisplayCoordinate(searchLocation, 4)})`;
       }
@@ -448,14 +493,16 @@ export class SimilarTracksBlockProcessor {
       });
     }
   }
-
 }
 
 function extractLocationFromFrontmatter(app: App, filePath: string): { latitude: number; longitude: number } | undefined {
   const file = app.vault.getFileByPath(normalizePath(filePath));
+
   if (!file) return undefined;
   const fileCache = app.metadataCache.getFileCache(file);
   const location: unknown = fileCache?.frontmatter?.Location;
+
   if (typeof location !== 'string') return undefined;
+
   return parseCoordinate(location) ?? undefined;
 }

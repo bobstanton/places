@@ -1,14 +1,15 @@
 import type * as GeoJSON from "geojson";
 import { DirectionsOverlayRequest, IsochroneOverlayRequest, RouteOverlayCapabilities, RouteOverlayService } from "places-shared/services";
-import { ServiceTrackingDecoratorBase, IDailyStats, StatsChangedCallback } from "../ServiceDecorators";
+import { ServiceTrackingDecoratorBase } from "../ServiceDecorators";
+import { API_USAGE_SERVICES, type ApiUsageOrigin, type ApiUsageRecorder } from "places-shared/services";
 import { DEFAULT_ROUTE_OVERLAY_CAPABILITIES } from "./RouteOverlayCachingDecorator";
 
 export class RouteOverlayTrackingDecorator
-  extends ServiceTrackingDecoratorBase<IDailyStats>
+  extends ServiceTrackingDecoratorBase
   implements RouteOverlayService
 {
-  constructor(private wrappedService: RouteOverlayService, serviceName: string, apiStatsSettings: Record<string, unknown>, onStatsChanged: StatsChangedCallback) {
-    super(serviceName, "routeOverlay", apiStatsSettings, onStatsChanged);
+  constructor(private wrappedService: RouteOverlayService, serviceName: string, recorder: ApiUsageRecorder, origin?: ApiUsageOrigin) {
+    super(recorder, serviceName, API_USAGE_SERVICES.routeOverlay, origin);
   }
 
   getProviderName(): string {

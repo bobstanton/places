@@ -1,10 +1,24 @@
 import { App } from "obsidian";
 import { getVaultQueryAPI, waitForVaultQueryAPI } from "vaultquery/api";
 import type { IVaultQueryAPI, EventRef } from "vaultquery/api";
-import { logger as rootLogger } from 'places-shared/utils';
+import { logger as rootLogger } from "places-shared/utils";
 import { getErrorMessage, sleep } from "places-shared/utils";
 
 const logger = rootLogger.scope('VaultQuery');
+
+const MAX_LOGGED_SQL_CHARS = 2000;
+
+export function vaultQuerySqlError(sql: string, sourcePath: string | undefined, error: unknown): Error {
+  const message = getErrorMessage(error);
+
+  logger.warn('SQL failed', {
+    sourcePath,
+    sql: sql.length > MAX_LOGGED_SQL_CHARS ? `${sql.slice(0, MAX_LOGGED_SQL_CHARS)} [+${sql.length - MAX_LOGGED_SQL_CHARS} chars]` : sql,
+    error: message,
+  });
+
+  return new Error("VaultQuery SQL error: " + message);
+}
 
 interface VaultQueryPluginManager {
   enabledPlugins?: Set<string>;
@@ -16,6 +30,7 @@ interface VaultQueryPluginManager {
 // from a genuinely missing or disabled plugin.
 export function isVaultQueryPluginEnabled(app: App): boolean {
   const manager = (app as unknown as { plugins?: VaultQueryPluginManager }).plugins;
+
   return manager?.enabledPlugins?.has('vaultquery') === true || manager?.plugins?.vaultquery !== undefined;
 }
 
@@ -38,6 +53,8 @@ export class VaultQueryService {
   private readyPromise: Promise<void> | null = null;
   private ready = false;
   private databaseLostRef: EventRef | null = null;
+  private disposed = false;
+  private cancelIndexingWait: (() => void) | null = null;
 
   constructor(protected app: App) {}
 
@@ -50,55 +67,59 @@ export class VaultQueryService {
     if (this.readyPromise !== null) return this.readyPromise;
 
     this.readyPromise = this.doInitialize();
+
     try {
       await this.readyPromise;
+      if (this.disposed) throw new VaultQueryPreparingError('Places was unloaded during startup.');
       this.ready = true;
     } catch (error) {
       this.readyPromise = null;
+
       throw error;
     }
   }
 
   private async doInitialize(): Promise<void> {
     const startTime = Date.now();
+
     logger.info('Starting initialization');
 
-    // Resolves when VaultQuery announces its API through the api-ready
-    // workspace event (or immediately if it is already loaded).
     const api = await waitForVaultQueryAPI(this.app);
+
+    if (this.disposed) return;
+
     if (!api) {
       if (isVaultQueryPluginEnabled(this.app)) {
         throw new VaultQueryPreparingError('Waiting for VaultQuery to finish starting...');
       }
+
       throw new Error('VaultQuery API not available');
     }
 
     await this.assertDatabaseHealthy(api);
+    if (this.disposed) return;
 
     const apiReadyTime = Date.now() - startTime;
     const indexingStatus = api.getIndexingStatus();
+
     logger.info(`API ready ${apiReadyTime}ms, isIndexing=${indexingStatus.isIndexing}` + (indexingStatus.progress ? `, ${indexingStatus.progress.current}/${indexingStatus.progress.total}` : ', no progress'));
 
     const waitStart = Date.now();
+
     await api.waitForIndexing(VaultQueryService.INITIAL_INDEXING_WAIT_MS);
+    if (this.disposed) return;
     const waitDuration = Date.now() - waitStart;
-    const timedOut = waitDuration >= VaultQueryService.INITIAL_INDEXING_WAIT_MS - 100; // close to timeout = timeout fired
-
     const postStatus = api.getIndexingStatus();
-    if (timedOut) {
-      logger.warn(`waitForIndexing ${waitDuration}ms TIMED OUT, post: isIndexing=${postStatus.isIndexing}` + (postStatus.progress ? `, ${postStatus.progress.current}/${postStatus.progress.total}` : ''));
-    }
-    else {
-      logger.debug(`waitForIndexing ${waitDuration}ms, post: isIndexing=${postStatus.isIndexing}` + (postStatus.progress ? `, ${postStatus.progress.current}/${postStatus.progress.total}` : ''));
-    }
 
-    if (timedOut && postStatus.isIndexing) {
-      logger.warn('Still indexing after timeout, waiting for VaultQuery indexing to complete');
+    logger.debug(`waitForIndexing ${waitDuration}ms, post: isIndexing=${postStatus.isIndexing}` + (postStatus.progress ? `, ${postStatus.progress.current}/${postStatus.progress.total}` : ''));
+
+    if (postStatus.isIndexing) {
+      logger.info('Indexing notes; waiting for VaultQuery indexing to complete', postStatus.progress);
       await this.waitForIndexingCompletion(api);
+      if (this.disposed) return;
       const latestStatus = api.getIndexingStatus();
+
       logger.info(`Indexing complete, total ${Date.now() - startTime}ms` + (latestStatus.progress ? `, ${latestStatus.progress.current}/${latestStatus.progress.total}` : ''));
-    } else if (timedOut) {
-      logger.warn(`Total ${Date.now() - startTime}ms - timed out, proceeding`);
     } else {
       logger.info(`Complete in ${Date.now() - startTime}ms`);
     }
@@ -113,21 +134,27 @@ export class VaultQueryService {
     }
 
     let lastHealth: Awaited<ReturnType<IVaultQueryAPI['checkDatabaseHealthAsync']>> | null = null;
+
     for (let attempt = 1; attempt <= VaultQueryService.DATABASE_HEALTH_MAX_ATTEMPTS; attempt++) {
       const health = await api.checkDatabaseHealthAsync();
+
       lastHealth = health;
+
       if (health.healthy) {
         logger.debug('Database health check passed');
+
         return;
       }
 
       if (!this.isTransientDatabaseHealthFailure(health)) {
         logger.warn('Database health check failed', health.error, health.diagnostics);
+
         throw new Error(`VaultQuery database is not healthy: ${health.error ?? 'unknown error'}`);
       }
 
       if (attempt < VaultQueryService.DATABASE_HEALTH_MAX_ATTEMPTS) {
         logger.warn(`Database health check timed out, retrying (${attempt}/${VaultQueryService.DATABASE_HEALTH_MAX_ATTEMPTS})`, health.error, health.diagnostics);
+
         await sleep(VaultQueryService.DATABASE_HEALTH_RETRY_DELAY_MS);
       }
     }
@@ -138,6 +165,7 @@ export class VaultQueryService {
   private isTransientDatabaseHealthFailure(health: Awaited<ReturnType<IVaultQueryAPI['checkDatabaseHealthAsync']>>): boolean {
     const message = health.error ?? '';
     const diagnostics = health.diagnostics ?? {};
+
     return /timed out|timeout/i.test(message) || diagnostics.workerCallTimedOut === true || diagnostics.healthCheckTimedOut === true;
   }
 
@@ -148,8 +176,6 @@ export class VaultQueryService {
       return;
     }
 
-    // 'vault-indexed' fires at the end of every reindex pass; the subscription
-    // happens before the re-check, and a pass finishing in between is not missed.
     await new Promise<void>((resolve) => {
       let ref: EventRef | null = null;
 
@@ -158,10 +184,14 @@ export class VaultQueryService {
           api.off(ref);
           ref = null;
         }
+
+        this.cancelIndexingWait = null;
         resolve();
       };
 
+      this.cancelIndexingWait = complete;
       ref = api.on('vault-indexed', complete);
+
       if (!api.getIndexingStatus().isIndexing) {
         complete();
       }
@@ -183,11 +213,13 @@ export class VaultQueryService {
     if (this.databaseLostRef) return;
 
     const api = this.getApi();
+
     if (!api) return;
 
     this.databaseLostRef = api.on('database-lost', () => {
       logger.debug('Database lost, resetting state for lazy re-initialization');
       this.resetState();
+
       // Unsubscribe before clearing the ref: since VaultQuery's event bus
       // survives database recovery, leaving the listener attached and then
       // re-subscribing would accumulate a duplicate per recovery cycle.
@@ -196,6 +228,7 @@ export class VaultQueryService {
       if (this.databaseLostRef) {
         api.off(this.databaseLostRef);
       }
+
       this.databaseLostRef = null;
       this.onDatabaseLost();
     });
@@ -220,6 +253,13 @@ export class VaultQueryService {
     return this.ready ? null : this.readyPromise;
   }
 
+  getLoadingProgress(): { current: number; total: number } | undefined {
+    if (this.ready) return undefined;
+    const status = this.getApi()?.getIndexingStatus();
+
+    return status?.isIndexing ? status.progress : undefined;
+  }
+
   async executeQuery(sql: string, sourcePath?: string): Promise<unknown[]> {
     await this.ensureReady();
 
@@ -228,13 +268,17 @@ export class VaultQueryService {
     try {
       return await api.query(sql, sourcePath) || [];
     } catch (error) {
-      throw new Error("VaultQuery SQL error: " + getErrorMessage(error));
+      throw vaultQuerySqlError(sql, sourcePath, error);
     }
   }
 
   cleanup(): void {
+    this.disposed = true;
+    this.cancelIndexingWait?.();
+
     if (this.databaseLostRef) {
       const api = this.getApi();
+
       if (api) api.off(this.databaseLostRef);
       this.databaseLostRef = null;
     }

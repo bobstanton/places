@@ -1,16 +1,14 @@
 import { TFile } from "obsidian";
 import { Kilometers, km, Meters, meters } from "places-shared/units";
 import { Coordinate, DistanceCalculator } from "places-shared/geo";
-import { TrackMetricsCalculator } from "./TrackMetricsCalculator";
+import { TrackMetricsCalculator } from 'places/core';
 import { TrackPoint } from "./TrackDataService";
 
-import { TrackComparisonUtilities } from "./TrackComparisonUtilities";
-import { DEFAULT_FRECHET_TOLERANCE } from "../constants/track";
-
+import { TrackComparisonUtilities } from "places/core/strategies";
+import { DEFAULT_FRECHET_TOLERANCE } from "places/core/strategies";
 
 // Minimum gap distance in meters for continuation detection
 const MIN_CONTINUATION_GAP_METERS = 500;
-
 
 export type TrackRelationship =
   | 'no-overlap'
@@ -67,11 +65,8 @@ export interface TrackComparisonResult {
   closestApproachLocation?: Coordinate;
 }
 
-
 export class TrackComparisonService {
-
   compare(track1Coords: Coordinate[], track1File: TFile, track2Coords: Coordinate[], track2File: TFile, toleranceMeters: Meters, track1Points: TrackPoint[], track2Points: TrackPoint[]): TrackComparisonResult {
-
     const track1LengthKm = DistanceCalculator.calculatePolylineDistanceKm(track1Coords);
     const track2LengthKm = DistanceCalculator.calculatePolylineDistanceKm(track2Coords);
 
@@ -118,6 +113,7 @@ export class TrackComparisonService {
 
     if (relationship === 'no-overlap') {
       const closest = this.findClosestApproach(track1Coords, track2Coords);
+
       closestApproachMeters = closest.distanceMeters;
       closestApproachLocation = closest.location;
     }
@@ -146,7 +142,6 @@ export class TrackComparisonService {
 
   // `continuationGap` is null unless the relationship is a continuation.
   private detectRelationshipAndContinuation(track1: Coordinate[], track2: Coordinate[], track1OverlapPercent: number, track2OverlapPercent: number, toleranceMeters: Meters): { relationship: TrackRelationship; continuationGap: DivergencePoint | null } {
-
     if (track1OverlapPercent > 90 && track2OverlapPercent > 90) {
       return { relationship: 'nearly-identical', continuationGap: null };
     }
@@ -275,6 +270,7 @@ export class TrackComparisonService {
     for (const coord of simplified1) {
       for (const other of simplified2) {
         const distance = DistanceCalculator.haversineDistanceMeters(coord.latitude, coord.longitude, other.latitude, other.longitude);
+
         if (distance < minDistance) {
           minDistance = distance;
           closestLocation = coord;

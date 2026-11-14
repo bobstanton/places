@@ -5,8 +5,6 @@ title: Places Overlays and Tracks Help
 
 # Places Overlays and Tracks Help
 
-Draw GeoJSON, GPX, CSV, track notes, georeferenced images, and vector tile sources over a map.
-
 ## Basic Usage
 
 ~~~places
@@ -19,17 +17,20 @@ dataview: FROM "Scranton" WHERE location
 
 ## Settings
 
-| Setting       | Description                                                                                | Examples                          |
-| ------------- | ------------------------------------------------------------------------------------------ | --------------------------------- |
-| path          | Geodata file, track note, or image file, as a note path or URL                             | 02 - Overlays/scranton-neighborhoods.geojson |
-| labelTemplate | Label template resolved against overlay features                                           | {this.name}                       |
-| waypointLabelTemplate | Label template for GPX `<wpt>` markers (defaults to the name; empty hides)          | Stop: {this.name}                 |
-| minZoom       | Minimum map zoom where the overlay is visible                                              | 9                                 |
-| maxZoom       | Maximum map zoom where the overlay is visible                                              | 12                                |
-| bounds        | Marks the entry as an image overlay; axis-aligned georeference as swLat,swLng,neLat,neLng  | 41.408,-75.663,41.409,-75.662     |
-| corners       | Marks the entry as an image overlay; four-corner georeference (rotated/skewed) as nwLat,nwLng,neLat,neLng,seLat,seLng,swLat,swLng | 41.409,-75.663,41.409,-75.662,41.408,-75.662,41.408,-75.663 |
-| opacity       | Image entries: image opacity, 0-1                                                          | 0.8                               |
-| visible       | Renders the entry when true (default); false skips it                                      | {parameter.showTrails}            |
+| Setting               | Description                                                                                                                       | Examples                                                                                                     |
+| --------------------- | --------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| path                  | Geodata file (`.geojson`, `.gpx`, `.fit`, `.csv`), track note, or image file, as a note path or URL                               | 02 - Overlays/scranton-neighborhoods.geojson                                                                 |
+| labelTemplate         | Label template resolved against overlay features                                                                                  | {this.name}                                                                                                  |
+| waypointLabelTemplate | Label template for GPX `<wpt>` markers (defaults to the name; empty hides)                                                        | Stop: {this.name}                                                                                            |
+| popup                 | Popup body sections for a clicked feature; a vector tile overlay's features answer clicks only with one                           | `content:`<br>`  - renderer: knap`<br>`    options:`<br>`      templateFile: Places Templates/Popup.knap.md` |
+| hoverStyle            | Style overrides applied to the feature under the pointer (MapLibre providers); same keys as `style`                               |                                                                                                              |
+| minZoom               | Minimum map zoom where the overlay is visible                                                                                     | 9                                                                                                            |
+| maxZoom               | Maximum map zoom where the overlay is visible                                                                                     | 12                                                                                                           |
+| bounds                | Marks the entry as an image overlay; axis-aligned georeference as swLat,swLng,neLat,neLng                                         | 41.408,-75.663,41.409,-75.662                                                                                |
+| corners               | Marks the entry as an image overlay; four-corner georeference (rotated/skewed) as nwLat,nwLng,neLat,neLng,seLat,seLng,swLat,swLng | 41.409,-75.663,41.409,-75.662,41.408,-75.662,41.408,-75.663                                                  |
+| opacity               | Image entries: image opacity, 0-1                                                                                                 | 0.8                                                                                                          |
+| visible               | Renders the entry when true (default); false skips it                                                                             | {parameter.showTrails}                                                                                       |
+| preset                | A vector tileset an installed extension supplies, in place of `tiles` or `url`                                                    | mapillary                                                                                                    |
 
 Vector tile entries take `tiles` or a TileJSON `url`, plus `sourceLayer` (or `sourceLayers`), `layerType`, `filter`, `bounds`, and the style, label, and icon fields. 
 
@@ -75,16 +76,18 @@ overlays:
 
 Labels are placed at the feature's point, line midpoint, or polygon center, and they respect the map's `showLabels` setting.
 
+GeoJSON features with `geometry: null` have no location to draw or label. They remain in the loaded data and do not prevent the other features from rendering.
+
 For GPX files and notes containing GPX data, embedded `<wpt>` waypoints are labeled with their name by
 default. Use `waypointLabelTemplate` to customize that label; it applies only to `<wpt>` waypoints, not
 the track line. The template resolves against each waypoint:
 
-| Placeholder                                                                                | Description                     |
-| ------------------------------------------------------------------------------------------ | ------------------------------- |
-| `{this.name}`                                                                              | The waypoint's `<name>`         |
-| `{this.description}`, `{this.symbol}`, `{this.type}`, `{this.comment}`, `{this.link}`      | The matching GPX elements       |
-| `{this.elevation}`, `{this.time}`                                                          | The waypoint's elevation and timestamp |
-| `{this.role}`                                                                              | Always `waypoint` here          |
+| Placeholder                                                                           | Description                            |
+| ------------------------------------------------------------------------------------- | -------------------------------------- |
+| `{this.name}`                                                                         | The waypoint's `<name>`                |
+| `{this.description}`, `{this.symbol}`, `{this.type}`, `{this.comment}`, `{this.link}` | The matching GPX elements              |
+| `{this.elevation}`, `{this.time}`                                                     | The waypoint's elevation and timestamp |
+| `{this.role}`                                                                         | Always `waypoint` here                 |
 
 An explicitly empty template hides the waypoint labels. This is the same
 `waypointLabelTemplate` key used by directions route endpoints and the global setting of the same name.
@@ -99,6 +102,126 @@ overlays:
 If the same overlay also has `labelTemplate`, GPX waypoints use `waypointLabelTemplate` while the
 general template applies to its other features.
 
+### Waypoint Icons
+
+Places settings includes **Waypoint icons**. Each line maps an exact waypoint name, symbol, or type to an emoji, ignoring capitalization and surrounding whitespace:
+
+~~~text
+Overlook => 👀
+Trailhead => 🥾
+Waterfall => 🌊
+~~~
+
+These mappings are included by default. Add `name:`, `sym:`, or `type:` before a value to match just that field, such as `sym: Overlook => 👀`. Symbol mappings take priority, followed by a literal symbol emoji, type mappings, and name mappings. Later mappings for the same field and value replace earlier ones.
+
+### Popup Content
+
+Use `popup.content` to choose and order the body sections:
+
+~~~places
+popup:
+  content:
+    - renderer: knap
+      options:
+        templateFile: Places Templates/Popup.knap.md
+    - note
+    - renderer: environment.weather-summary
+~~~
+
+`renderer: knap` renders an external Markdown template with the clicked place or feature data. `note` renders the note body without embedded maps. Interactive renderers include the built-in `image.preview` for photo rows from `image_files`, and those supplied by installed extensions. Omit `popup` to display the note body. Use `content: none` to show only the popup header.
+
+Notes and query results can override this block content using individual properties or columns such as `popup.content.renderer`, `popup.content.options.templateFile`, or `popup.content: none`. Query columns take precedence over note properties, then the block. See `places-style-help` for their syntax and the full inventory.
+
+### Knap popup templates
+
+Use the built-in `knap` renderer for Markdown with conditions, loops, and [Knap filters](https://knap.md/filters):
+
+~~~places
+popup:
+  content:
+    - renderer: knap
+      options:
+        templateFile: Places Templates/Popup.knap.md
+~~~
+
+Save the template in `Places Templates/Popup.knap.md`:
+
+~~~markdown
+### {{ name | escape_md }}
+{% if frontmatter.Address %}
+{{ frontmatter.Address | escape_md }}
+{% endif %}
+{% if tags %}
+{{ tags | wikilink | join:", " }}
+{% endif %}
+~~~
+
+`templateFile` references a file in the vault (`.knap.md`, `.md`, or `.knap`). Markdown template notes also support quoted wikilinks. Places reads the file when opening the popup.
+
+#### Place-marker data
+
+Place-marker popups pass the following variables to the template. Query-backed markers also include their query row.
+
+| Variable                  | Value supplied                                                                                                                |
+| ------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `name`                    | Displayed marker name, after label-template processing.                                                                       |
+| `originalName`            | Name before label-template processing; defaults to `name`.                                                                    |
+| `title`, `filename`       | Linked filename without `.md`; defaults to `name` for a place without a file.                                                 |
+| `path`                    | Linked vault file path, including its extension; empty when no file is linked.                                                |
+| `icon`                    | Marker icon text.                                                                                                             |
+| `latitude`, `longitude`   | Marker coordinates as numbers in degrees.                                                                                     |
+| `tags`                    | Array of place tags; empty when no tags are present.                                                                          |
+| `frontmatter`             | Place metadata with its original keys, such as `frontmatter.Address` and `frontmatter.Favorite`; an empty object when absent. |
+| `row`                     | Original query row with its column names; an empty object for a place without a query row.                                    |
+| Metadata and query fields | Also available at the top level under their original names and generated aliases, such as `Address` and `address`.            |
+
+Built-in variables in the table take precedence over metadata and query fields with the same name. For other exact-name conflicts, metadata takes precedence over query columns. `frontmatter` and `row` retain the original values.
+
+Aliases include lowercase keys and lowercase keys with spaces replaced by underscores: `Last Visited` adds `last visited` and `last_visited`. Lowercase keys and keys containing underscores or hyphens also receive a title-case alias: `rating_value` adds `Rating Value`. Aliases fill unused names, with query aliases added first.
+
+#### Overlay-feature data
+
+Overlay-feature popups pass a different set of variables. Property names retain their original spelling without the place-marker aliases. `properties`, `geometry`, `feature`, and `source` take precedence over properties with those names. A supplied feature index takes precedence over a property named `index`.
+
+| Variable               | Value supplied                                                                                                      |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| Feature property names | Clicked feature properties at the top level, preserving their original names; for example, `Name` and `Population`. |
+| `properties`           | Complete feature properties object, preserving keys that conflict with other template variables.                    |
+| `geometry`             | Feature geometry, including `geometry.type` and `geometry.coordinates`; may be null.                                |
+| `feature`              | Complete clicked GeoJSON feature, including `feature.id` when present.                                              |
+| `source`               | Overlay source identifier supplied with the popup; empty when none is supplied.                                     |
+| `index`                | Feature index supplied with the popup, when available; otherwise the feature property named `index`, if present.    |
+| `role`                 | Feature property when present; otherwise `waypoint` for a GPX waypoint, or empty.                                   |
+| `role_label`           | Feature property when present; otherwise empty. Generated route endpoints supply labels such as `Start` and `End`.  |
+
+Missing values render as empty text. Invalid templates restore the normal popup content. Links and embeds resolve from the popup's Markdown source path. Knap renders the popup body; actions and interactive renderers remain separate sections. Regex searches in Knap filters are disabled.
+
+Installed popup renderers:
+
+{{dynamic:popupRenderers}}
+
+Geodata and vector tile overlays accept the same setting on an individual entry. The template receives the clicked feature:
+
+~~~places
+overlays:
+  - path: 02 - Overlays/scranton-neighborhoods.geojson
+    popup:
+      content:
+        - renderer: knap
+          options:
+            templateFile: Templates/Neighborhood.knap.md
+~~~
+
+Save `Templates/Neighborhood.knap.md` with:
+
+~~~markdown
+### {{ Name | escape_md }}
+**Population:** {{ Population }}
+**Geometry:** {{ geometry.type }}
+~~~
+
+Omit a geodata overlay's `popup` to keep its existing feature details. A `note` section renders the source when the overlay is backed by a vault note. A vector tile overlay without a `popup` draws for context only: its features answer no clicks.
+
 ### External GeoJSON URLs
 
 ~~~places
@@ -110,19 +233,21 @@ height: 500px
 
 ## GeoJSON Styling Properties
 
-Styling is defined inside each GeoJSON feature's properties object. Places reads the simplestyle-spec properties below.
+Places reads the following styling properties from each GeoJSON feature:
 
-| Property           | Geometry      | Description                                      |
-| ------------------ | ------------- | ------------------------------------------------ |
-| `stroke`           | Line, Polygon | Line color (hex, rgb, or name): "#e63946", "red" |
-| `stroke-width`     | Line, Polygon | Line thickness in pixels: 3, 5, 10               |
-| `stroke-opacity`   | Line, Polygon | Line transparency (0-1): 0.8                     |
-| `stroke-dasharray` | Line, Polygon | Dash pattern: "5,10", "10,5,2,5"                 |
-| `fill`             | Polygon       | Fill color: "#2a9d8f", "rgba(0,100,200,0.5)"     |
-| `fill-opacity`     | Polygon       | Fill transparency (0-1): 0.3                     |
-| `marker-color`     | Point         | Marker color: "#ff0000"                          |
-| `marker-size`      | Point         | Marker size: "small", "medium", "large"          |
-| `marker-symbol`    | Point         | Icon symbol name (provider-specific)             |
+| Property           | Geometry      | Description                                                             |
+| ------------------ | ------------- | ----------------------------------------------------------------------- |
+| `stroke`           | Line, Polygon | Line color (hex, rgb, or name): "#e63946", "red"                        |
+| `stroke-width`     | Line, Polygon | Line thickness in pixels: 3, 5, 10                                      |
+| `stroke-opacity`   | Line, Polygon | Line transparency (0-1): 0.8                                            |
+| `stroke-dasharray` | Line          | Dash and gap lengths in pixels: `"5,10"` or `"5 10"`; empty means solid |
+| `fill`             | Polygon       | Fill color: "#2a9d8f", "rgba(0,100,200,0.5)"                            |
+| `fill-opacity`     | Polygon       | Fill transparency (0-1): 0.3                                            |
+| `marker-color`     | Point         | Marker color: "#ff0000"                                                 |
+| `marker-size`      | Point         | Marker size: "small", "medium", "large"                                 |
+| `marker-symbol`    | Point         | Icon symbol name (provider-specific)                                    |
+
+MapLibre uses the first line's dash pattern for an entire track or GeoJSON overlay. Use separate overlays for different dash patterns. In GeoJSON, dash lengths are in pixels; overlay `style.dashArray` uses multiples of line width.
 
 ### Example: Styled LineString
 
@@ -235,7 +360,7 @@ Paths may be vault-relative, external URLs (http/https), or data URLs. Set an op
 
 ## Vector Tile Overlays
 
-Vector tile entries draw external Mapbox Vector Tile (MVT) sources on the map: contours, roads, land cover, or any vector tileset. Each entry needs a tile URL template or a TileJSON `url`, plus `sourceLayer` (or `sourceLayers`); `layerType` selects the rendering. Vector overlays render only on a MapLibre-based map provider, not Leaflet. Each entry supplies its own tile URL and key, independent of the base map.
+Vector tile entries draw Mapbox Vector Tile (MVT) sources. Each entry needs a tile URL template, a TileJSON `url`, or a `path` to a `.pmtiles` archive in the vault (`tileJson: true` marks a `tiles` address as a TileJSON document when it does not end in `.json`), plus `sourceLayer` (or `sourceLayers`); `layerType` selects the rendering. Vector overlays render only on a MapLibre-based map provider, not Leaflet.
 
 ### Basic usage
 
@@ -259,6 +384,23 @@ overlays:
 
 `bounds` restricts the source to tiles overlapping the `west,south,east,north` box. The rendered edge follows tile boundaries rather than the exact coordinates.
 
+### Local archives
+
+Set `path` to the `.pmtiles` archive's vault path. Source layers and zoom range are read from the archive.
+
+~~~places
+mapProvider: openfreemap
+initialCenter: 41.408, -75.662
+initialZoom: 13
+overlays:
+  - path: Maps/scranton.pmtiles
+    sourceLayer: roads
+    layerType: line
+    style:
+      color: "#d9480f"
+      width: 2
+~~~
+
 Use `sourceLayers` when several source layers should share one style; it renders one MapLibre layer per source layer:
 
 ~~~places
@@ -280,7 +422,7 @@ A vector tileset's source layer names, and the properties available to filter on
 
 Not every tileset declares `vector_layers`, an optional part of TileJSON, and a raw `tiles:` template has no metadata at all. Completion falls back to a format hint in that case.
 
-A tile source is either a raw `tiles:` URL template (`https://host/{z}/{x}/{y}.pbf`) or a TileJSON `url:` endpoint. A TileJSON `url:` carries the tileset's zoom range and attribution: tiles beyond the tileset's maximum zoom overzoom instead of failing, and versioned tile paths resolve automatically. A raw `tiles:` template carries neither. `layerType` accepts `line` (default), `fill`, `circle`, and `symbol`. Put paint and sizing options under `style:`: `color`, `opacity`, `width`, `dashArray`, `fillColor`, `fillOpacity`, `circleRadius`, `strokeColor`, `strokeWidth`, `strokeOpacity`, and the text/icon sizing and color options. `dashArray` renders line layers dashed, from comma-separated dash and gap lengths (`dashArray: 2,2`). Use exactly one of `sourceLayer` or `sourceLayers`.
+A TileJSON `url:` carries the tileset's zoom range and attribution: tiles beyond the tileset's maximum zoom overzoom instead of failing, and versioned tile paths resolve automatically. A raw `tiles:` template carries neither. `layerType` accepts `line` (default), `fill`, `circle`, and `symbol`. Put paint and sizing options under `style:`: `color`, `opacity`, `width`, `dashArray`, `fillColor`, `fillOpacity`, `circleRadius`, `strokeColor`, `strokeWidth`, `strokeOpacity`, and the text/icon sizing and color options. `dashArray` takes comma-separated dash and gap lengths in multiples of line width. For example, `width: 3` with `dashArray: "2,5"` draws 6-pixel dashes and 15-pixel gaps. Use exactly one of `sourceLayer` or `sourceLayers`.
 
 ### Zoom-scaled styling
 
@@ -362,7 +504,7 @@ Symbol labels require the map style to provide fonts (glyphs); most vector style
 
 ### Icons (symbol layers)
 
-`icon` renders a sprite image at each symbol feature. A bare name references an image in the base style's own sprite; `sprite` registers an external sprite sheet (its base URL, without the `.json` or `.png` suffix) and resolves `icon` against it. `style.iconSize` scales the icon. `icon` and `textField` combine on one entry; a symbol entry requires at least one of them. External sprites require a MapLibre GL engine; the mapbox provider renders such an entry without the icon.
+`icon` renders a sprite image at each symbol feature; `iconSize` under `style` scales it (1 is the sprite's own size). A bare name references an image in the base style's own sprite; `sprite` registers an external sprite sheet (its base URL, without the `.json` or `.png` suffix) and resolves `icon` against it. `style.iconSize` scales the icon. `icon` and `textField` combine on one entry; a symbol entry requires at least one of them. External sprites require a MapLibre GL engine; the mapbox provider renders such an entry without the icon.
 
 ~~~places
 mapProvider: openfreemap
@@ -376,6 +518,32 @@ overlays:
     sprite: https://maputnik.github.io/osm-liberty/sprites/osm-liberty
     icon: information
 ~~~
+
+### Overlay presets
+
+An installed extension can supply a vector tileset by name. The entry needs no `tiles` or `url`, and any access token stays in that extension's settings rather than in the note:
+
+~~~places
+overlays:
+  - preset: mapillary
+~~~
+
+`sourceLayers` draws only some of the preset's layers, and `minZoom`, `maxZoom`, `filter`, `style`, and `popup` replace the preset's own:
+
+~~~places
+overlays:
+  - preset: mapillary
+    sourceLayers: [sequence, image]
+    filter: is_pano == true
+    style:
+      color: "#7c3aed"
+~~~
+
+Installed overlay presets:
+
+{{dynamic:overlayPresets}}
+
+A preset's features that open a popup appear in the map's click stack along with markers and tracks under the same point.
 
 ### Providers with vector tiles
 
@@ -469,33 +637,36 @@ Use `places-image-align-help` to learn about the interactive image alignment too
 
 Color tracks by elevation, grade, speed, or pace.
 
-Elevation and grade need per-point elevations; speed and pace need per-point timestamps. A GPX with `<time>` on its track points carries both. A track imported before Places recorded timestamps has none stored in its cache. Run **Rebuild all overlay caches** from the command palette to re-derive every cached overlay from its source, or **Rebuild overlay cache** for a single note. The source is never modified. A track whose source genuinely has no timestamps (a GeoJSON exported without them, or a plain polyline) is reported as such, because no rebuild will give it speeds. Without the data the mode needs, the track draws as a plain line rather than silently switching to another coloring.
+For tracks imported with an older version, **Rebuild overlay cache** refreshes the cached data from `Overlay Source`. **Rebuild all overlay caches** updates all cached overlays. A coloring mode with missing data displays a plain line.
 
-Speed and pace use a sequential blue-to-red ramp, normalized against that track's own range: a walk and a drive each use the full scale. Pace inverts it, keeping fast at the red end in both. The span they are averaged over is `speedWindow`. See the chart help for how the windows work.
+Speed and pace use each track's range for the blue-to-red scale, with faster sections at the red end. `speedWindow` sets the averaging distance or time.
 
 MapLibre-based maps show direction arrows at detailed zoom levels and mark each rendered track segment's start and end. Clicking a trail opens source-backed details; when Places Utilities playback is enabled without a fixed `track`, the same click selects that trail for playback.
 
 Set `track.details: panel` to show those details in a fixed map panel instead of a popup. The panel follows the playback position while playing, scrubbing, or dragging. The default is `popup`.
 
-| Setting               | Description                                                                            | Examples                                |
-| --------------------- | -------------------------------------------------------------------------------------- | --------------------------------------- |
-| `colorBy`             | Color tracks by data: altitude, slope steepness, speed, pace, or single solid color | **none**, elevation, grade, speed, pace |
-| `gradeWindow`         | Span the rolling grade is measured over. Larger = smoother lines, less GPS noise       | **100ft**, 50m, 0.1mi                   |
-| `defaultVisibility`   | Whether routes are visible when map loads. `hidden` requires clicking markers          | **hidden**, visible                     |
-| `directionArrows`     | Direction arrow scale on MapLibre tracks. 0 hides them                                 | **1**, 0.7, 0                           |
-| `speedWindow`         | Span speed and pace are averaged over: a distance, or a time that reads better across stops | **200m**, 0.25mi, 30s               |
-| `outline`             | Outline around track lines. Unset, colored tracks get one and single-color tracks do not | true, false                           |
-| `details`             | Clicked-point details presentation                                                     | **popup**, panel                        |
-| `labels`              | Track start, midpoint, and end labels; see Path Overlay Labels below                   | `visibility: all`                       |
-| `selection`           | Parameters written by track and point selection; see `places-queryparameters-help`     | `trackParameter: selected`              |
+| Setting             | Description                                                                                                          | Examples                                |
+| ------------------- | -------------------------------------------------------------------------------------------------------------------- | --------------------------------------- |
+| `colorBy`           | Color tracks by elevation, grade, speed, pace, or a single color (dashed by default)                                 | **none**, elevation, grade, speed, pace |
+| `style`             | Width, solid/dashed, color, opacity; optional outline after a semicolon. Unspecified components inherit              | `"4 solid red; 8 solid black 0.3"`      |
+| `gradeWindow`       | Span the rolling grade is measured over. Larger = smoother lines, less GPS noise                                     | **100ft**, 50m, 0.1mi                   |
+| `defaultVisibility` | Initial track visibility. When omitted, a single unclustered track shows automatically; multiple tracks start hidden | visible, hidden                         |
+| `directionArrows`   | Direction arrow scale on MapLibre tracks. 0 hides them                                                               | **1**, 0.7, 0                           |
+| `speedWindow`       | Span speed and pace are averaged over: a distance, or a time that reads better across stops                          | **200m**, 0.25mi, 30s                   |
+| `outline`           | Outline around track lines. Unset, colored tracks get one and single-color tracks do not                             | true, false                             |
+| `details`           | Clicked-point details presentation                                                                                   | **popup**, panel                        |
+| `labels`            | Track start, midpoint, and end labels; see Track Labels below                                                        | `visibility: all`                       |
+| `selection`         | Parameters written by track and point selection; see `places-queryparameters-help`                                   | `trackParameter: selected`              |
 
-### Colored Elevation Tracks
+These options are nested under `track:` in code blocks. The per-place subset also works as individual note properties and query columns: `track.colorBy`, `track.style`, `track.defaultVisibility`, `track.outline`, and `track.labels.visibility`/`start`/`midpoint`/`end`. Query rows override note settings, which override the code block. See `places-style-help` for the full inventory and syntax.
+
+### Grade-Colored Tracks
 
 ~~~places
 mapProvider: leaflet
 track:
   colorBy: grade
-  gradeDistance: 100
+  gradeWindow: 100ft
 height: 400px
 ~~~
 
@@ -513,9 +684,9 @@ All tracks from the query will be visible on initial map load. Click markers to 
 
 A drawn track is itself a click target: clicking opens its place popup and leaves the line visible. 
 
-## Path Overlay Labels
+## Track Labels
 
-GPX/path overlays (tracks from `Overlay Source`) can show text labels at the **start**, **midpoint**, and **end** of the line - similar to the distance/time label on generated directions. Each label only appears while its track is visible, and labels respect collision (they hide rather than overlap).
+Track overlays (from `Overlay Source` or `Overlay Cache`) can show text labels at the **start**, **midpoint**, and **end** of the line. Labels appear while their track is visible and hide when they would overlap.
 
 Labels are templates resolved against the **track note's frontmatter**, using the same engine as VaultQuery. Frontmatter keys are top-level. A key with a space needs bracket form:
 
@@ -524,9 +695,12 @@ Labels are templates resolved against the **track note's frontmatter**, using th
 - built-ins like `{this.title}`, `{this.tags}`, and helpers like `{h.wikilink(this.path)}` are also supported
 - `{h.round(this.Distance)}` rounds a number to at most 2 decimals, keeping any unit (e.g. `3.7476` -> `3.75`, `6.38 mi` -> `6.38 mi`)
 
-Values are taken straight from frontmatter - nothing is parsed from the track or unit-converted.
+For a single continuous track, labels use the note's frontmatter values as stored. For a track with separate segments, each segment gets its own labels: `Distance` and available elevation figures are calculated from that segment, and `{this.Segment}` and `{this['Segment Count']}` identify it. Note-wide time and speed figures are blank in those segment labels.
+
+Use `track.labels.visibility: all`, `none`, or a comma-separated selection of `start`, `midpoint`, and `end`. `mid` and `middle` also select `midpoint`. Set templates under `track.labels.start`, `midpoint`, and `end`. Use these dotted names as individual query columns or note properties; an empty template disables that label. Templates inherit separately for each slot.
 
 ## Importing Tracks
 
-Drag and drop GPX/GeoJSON/CSV files to the folder tree or use the `Import track data` command.
+Drag and drop GPX/FIT/GeoJSON/CSV files to the folder tree or use the `Import track data` command.
 
+To copy files into your vault without creating track notes, hold **Option on macOS** or **Ctrl on Windows/Linux** while dropping them onto a folder in the file explorer. Dropping an external file into a note with this shortcut creates a link to the original file.

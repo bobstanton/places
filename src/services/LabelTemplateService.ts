@@ -1,6 +1,8 @@
 import { MapPlace } from "places-shared/overlay";
 import { getErrorMessage } from "places-shared/utils";
 import { createPlaceLabelResolver } from "./PlaceLabelTemplate";
+import { labelInputSignature, type LabelResultCache } from './LabelResultCache';
+import { LoopYieldController } from 'places/core/strategies';
 
 export interface LabelTemplateResult {
   successCount: number;
@@ -13,11 +15,11 @@ export interface LabelTemplateError {
   message: string;
 }
 
-// A wrapper around the shared place-label resolver, adding the two things the
-// map surfaces need: original names preserved for recovery, and per-place
-// errors collected for display under the block. The template surface (helpers,
-// properties, expression support) is documented in `places-style-help` and not
-// restated here.
+export interface PlaceLabelOutcome {
+  error?: LabelTemplateError;
+  templateError?: boolean;
+}
+
 class LabelTemplateService {
   // An unclosed brace is not a placeholder.
   private readonly placeholderRegex = /\{(this\.[^}]+|h\.[^}]+)\}/;
@@ -32,17 +34,20 @@ class LabelTemplateService {
     }
 
     const cleanTemplate = this.stripQuotes(template);
+
     if (!cleanTemplate) {
       return errors;
     }
 
     const openBraces = (cleanTemplate.match(/\{/g) || []).length;
     const closeBraces = (cleanTemplate.match(/\}/g) || []).length;
+
     if (openBraces !== closeBraces) {
       errors.push(`Mismatched braces: ${openBraces} opening '{' and ${closeBraces} closing '}'`);
     }
 
     const unclosedPattern = /\{(this\.|h\.)[^}]*$/;
+
     if (unclosedPattern.test(cleanTemplate)) {
       errors.push('Unclosed template expression - missing closing "}"');
     }
@@ -50,23 +55,27 @@ class LabelTemplateService {
     return errors;
   }
 
-  // Returns the original name when the template is empty or has no placeholders; throws when processing fails.
-  async processTemplate(template: string, place: MapPlace): Promise<string> {
+  async processTemplate(template: string, place: MapPlace, cache?: LabelResultCache<string>): Promise<string> {
     if (!template || !this.placeholderRegex.test(template)) {
       return place.name;
     }
 
+    const key = cache ? labelInputSignature(place, [template]) : undefined;
+    const cached = cache?.get(key);
+
+    if (cached !== undefined) return cached;
     const result = (await createPlaceLabelResolver(place).resolve(template)).trim();
 
     if (!result) {
       throw new Error('Template produced empty result');
     }
 
+    if (key) cache?.set(key, result);
+
     return result;
   }
 
-  // Preserves original names in place.originalName; mutates `places` in place.
-  async processPlaces(places: MapPlace[], template: string): Promise<LabelTemplateResult> {
+  async processPlaces(places: MapPlace[], template: string, cache?: LabelResultCache<string>, onResult?: (place: MapPlace, outcome: PlaceLabelOutcome) => void): Promise<LabelTemplateResult> {
     const result: LabelTemplateResult = {
       successCount: 0,
       errors: [],
@@ -76,26 +85,39 @@ class LabelTemplateService {
 
     if (!cleanTemplate || !this.placeholderRegex.test(cleanTemplate)) {
       result.successCount = places.length;
+      if (onResult) for (const place of places) onResult(place, {});
+
       return result;
     }
 
     const validationErrors = this.validateTemplate(cleanTemplate);
+
     if (validationErrors.length > 0) {
-      result.errors.push({
+      const error: LabelTemplateError = {
         placeName: '(template validation)',
         message: validationErrors.join('; '),
-      });
+      };
+
+      result.errors.push(error);
+      if (onResult) for (const place of places) onResult(place, { error, templateError: true });
+
       return result;
     }
 
-    const outcomes = await Promise.all(places.map(async place => {
+    const usable = cache?.admits(places.length) === false ? undefined : cache;
+    const loop = new LoopYieldController({ batchSize: Infinity, maxIntervalMs: 8 });
+
+    for (let index = 0; index < places.length; index++) {
+      const place = places[index];
+
       if (!place.originalName) {
         place.originalName = place.name;
       }
 
       try {
-        place.name = await this.processTemplate(cleanTemplate, place);
-        return undefined;
+        place.name = await this.processTemplate(cleanTemplate, place, usable);
+        result.successCount++;
+        onResult?.(place, {});
       } catch (error) {
         const errorMessage = getErrorMessage(error);
         const templateError: LabelTemplateError = {
@@ -103,13 +125,14 @@ class LabelTemplateService {
           filePath: place.filePath,
           message: errorMessage,
         };
-        place.name = place.originalName || place.name;
-        return templateError;
-      }
-    }));
 
-    result.errors = outcomes.filter((error): error is LabelTemplateError => error !== undefined);
-    result.successCount = places.length - result.errors.length;
+        place.name = place.originalName || place.name;
+        result.errors.push(templateError);
+        onResult?.(place, { error: templateError });
+      }
+
+      await loop.yieldIfNeeded(index + 1);
+    }
 
     return result;
   }
@@ -118,9 +141,11 @@ class LabelTemplateService {
     if (!value) return value;
     const trimmed = value.trim();
     const quote = trimmed[0];
+
     if (trimmed.length >= 2 && (quote === '"' || quote === "'") && trimmed[trimmed.length - 1] === quote) {
       return trimmed.slice(1, -1);
     }
+
     return trimmed;
   }
 }
@@ -131,5 +156,6 @@ export function getLabelTemplateService(): LabelTemplateService {
   if (!labelTemplateServiceInstance) {
     labelTemplateServiceInstance = new LabelTemplateService();
   }
+
   return labelTemplateServiceInstance;
 }

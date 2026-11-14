@@ -26,7 +26,7 @@ export class CommandRegistrar {
 
   constructor(
     private readonly plugin: Plugin,
-    private readonly places: AggregatorApiService,
+    private readonly placesFor: (sourcePath: string) => AggregatorApiService,
     private readonly tracks: TrackImportController,
     private readonly getSettings: () => IPlacesPluginSettings,
     private readonly syncFileWithPlace: (file: TFile, place: Place) => Promise<void>,
@@ -56,9 +56,10 @@ export class CommandRegistrar {
         editorCallback: (_editor: Editor, context: MarkdownView | MarkdownFileInfo) => {
           if (!context.file) return;
           const initial = parseCoordinate(context.file.basename);
+
           new ReverseGeocodeModal(
             this.plugin.app,
-            this.places,
+            this.placesFor(context.file.path),
             this.getSettings().units,
             (place) => void this.syncFileWithPlace(context.file!, place),
             initial ?? undefined,
@@ -72,6 +73,7 @@ export class CommandRegistrar {
         callback: () => {
           const activeFile = this.plugin.app.workspace.getActiveFile();
           const settings = this.getSettings();
+
           new ImportTrackModal(
             this.plugin.app,
             (results, mode, folder, filename) => void this.tracks.importTracks(results, mode, activeFile, folder, filename),
@@ -162,6 +164,7 @@ export class CommandRegistrar {
 
     for (const entry of this.commands) {
       const { description, ...command } = entry;
+
       void description;
       this.plugin.addCommand(command);
     }
@@ -169,21 +172,28 @@ export class CommandRegistrar {
 
   private searchActiveFile(): void {
     const file = this.plugin.app.workspace.getActiveFile();
+
     if (!file) {
       new Notice("No active file.");
+
       return;
     }
+
     const view = this.plugin.app.workspace.getActiveViewOfType(MarkdownView);
+
     if (!view) {
       new Notice("No active editor.");
+
       return;
     }
+
     this.search(file, view.editor);
   }
 
   private search(file: TFile, editor: Editor): void {
     const selection = editor.getSelection().trim();
-    new PlaceSearchModal(this.plugin.app, this.places, selection || file.basename, (place) => {
+
+    new PlaceSearchModal(this.plugin.app, this.placesFor(file.path), selection || file.basename, (place) => {
       void this.syncFileWithPlace(file, place);
     }).open();
   }

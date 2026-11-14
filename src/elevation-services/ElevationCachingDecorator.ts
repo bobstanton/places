@@ -6,8 +6,8 @@ export class ElevationCachingDecorator
   extends ServiceCachingDecoratorBase
   implements IElevationService
 {
-  constructor(private wrappedService: IElevationService, private serviceName: string, cacheStorage: ICacheStorage) {
-    super(cacheStorage);
+  constructor(private wrappedService: IElevationService, private serviceName: string, cacheStorage: ICacheStorage, onCacheHit?: () => void) {
+    super(cacheStorage, undefined, onCacheHit);
   }
 
   getProviderName(): string {
@@ -19,11 +19,13 @@ export class ElevationCachingDecorator
     const keyBase = coordinates
       .map(coord => `${coord.latitude.toFixed(5)},${coord.longitude.toFixed(5)}`)
       .join("|");
+
     return `${this.serviceName}:${prefix}:${keyBase}`;
   }
 
   async getElevationProfile(coordinates: Coordinate[]): Promise<ElevationProfile> {
     const cacheKey = this.generateCoordinatesCacheKey("profile", coordinates);
+
     return this.executeWithCache(cacheKey, () =>
       this.wrappedService.getElevationProfile(coordinates)
     );

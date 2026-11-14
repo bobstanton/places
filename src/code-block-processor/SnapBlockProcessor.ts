@@ -1,17 +1,20 @@
 import { isRecord, logger as rootLogger, scalarToString } from "places-shared/utils";
-import { createLoadingIndicator } from "places-shared/ui";
+import { applyBlockWidth, createLoadingIndicator, RenderStalenessGuard } from "places-shared/obsidian/ui";
 import { App, MarkdownPostProcessorContext, TFile } from "obsidian";
 import { parseBooleanOptional, parseEnum, parseEnumWithDefault, parseShortDistanceAsMeters } from "places-shared/settings";
-import { ISnapService, RouteTravelMode, SnapExclusion, SnapMatchedEdge, SnapRequest, SnapShapeMatch, SnappedPoint, VALHALLA_TRACE_EDGE_ATTRIBUTES, summarizeMatchedSurfaces, summarizeMatchedWayNames } from "places-shared/services";
-import { TrackPointProcessor, RawTrackPoint } from "../services/TrackPointProcessor";
+import { ISnapService, type ApiUsageOrigin, RouteTravelMode, SnapExclusion, SnapMatchedEdge, SnapRequest, SnapShapeMatch, SnappedPoint, VALHALLA_TRACE_EDGE_ATTRIBUTES, summarizeMatchedSurfaces, summarizeMatchedWayNames } from "places-shared/services";
+import { TrackPointProcessor, RawTrackPoint } from 'places/core';
 import { renderErrorWithHelp, getErrorMessage } from "places-shared/utils";
 import PlacesPlugin from "../main";
-import { optionalStringSetting, parseCodeBlock } from "../services/CodeBlockParser";
+import { optionalStringSetting, parseCodeBlock } from 'places/core';
 import { TrackDataService, TrackData } from "../services/TrackDataService";
 import { renderTrackPreviewMap } from "./TrackMapPreview";
 import { renderTrackActionBar } from "./TrackActionBar";
-import { registerRefreshableCodeBlock, renderHoverPlaceholder, createOwnNoteEditRefreshGuard } from "./RefreshableCodeBlock";
+import { registerRefreshableCodeBlock, createTrackFileRefreshGuard } from "./RefreshableCodeBlock";
+import { renderHoverPlaceholder } from "places-shared/obsidian/ui";
+import { BlockRefreshRegistry } from "../services/BlockRefreshRegistry";
 import { BlockParameterSupport } from "../services/BlockParameters";
+import { cleanupMapContainer } from "../services/MapSurfaceCleanup";
 
 const logger = rootLogger.scope('places-snap');
 
@@ -24,6 +27,7 @@ function parseSnapExclusions(raw: unknown): SnapExclusion[] | undefined {
   const parsed = values
     .map(value => scalarToString(value).trim().toLowerCase())
     .filter((value): value is SnapExclusion => value === 'motorway' || value === 'toll' || value === 'ferry');
+
   return parsed.length > 0 ? parsed : undefined;
 }
 
@@ -33,6 +37,7 @@ function renderMatchedWaySummary(el: HTMLElement, edges: SnapMatchedEdge[] | und
   const names = summarizeMatchedWayNames(edges);
   const surfaces = summarizeMatchedSurfaces(edges);
   const parts: string[] = [];
+
   parts.push(names.length > 0 ? `Ways: ${names.join(', ')}` : `Ways: ${edges.length} unnamed`);
   if (surfaces.length > 0) parts.push(`Surfaces: ${surfaces.join(', ')}`);
   el.createDiv({ cls: 'places-action-status', text: parts.join('. ') });
@@ -61,31 +66,52 @@ interface SnapBlockSettings {
   poiDiscovery?: boolean;
 }
 
-// Previews a track snapped to the road network next to the original, without writing to the note.
 export class SnapBlockProcessor {
+  private static renders = new WeakMap<HTMLElement, RenderStalenessGuard>();
+
   constructor(private app: App, private trackDataService: TrackDataService, private blockParameters: BlockParameterSupport) {}
 
   async processCodeBlock(source: string, el: HTMLElement, ctx: MarkdownPostProcessorContext): Promise<void> {
     if (renderHoverPlaceholder(el, '🗺️ Snap preview not available in hover')) return;
 
+    const previous = SnapBlockProcessor.renders.get(el);
+
+    if (previous) previous.superseded = true;
+    const guard = new RenderStalenessGuard(el, ctx.sourcePath);
+
+    SnapBlockProcessor.renders.set(el, guard);
+    ctx.addChild(guard);
+    const isStale = () => guard.superseded;
+
+    for (const map of el.querySelectorAll<HTMLElement>('.places-map-container')) cleanupMapContainer(map);
+    el.empty();
+
     const parsed = parseCodeBlock(source);
+    const autoRefresh = parsed.settings.autorefresh;
     const parameters = await this.blockParameters.apply(parsed, el, ctx);
+
+    if (isStale()) return;
     registerRefreshableCodeBlock({
+      autoRefresh,
       source,
       el,
       ctx,
       process: (src, container, context) => this.processCodeBlock(src, container, context),
-      shouldAutoRefresh: createOwnNoteEditRefreshGuard(source, ctx.sourcePath),
+      shouldAutoRefresh: createTrackFileRefreshGuard(source, ctx.sourcePath,
+        typeof parsed.settings.track === 'string' && parsed.settings.track.trim() ? [parsed.settings.track] : [],
+        (input, sourcePath) => this.trackDataService.resolveTrackFile(input, sourcePath)),
       ariaLabel: 'Re-snap track',
       onError: error => logger.error('Re-snap failed:', error),
       usesParameters: parameters !== null,
     });
 
     const settings = this.parseSettings(parsed.settings);
-    const snapService = this.resolveSnapService(settings.provider);
+    const snapService = this.resolveSnapService(settings.provider, { sourcePath: ctx.sourcePath, blockType: 'places-snap' });
+
     if (!snapService.service) {
       renderErrorWithHelp(el, { icon: "⚠️", title: "Snap provider unavailable", message: snapService.error });
       await parameters?.renderStrip();
+
       return;
     }
 
@@ -94,9 +120,13 @@ export class SnapBlockProcessor {
 
     try {
       const trackData = await this.trackDataService.loadTrackFromPath(trackInput, ctx.sourcePath, { skipCache: true });
+
+      if (isStale()) return;
+
       if (trackData.points.length < 2) {
         throw new Error("The track needs at least two points to snap");
       }
+
       const snapRequest: SnapRequest = {
         points: trackData.points,
         mode: settings.mode,
@@ -109,25 +139,30 @@ export class SnapBlockProcessor {
         shapeMatch: settings.shapeMatch,
         traceOptions: settings.traceOptions,
         units: PlacesPlugin.settings.units,
-        // The edge-field whitelist the classify block also requests.
         attributes: settings.wayDetails ? VALHALLA_TRACE_EDGE_ATTRIBUTES : undefined,
       };
       const unsupported = snapService.service.describeUnsupportedRequest?.(snapRequest) ?? [];
       const snapResult = await snapService.service.snapPoints(snapRequest);
 
+      if (isStale()) return;
+
       loading.remove();
+
       for (const note of unsupported) {
         el.createDiv({ cls: 'places-action-status', text: note });
       }
+
       renderMatchedWaySummary(el, snapResult.edges);
-      await this.renderPreview(el, ctx, settings, trackInput, trackData, snapResult.points, snapService.service);
+
+      await this.renderPreview(el, ctx, settings, trackInput, trackData, snapResult.points, snapService.service, isStale);
     } catch (error) {
+      if (isStale()) return;
       loading.remove();
       logger.error('Snap failed:', error);
-      // Provider errors carry the server's own message (quota and size limits included).
       renderErrorWithHelp(el, { icon: "⚠️", title: "Snap failed", message: getErrorMessage(error) });
     }
-    await parameters?.renderStrip();
+
+    if (!isStale()) await parameters?.renderStrip();
   }
 
   private parseSettings(pairs: Record<string, unknown>): SnapBlockSettings {
@@ -152,12 +187,14 @@ export class SnapBlockProcessor {
     };
   }
 
-  private resolveSnapService(requested: string | undefined): { service?: ISnapService; error: string } {
+  private resolveSnapService(requested: string | undefined, origin: ApiUsageOrigin): { service?: ISnapService; error: string } {
     const available = PlacesPlugin.getSnapServiceNames();
 
     if (requested) {
-      const service = PlacesPlugin.getSnapService(requested);
+      const service = PlacesPlugin.getSnapService(requested, origin);
+
       if (service) return { service, error: "" };
+
       return {
         error: available.length > 0
           ? `Unknown snap provider "${requested}". Available: ${available.join(", ")}`
@@ -165,29 +202,28 @@ export class SnapBlockProcessor {
       };
     }
 
-    const service = PlacesPlugin.getFirstSnapService();
+    const service = PlacesPlugin.getFirstSnapService(origin);
+
     if (service) return { service, error: "" };
+
     return { error: "No snap provider is available. Enable a provider plugin with snap support (see places-help)." };
   }
 
-  private async renderPreview(el: HTMLElement, ctx: MarkdownPostProcessorContext, settings: SnapBlockSettings, trackInput: string, original: TrackData, snappedPoints: SnappedPoint[], snapService: ISnapService): Promise<void> {
+  private async renderPreview(el: HTMLElement, ctx: MarkdownPostProcessorContext, settings: SnapBlockSettings, trackInput: string, original: TrackData, snappedPoints: SnappedPoint[], snapService: ISnapService, isStale: () => boolean): Promise<void> {
+    applyBlockWidth(el, settings.width);
     const container = el.createDiv({ cls: "places-snap-container" });
-    const mapContainer = container.createDiv({ cls: "places-snap-map places-map-container" });
-    mapContainer.setCssProps({
-      '--places-snap-map-height': settings.height,
-      '--places-snap-map-width': settings.width,
-      height: settings.height
-    });
 
     const targetFile = this.resolveTrackFile(trackInput, ctx.sourcePath);
     const trackName = original.metadata.name ?? "Track";
 
     const rendered = await renderTrackPreviewMap({
-      mapContainer,
+      host: container,
+      mapContainerClass: "places-snap-map",
       ctx,
+      isStale,
+      onRerenderRequested: () => BlockRefreshRegistry.refreshForElement(el).then(() => undefined),
       mapProviderName: settings.mapProvider,
       height: settings.height,
-      width: settings.width,
       style: settings.style,
       tracks: [
         { name: `${trackName} (original)`, icon: "⚪", coordinates: original.points.map((point) => [point.longitude, point.latitude]), color: ORIGINAL_COLOR, lineStyle: 'dashed' },
@@ -195,13 +231,14 @@ export class SnapBlockProcessor {
       ],
       poiDiscovery: settings.poiDiscovery ?? false,
     });
-    if (!rendered) return;
+
+    if (!rendered || isStale()) return;
 
     const snappedCount = snappedPoints.filter((point) => point.snapped).length;
     const info = container.createEl("p", { cls: "places-snap-info" });
+
     info.setText(`${snapService.getProviderName()} snapped ${snappedCount} of ${snappedPoints.length} points (${settings.mode}${settings.radiusMeters !== undefined ? `, ${settings.radiusMeters}m radius` : ''}).`);
 
-    // Elevation and timestamps carry over by index: snap providers return one point per input point.
     const rawPoints: RawTrackPoint[] = snappedPoints.map((point, index) => ({
       latitude: point.latitude,
       longitude: point.longitude,

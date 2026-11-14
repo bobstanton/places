@@ -1,6 +1,6 @@
 import { App, Notice, TFile } from "obsidian";
 import { getErrorMessage, renderErrorWithHelp, logger as rootLogger } from "places-shared/utils";
-import type { TrackData } from "../services/TrackPointProcessor";
+import type { TrackData } from 'places-shared/geo';
 import type { TrackDataService } from "../services/TrackDataService";
 
 const logger = rootLogger.scope("TrackActionBar");
@@ -31,10 +31,12 @@ export function renderTrackActionBar(options: TrackActionBarOptions): void {
   const status = container.createDiv({ cls: "places-track-action-status" });
 
   const replace = actions.createEl("button", { cls: "places-button mod-cta", text: options.replaceLabel });
+
   if (targetFile) {
     replace.addEventListener("click", () => {
       void withBusy(replace, async () => {
         status.empty();
+
         try {
           await trackDataService.writeOverlayToFile(targetFile, trackData);
           setSuccess(status, options.replaceSuccess);
@@ -50,13 +52,17 @@ export function renderTrackActionBar(options: TrackActionBarOptions): void {
   }
 
   const exportButton = actions.createEl("button", { cls: "places-button", text: "Export to new note" });
+
   exportButton.addEventListener("click", () => {
     void withBusy(exportButton, async () => {
       status.empty();
+
       try {
         const file = await trackDataService.createTrackNote(trackData, { sourcePath, name: options.exportName });
+
         setSuccess(status, `Created track note "${file.basename}".`);
         new Notice(`Created track note: ${file.path}`);
+
         await app.workspace.getLeaf().openFile(file);
       } catch (error) {
         logger.error("Track export failed", error);
@@ -73,6 +79,7 @@ function setSuccess(status: HTMLElement, text: string): void {
 
 async function withBusy(button: HTMLButtonElement, action: () => Promise<void>): Promise<void> {
   button.disabled = true;
+
   try {
     await action();
   } finally {

@@ -182,7 +182,7 @@ export function render(container: HTMLElement, ctx: RenderContext): void {
   row15.createEl('td', { text: "Elevation-to-color ramp: a preset name or a custom stop list. Unset uses the default hypsometric tint." });
   const td10 = row15.createEl('td');
   td10.appendText("hypsometric, viridis, spectral, grayscale, or a list of ");
-  td10.createEl('code', { cls: 'places-help-code', text: "<metres>: <color>" });
+  td10.createEl('code', { cls: 'places-help-code', text: "<meters>: <color>" });
   container.createEl('h2', { cls: 'places-help-heading places-help-h2', text: "Relief without the 3D surface" });
   const para1 = container.createEl('p', { cls: 'places-help-paragraph' });
   para1.appendText("Hillshade and color relief are layers, not the 3D mesh: they render on a flat 2D map. To use them without 3D terrain, give the relief settings directly; the elevation then comes from the map provider's own DEM, for map providers that publish one. Set ");
@@ -301,7 +301,7 @@ export function render(container: HTMLElement, ctx: RenderContext): void {
   token15.appendText("viridis");
   codeBlock3.createSpan({ cls: 'places-help-fence cm-formatting', text: "\n```" });
   const para6 = container.createEl('p', { cls: 'places-help-paragraph' });
-  para6.appendText("Custom stops (metres to color) are interpolated between:");
+  para6.appendText("Custom stops (meters to color) are interpolated between:");
   const codeBlock4 = container.createEl('pre', { cls: 'HyperMD-codeblock HyperMD-codeblock-bg display-only' });
   codeBlock4.createSpan({ cls: 'places-help-fence cm-formatting', text: "```places\n" });
   const code4 = codeBlock4.createEl('code');
